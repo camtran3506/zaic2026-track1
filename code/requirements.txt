@@ -1,0 +1,10 @@
+# Install PyTorch with the CUDA wheel matching your server/container first.
+# Versions shown are a compatible starting point; validate and pin exact versions before freeze.
+numpy>=1.26,<3
+transformers>=4.53,<5
+accelerate>=1.1,<2
+safetensors>=0.4,<1
+faster-whisper>=1.1,<2
+ctranslate2>=4.5,<5
+huggingface-hub>=0.25,<1
+pytest>=8,<10

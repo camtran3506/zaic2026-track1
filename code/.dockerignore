@@ -1,0 +1,12 @@
+.git
+__pycache__/
+*.pyc
+.pytest_cache/
+result/
+*.jsonl
+*.wav
+**/*_environment/
+train/
+public_test/
+private_test/
+tests/
