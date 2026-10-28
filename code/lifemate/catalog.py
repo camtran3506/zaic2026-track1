@@ -102,10 +102,13 @@ def compact_schema(spec: dict) -> dict:
     }
 
 
-def prompt_catalog(allowed: dict[str, dict], query: str, last_tool: str | None, max_detailed: int) -> dict:
+def prompt_catalog(allowed: dict[str, dict], query: str, last_tool: str | None, max_detailed: int,
+                   inspected_tool: str | None = None) -> dict:
     ordered = rank_tools(allowed, query, last_tool)
     detailed = set(ordered[:max_detailed])
     detailed.add("sys.ask_missing_info")
+    if inspected_tool in allowed:
+        detailed.add(inspected_tool)
     # Read tools from selected apps help discover IDs before attempting writes.
     for name in ordered[:max(1, max_detailed // 2)]:
         app = name.split(".")[0]

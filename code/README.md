@@ -203,22 +203,27 @@ preventing a sample's trajectory from leaking into validation. It replays each g
 call through the real train `ToolEnv.validate/call`; the next prompt contains only
 previous real tool results. It never opens environment state files. Gold lists must
 be in execution order. It uses the **same candidate ranking and prompt builder** as
-inference; unavailable/schema-invalid/non-exposed targets fail with the sample ID.
-Use `--max-tool-details` consistently in preparation and inference if your gold tools
-need a larger candidate set. Training transcripts are required; pass `--asr-model`
+inference. `tool_index` retains all allowed tools; `--max-tool-details` only controls
+the initial detailed schemas. If a gold tool is absent from that initial selection,
+SFT adds an assistant `{"action":"inspect","name":"app.tool"}` decision before the
+call. Inference supports the same action: it reveals the requested allowed schema
+without calling ToolEnv or changing application state. Size fitting protects that
+schema's complete parameters/required/enum definitions; actual calls are validated
+against the schemas in the final prompt. Unavailable/schema-invalid gold labels
+still fail with the sample ID. Training transcripts are required; pass `--asr-model`
 for records/history that need ASR. No synthetic tool results or gold arguments are
 inserted into earlier prompts. Loss masks system/user/padding tokens and trains only
 the assistant JSON and its end-of-turn tokens.
 
-If a valid gold tool is missing from the final prompt (candidate ranking or prompt
-size pruning), CLI preparation stops by default. Add `--missing-tool-policy skip`
-to exclude the **entire sample**, including all its steps, with a warning and an
-entry in `sft/train_skipped.jsonl` or `sft/validation_skipped.jsonl`. The Kaggle notebook
-defaults to `TRAIN_MISSING_TOOL_POLICY="skip"`; set it to `"error"` for strict mode.
-The manifest records retained IDs, source counts and skipped reasons separately
-for each partition. Validation loss then describes only the retained validation
-samples; this filtering does not fix candidate recall at inference time. No gold
-tool is injected into the prompt, and invalid labels still cause preparation to fail.
+The notebook defaults to `TRAIN_MISSING_TOOL_POLICY="error"`: an out-of-ranking
+gold tool is recovered through a supervised inspection step, not filtered out.
+Gold arguments/schema are absent from the first prompt; the schema is provided
+only after the assistant requests it, using the same mechanism as inference.
+The old `--missing-tool-policy skip` remains an explicit diagnostic fallback for
+an unrecoverable missing-schema error, with skipped IDs/reasons in the manifest.
+Oversized inference prompts now fail explicitly instead of silently truncating
+schemas: raise `--max-input-tokens` within the model's supported context and available
+VRAM if necessary. The SFT `--max-length` budget includes prompt and target tokens.
 
 Outputs: `sft/{train,validation}.jsonl`, split/hash manifest, `training/adapter/`,
 checkpoints (optimizer/scheduler/RNG), `training/{train,eval}_results.json`,

@@ -14,13 +14,18 @@ SYSTEM_PROMPT = """Bạn là AI Agent LifeMate. Chỉ xuất ĐÚNG MỘT JSON o
 Bạn có transcript yêu cầu nói tiếng Việt, context, history, các tool được cài và kết quả các calls trước.
 Mục tiêu: hoàn tất đúng trạng thái ứng dụng với ít calls hợp lý nhất.
 
-Một trong hai dạng output:
+Một trong các dạng output:
 {"action":"call","name":"app.tool","arguments":{"key":"value"}}
 {"action":"done"}
+{"action":"inspect","name":"app.tool"}
 
 QUY TẮC BẮT BUỘC:
 - Mỗi lần chỉ đề xuất 1 tool call; bạn sẽ được xem kết quả và quyết định tiếp.
 - Chỉ gọi tools trong tool_schemas, đúng tên và JSON types/enum/required/x-one-of.
+- tool_index liệt kê toàn bộ tools được phép. Nếu tool cần dùng có trong tool_index
+  nhưng chưa có schema, xuất {"action":"inspect","name":"app.tool"} để xem schema.
+  inspect là thao tác nội bộ, không thực thi tool và không thay đổi trạng thái ứng dụng.
+  Sau khi xem schema, dùng action call với arguments đúng schema; không đoán tham số.
 - Với x-ref, trước tiên dùng read tool tương ứng để tìm ID thực; KHÔNG bịa ID.
 - Nếu cần kết hợp nhiều hành động, hoàn tất từng hành động theo thứ tự phụ thuộc.
 - Dùng user context (current_time/timezone/location/profile) và lịch sử để giải quyết tham chiếu.
@@ -50,6 +55,8 @@ def parse_decision(raw: str) -> dict:
             obj = obj["tool_calls"][0]
         if obj.get("action") in ("done", "finish", "stop", "none"):
             return {"action": "done"}
+        if obj.get("action") == "inspect":
+            return {"action": "inspect", "name": obj.get("name")}
         if obj.get("action") == "call" or ("name" in obj and "arguments" in obj):
             return {"action": "call", "name": obj.get("name"), "arguments": obj.get("arguments")}
     raise ValueError(f"Model did not produce a valid tool decision: {raw[:300]}")
@@ -60,9 +67,9 @@ def short_json(obj: Any, limit: int = 5000) -> str:
     return s if len(s) <= limit else s[:limit] + "...(truncated)"
 
 
-def fit_prompt_payload(info: dict, max_chars: int = 20000) -> str:
+def fit_prompt_payload(info: dict, max_chars: int = 20000, protected_tools=()) -> str:
     """Fit large catalogs while preserving syntactically valid JSON at all times."""
-    # The ranker puts likely-relevant schemas first. Always retain meta schema.
+    # Retain the explicitly inspected schema and meta schema with full parameters.
     from copy import deepcopy
     payload = deepcopy(info)
     cat = payload["available_tools"]
@@ -74,7 +81,7 @@ def fit_prompt_payload(info: dict, max_chars: int = 20000) -> str:
     while len(s) > max_chars and len(cat["tool_schemas"]) > 2:
         # Remove lowest-ranked non-meta schema.
         i = next((i for i in range(len(cat["tool_schemas"]) - 1, -1, -1)
-                  if cat["tool_schemas"][i]["name"] != "sys.ask_missing_info"), None)
+                  if cat["tool_schemas"][i]["name"] not in {"sys.ask_missing_info", *protected_tools}), None)
         if i is None:
             break
         cat["tool_schemas"].pop(i)
@@ -94,10 +101,11 @@ def fit_prompt_payload(info: dict, max_chars: int = 20000) -> str:
         s = dumped()
     if len(s) > max_chars:
         # Extremely large catalogs: collapse descriptions in index first.
-        cat["tool_index"] = [{"name": x["name"]} for x in cat["tool_index"]]
+        cat["tool_index"] = [{"name": x["name"], "description": x.get("description", "")[:35]}
+                             for x in cat["tool_index"]]
         s = dumped()
-    # Do not truncate into an invalid JSON document; if the request itself
-    # is enormous, the tokenizer max_input_tokens remains a last-resort limit.
+    # Never cut JSON/schema definitions. LocalLLM checks the actual token budget
+    # and raises if this complete payload still does not fit.
     return s
 
 
@@ -158,13 +166,14 @@ class AgentConfig:
     use_train_transcript: bool = False
 
 
-def build_step_prompt(transcript, context, history, enabled, observations, last_tool, max_tool_details):
+def build_step_prompt(transcript, context, history, enabled, observations, last_tool, max_tool_details,
+                      inspected_tool=None):
     """Identical candidate selection and prompt payload for SFT and inference."""
     search_query = transcript + " " + " ".join(
         str(o.get("name", "")) + " " + short_json(o.get("result", ""), 900)
         for o in observations[-2:]
     )
-    tools = prompt_catalog(enabled, search_query, last_tool, max_tool_details)
+    tools = prompt_catalog(enabled, search_query, last_tool, max_tool_details, inspected_tool)
     info = {
         "request_transcript": transcript,
         "user_context": {k: v for k, v in context.items() if k != "installed_apps"},
@@ -172,7 +181,9 @@ def build_step_prompt(transcript, context, history, enabled, observations, last_
         "available_tools": tools,
         "previous_actions_and_results": observations[-7:],
     }
-    return tools, fit_prompt_payload(info)
+    payload = fit_prompt_payload(info, protected_tools=(inspected_tool,) if inspected_tool else ())
+    # Validate calls against schemas actually visible after size fitting.
+    return json.loads(payload)["available_tools"], payload
 
 
 class LifeMateAgent:
@@ -197,13 +208,16 @@ class LifeMateAgent:
         invalid = 0
         executed = 0
         last_tool: str | None = None
+        inspected_tool = None
+        inspections = 0
         epoch = 0
         recent_reads: set[tuple[int, str, str]] = set()
         while executed < self.cfg.max_calls and invalid < self.cfg.max_invalid:
             if time.monotonic() - t0 > self.cfg.sample_seconds - self.cfg.reserve_seconds:
                 break
             tools, user_prompt = build_step_prompt(
-                transcript, context, history, enabled, observations, last_tool, self.cfg.max_tool_details)
+                transcript, context, history, enabled, observations, last_tool, self.cfg.max_tool_details,
+                inspected_tool)
             raw = self.llm.generate(SYSTEM_PROMPT, user_prompt)
             try:
                 decision = parse_decision(raw)
@@ -213,6 +227,16 @@ class LifeMateAgent:
                 continue
             if decision["action"] == "done":
                 break
+            if decision["action"] == "inspect":
+                name = decision.get("name")
+                if (not isinstance(name, str) or name not in enabled or name == inspected_tool
+                        or inspections >= self.cfg.max_calls):
+                    invalid += 1
+                    observations.append({"error": "Invalid, duplicate or excessive schema inspection"})
+                else:
+                    inspected_tool = name
+                    inspections += 1
+                continue
             name, args = decision.get("name"), decision.get("arguments")
             if not isinstance(name, str) or name not in enabled or name not in {x["name"] for x in tools["tool_schemas"]}:
                 invalid += 1
@@ -256,4 +280,4 @@ class LifeMateAgent:
             if name == "sys.ask_missing_info":
                 break
         return {"transcript": transcript, "elapsed_seconds": round(time.monotonic() - t0, 3),
-                "executed": executed, "invalid_proposals": invalid}
+                "executed": executed, "invalid_proposals": invalid, "schema_inspections": inspections}

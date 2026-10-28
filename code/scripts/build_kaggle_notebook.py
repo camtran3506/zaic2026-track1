@@ -33,7 +33,7 @@ GPU_INDEX = 0         # dùng một GPU; không cộng gộp VRAM của 2 T4
 TRAIN_LLM = True
 TRAIN_BACKEND = "unsloth"  # backend mặc định; cần CUDA
 TRAIN_USE_ASR = False  # bật nếu train/history thiếu transcript
-TRAIN_MISSING_TOOL_POLICY = "skip"  # ghi log và bỏ cả mẫu nếu gold tool không có trong prompt; "error" để dừng
+TRAIN_MISSING_TOOL_POLICY = "error"  # schema thiếu sẽ được lấy qua action inspect; không mặc định bỏ mẫu
 TRAIN_DATA_ROOT = None  # None: tự tìm train/train.jsonl trong /kaggle/input
 LOCAL_ADAPTER = None   # TRAIN_LLM=False + đường dẫn adapter để dùng bản đã train
 TRAIN_EPOCHS = 3
@@ -203,7 +203,7 @@ Các cell dưới ghi mã vào `/kaggle/working/lifemate_app` để chạy trong
 for rel in ['lifemate/__init__.py', 'lifemate/catalog.py', 'lifemate/models.py', 'lifemate/agent.py',
             'main.py', 'score_train.py', 'lifemate/sft.py', 'prepare_sft.py', 'train_lora.py',
             'merge_lora.py', 'finetune.py', 'tests/test_baseline.py', 'tests/test_sft.py',
-            'tests/test_finetune_integration.py', 'tests/test_audio.py']:
+            'tests/test_finetune_integration.py', 'tests/test_audio.py', 'tests/test_catalog_inspection.py']:
     md(f'### `{rel}`')
     code(f'%%writefile /kaggle/working/lifemate_app/{rel}\n' + (ROOT/'code'/rel).read_text())
 
@@ -317,6 +317,8 @@ print("ASR:", ASR_PATH, "\\nLLM:", LLM_PATH)
 md('''## 5. Fine-tune tool calling trên TRAIN (LoRA/QLoRA)
 
 Mặc định `TRAIN_LLM=True`: huấn luyện LoRA/QLoRA, rồi tự chuyển sang **base model + adapter vừa train** cho task chính. Nhãn phải là `label.tool_calls` theo thứ tự thực thi. Replay dùng `ToolEnv` thật của train; kết quả tool trước được đưa vào prompt bước sau. Chỉ tính loss trên assistant JSON, split theo sample ID trước khi tạo các bước, không đọc nhãn test.
+
+Danh mục `tool_index` giữ toàn bộ tool được phép. Nếu gold tool chưa có schema chi tiết, dữ liệu SFT thêm action nội bộ `inspect` để yêu cầu schema trước khi gọi tool. Inference hỗ trợ cùng action; schema đã yêu cầu được giữ nguyên khi rút gọn prompt. Mặc định `TRAIN_MISSING_TOOL_POLICY="error"`, không bỏ mẫu do giới hạn top tool. `inspect` không phải tool call của BTC và không xuất vào submission.
 
 Muốn dùng adapter đã có: đặt `TRAIN_LLM=False`, `LOCAL_ADAPTER` tới thư mục adapter. Muốn dùng model đã merge: đặt `TRAIN_LLM=False`, `LOCAL_ADAPTER=None`, `LOCAL_LLM` tới model merged. Nếu thiếu train data khi bật training, cell sẽ dừng rõ ràng thay vì dùng model gốc âm thầm.
 

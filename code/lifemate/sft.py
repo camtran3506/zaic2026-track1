@@ -30,8 +30,9 @@ def split_records(records, validation_fraction=0.1, seed=42):
 def replay_sample(item, catalog, env, split_dir, asr=None, max_tool_details=35):
     """Read ONLY train labels; observe real ToolEnv returns before later targets.
 
-    Gold lists must be in execution order. No invented tool results, test labels,
-    or direct access to environment files. Fail on ambiguous/invisible targets.
+    Gold lists must be in execution order. Missing schemas are requested through
+    supervised inspect actions before calls, using the same protocol as inference.
+    No invented tool results, test labels, or direct access to environment files.
     """
     calls = item.get("label", {}).get("tool_calls")
     if not isinstance(calls, list):
@@ -50,17 +51,17 @@ def replay_sample(item, catalog, env, split_dir, asr=None, max_tool_details=35):
     enabled = allowed_tools(catalog, context.get("installed_apps", {}))
     observations, examples = [], []
     last_tool = None
+    inspected_tool = None
     recent_reads, epoch = set(), 0
 
     def example(target, step):
         tools, prompt = build_step_prompt(transcript, context, history, enabled, observations,
-                                          last_tool, max_tool_details)
+                                          last_tool, max_tool_details, inspected_tool)
         exposed = json.loads(prompt)["available_tools"]["tool_schemas"]
         if target["action"] == "call" and target["name"] not in {t["name"] for t in exposed}:
             raise UnexposedToolError(
                 f"{item['id']} step {step}: target {target['name']} not exposed in prompt "
-                f"({len(exposed)} schemas); use --missing-tool-policy skip to report and exclude this "
-                "whole sample, or adjust candidate selection consistently in training/inference")
+                f"({len(exposed)} schemas) after schema inspection; check catalog prompt construction")
         return {"sample_id": item["id"], "step": step, "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
@@ -80,7 +81,15 @@ def replay_sample(item, catalog, env, split_dir, asr=None, max_tool_details=35):
         read_key = (epoch, name, short_json(args))
         if enabled[name].get("kind") == "read" and read_key in recent_reads:
             raise ValueError(f"{item['id']}: duplicate read rejected by inference policy")
-        examples.append(example({"action": "call", "name": name, "arguments": args}, step))
+        _, prompt = build_step_prompt(transcript, context, history, enabled, observations,
+                                       last_tool, max_tool_details, inspected_tool)
+        exposed = {spec["name"] for spec in json.loads(prompt)["available_tools"]["tool_schemas"]}
+        if name not in exposed:
+            # Supervise an explicit schema request, just as inference can request it.
+            # The first prompt contains no gold args/schema injected from the label.
+            examples.append(example({"action": "inspect", "name": name}, len(examples)))
+            inspected_tool = name
+        examples.append(example({"action": "call", "name": name, "arguments": args}, len(examples)))
         try:
             result = env.call(name, args)
         except Exception as exc:
@@ -94,7 +103,7 @@ def replay_sample(item, catalog, env, split_dir, asr=None, max_tool_details=35):
             epoch += 1
             recent_reads.clear()
     if not calls or calls[-1]["name"] != "sys.ask_missing_info":
-        examples.append(example({"action": "done"}, len(calls)))
+        examples.append(example({"action": "done"}, len(examples)))
     return examples
 
 

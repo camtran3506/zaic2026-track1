@@ -70,8 +70,10 @@ class LocalLLM:
         tokenizer = self.tokenizer
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         rendered = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        encoded = tokenizer(rendered, return_tensors="pt", truncation=True,
-                            max_length=self.max_input_tokens, return_token_type_ids=False)
+        encoded = tokenizer(rendered, return_tensors="pt", truncation=False, return_token_type_ids=False)
+        if encoded["input_ids"].shape[1] > self.max_input_tokens:
+            raise ValueError(f"Prompt exceeds --max-input-tokens={self.max_input_tokens}; "
+                             "increase the input budget instead of silently truncating tool schemas")
         encoded = {k: v.to(self.device) for k, v in encoded.items()}
         with self.torch.inference_mode():
             ids = self.model.generate(
