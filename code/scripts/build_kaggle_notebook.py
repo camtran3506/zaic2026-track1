@@ -208,11 +208,26 @@ for rel in ['lifemate/__init__.py', 'lifemate/catalog.py', 'lifemate/models.py',
 
 code('''run_logged([sys.executable, "-m", "pytest", "-q", "-p", "no:cacheprovider"],
            OUT / "unit_tests.log", cwd=APP, env=BASE_ENV)
-run_logged([sys.executable, "-c",
-    "import sys; sys.path.insert(0, sys.argv[1]); from zaic_tools import ToolEnv; "
-    "assert all(callable(getattr(ToolEnv,n,None)) for n in "
-    "('validate','call','get_tool_calls','get_state_hash')); print('ToolEnv public API OK')",
-    SPLIT_DIR], OUT / "setup.log", cwd=APP, env=BASE_ENV)
+toolenv_check_script = """
+import sys
+from pathlib import Path
+from main import resolve_data_layout
+split_dir, env_root, holder = resolve_data_layout(Path(sys.argv[1]), sys.argv[2])
+try:
+    sys.path.insert(0, str(split_dir))
+    from zaic_tools import ToolEnv
+    env = ToolEnv(sys.argv[2], sys.argv[3], root=str(env_root))
+    required = ('validate', 'call', 'get_tool_calls', 'get_state_hash')
+    missing = [name for name in required if not callable(getattr(env, name, None))]
+    if missing:
+        raise RuntimeError('ToolEnv instance is missing callable API methods: ' + ', '.join(missing))
+    print('ToolEnv instance public API OK')
+finally:
+    if holder is not None:
+        holder.cleanup()
+"""
+run_logged([sys.executable, "-c", toolenv_check_script, SPLIT_DIR, SPLIT, EXPECTED_IDS[0]],
+           OUT / "setup.log", cwd=APP, env=BASE_ENV)
 ''')
 
 md('''## 4. Tải Hugging Face model và chuyển ASR nếu cần
