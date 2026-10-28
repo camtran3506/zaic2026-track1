@@ -210,6 +210,16 @@ for records/history that need ASR. No synthetic tool results or gold arguments a
 inserted into earlier prompts. Loss masks system/user/padding tokens and trains only
 the assistant JSON and its end-of-turn tokens.
 
+If a valid gold tool is missing from the final prompt (candidate ranking or prompt
+size pruning), CLI preparation stops by default. Add `--missing-tool-policy skip`
+to exclude the **entire sample**, including all its steps, with a warning and an
+entry in `sft/train_skipped.jsonl` or `sft/validation_skipped.jsonl`. The Kaggle notebook
+defaults to `TRAIN_MISSING_TOOL_POLICY="skip"`; set it to `"error"` for strict mode.
+The manifest records retained IDs, source counts and skipped reasons separately
+for each partition. Validation loss then describes only the retained validation
+samples; this filtering does not fix candidate recall at inference time. No gold
+tool is injected into the prompt, and invalid labels still cause preparation to fail.
+
 Outputs: `sft/{train,validation}.jsonl`, split/hash manifest, `training/adapter/`,
 checkpoints (optimizer/scheduler/RNG), `training/{train,eval}_results.json`,
 `training/trainer_state.json`, training config, resolved base-model SHA (for HF IDs),

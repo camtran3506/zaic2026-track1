@@ -11,6 +11,10 @@ from .agent import (SYSTEM_PROMPT, _train_transcript, audio_path, build_step_pro
 from .catalog import allowed_tools
 
 
+class UnexposedToolError(ValueError):
+    """A valid gold tool is absent from the actual prompt's selected schemas."""
+
+
 def split_records(records, validation_fraction=0.1, seed=42):
     if not 0 < validation_fraction < 1 or len(records) < 2:
         raise ValueError("Need >=2 unique samples and 0 < validation_fraction < 1")
@@ -51,8 +55,12 @@ def replay_sample(item, catalog, env, split_dir, asr=None, max_tool_details=35):
     def example(target, step):
         tools, prompt = build_step_prompt(transcript, context, history, enabled, observations,
                                           last_tool, max_tool_details)
-        if target["action"] == "call" and target["name"] not in {t["name"] for t in tools["tool_schemas"]}:
-            raise ValueError(f"{item['id']} step {step}: target not exposed; increase --max-tool-details consistently in training/inference")
+        exposed = json.loads(prompt)["available_tools"]["tool_schemas"]
+        if target["action"] == "call" and target["name"] not in {t["name"] for t in exposed}:
+            raise UnexposedToolError(
+                f"{item['id']} step {step}: target {target['name']} not exposed in prompt "
+                f"({len(exposed)} schemas); use --missing-tool-policy skip to report and exclude this "
+                "whole sample, or adjust candidate selection consistently in training/inference")
         return {"sample_id": item["id"], "step": step, "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},

@@ -19,6 +19,7 @@ def main():
     p.add_argument("--asr-compute-type", default="float16")
     p.add_argument("--validation-fraction", type=float, default=0.1)
     p.add_argument("--max-tool-details", type=int, default=35)
+    p.add_argument("--missing-tool-policy", choices=["error", "skip"], default="error")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--export-merged", action="store_true", help="Needs RAM/disk for full-precision base + adapter")
     # Remaining args are forwarded to train_lora.py, e.g. --max-steps or --quantization.
@@ -52,7 +53,7 @@ def main():
     env.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_DATASETS_OFFLINE="1")
     prepare = ["--data-root", args.data_root, "--output-dir", args.output_dir / "sft",
                "--validation-fraction", args.validation_fraction, "--seed", args.seed,
-               "--max-tool-details", args.max_tool_details]
+               "--max-tool-details", args.max_tool_details, "--missing-tool-policy", args.missing_tool_policy]
     if args.asr_model:
         prepare.extend(["--asr-model", args.asr_model, "--device", args.asr_device,
                         "--asr-compute-type", args.asr_compute_type])

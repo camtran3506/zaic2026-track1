@@ -1,9 +1,11 @@
 import json
+import sys
+import types
 from pathlib import Path
 
 import pytest
 
-from lifemate.sft import encode_example, replay_sample, split_records, AssistantCollator
+from lifemate.sft import UnexposedToolError, encode_example, replay_sample, split_records, AssistantCollator
 from test_baseline import CATALOG, FakeEnv, item
 
 
@@ -45,6 +47,49 @@ def test_terminal_missing_info_does_not_add_done():
     entry['label']['tool_calls'] = [{'name': 'sys.ask_missing_info',
         'arguments': {'tool_name': 'smart_home.light_set', 'params': ['device_id']}}]
     assert len(replay_sample(entry, CATALOG, FakeEnv(), Path('/unused'))) == 1
+
+
+def test_gold_tool_must_exist_in_final_prompt_after_pruning(monkeypatch):
+    import lifemate.sft as sft
+    monkeypatch.setattr(sft, 'build_step_prompt', lambda *args: (
+        {'tool_schemas': [{'name': 'smart_home.get_status'}]},
+        json.dumps({'available_tools': {'tool_schemas': []}})))
+    with pytest.raises(UnexposedToolError, match='smart_home.get_status not exposed'):
+        replay_sample(labeled(), CATALOG, FakeEnv(), Path('/unused'))
+
+
+def test_prepare_skip_reports_whole_samples_and_retains_partition_ids(tmp_path, monkeypatch):
+    import prepare_sft
+    source = tmp_path / 'data' / 'train'
+    source.mkdir(parents=True)
+    records = [dict(labeled(), id=f'train_{i}') for i in range(8)]
+    train, valid = split_records(records, 0.3, 42)
+    rejected = {train[0]['id'], valid[0]['id']}
+    (source / 'train.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in records))
+    (source / 'train_tools_catalog.json').write_text(json.dumps({'apps': [{'tools': list(CATALOG.values())}]}))
+    monkeypatch.setitem(sys.modules, 'zaic_tools', types.SimpleNamespace(ToolEnv=lambda *a, **k: FakeEnv()))
+    def replay(record, *args):
+        if record['id'] in rejected:
+            raise UnexposedToolError(f"{record['id']}: target not exposed")
+        return replay_sample(record, *args)
+    monkeypatch.setattr(prepare_sft, 'replay_sample', replay)
+    out = tmp_path / 'sft'
+    monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--data-root', str(source),
+        '--output-dir', str(out), '--validation-fraction', '0.3', '--missing-tool-policy', 'skip'])
+    prepare_sft.main()
+    manifest = json.loads((out / 'manifest.json').read_text())
+    retained = set()
+    for part in ('train', 'validation'):
+        metadata = manifest['partitions'][part]
+        rows = [json.loads(line) for line in (out / f'{part}.jsonl').read_text().splitlines()]
+        ids = {r['sample_id'] for r in rows}
+        assert ids == set(metadata['sample_ids'])
+        assert not ids & rejected
+        assert not retained & ids
+        retained |= ids
+        assert metadata['source_samples'] == metadata['samples'] + len(metadata['skipped_samples'])
+        assert len((out / f'{part}_skipped.jsonl').read_text().splitlines()) == 1
+    assert len(retained) == 6
 
 
 def test_split_is_grouped_deterministic_and_order_independent():

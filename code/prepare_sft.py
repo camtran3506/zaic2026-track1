@@ -7,7 +7,7 @@ import sys
 
 from main import resolve_data_layout
 from lifemate.catalog import load_catalog
-from lifemate.sft import file_sha256, replay_sample, split_records
+from lifemate.sft import UnexposedToolError, file_sha256, replay_sample, split_records
 
 
 def main():
@@ -17,6 +17,8 @@ def main():
     p.add_argument("--validation-fraction", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--max-tool-details", type=int, default=35)
+    p.add_argument("--missing-tool-policy", choices=["error", "skip"], default="error",
+                   help="Skip/report whole samples whose gold tools are absent from prompts, or stop")
     p.add_argument("--asr-model", type=Path)
     p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     p.add_argument("--asr-compute-type", default="float16")
@@ -38,21 +40,40 @@ def main():
         asr = LocalASR(args.asr_model, device=args.device, compute_type=args.asr_compute_type)
     metadata = dict(source=str(source), source_sha256=file_sha256(source),
                     catalog_sha256=file_sha256(catalog_path), seed=args.seed,
-                    max_tool_details=args.max_tool_details, partitions={})
+                    max_tool_details=args.max_tool_details, missing_tool_policy=args.missing_tool_policy,
+                    partitions={})
     for partition, rows in (("train", train), ("validation", validation)):
         path = args.output_dir / f"{partition}.jsonl"
         count = 0
+        retained_ids = []
+        skipped = []
         # Partial preparations stay marked .partial and are never consumed by the trainer.
         with path.with_suffix(".partial").open("w", encoding="utf-8") as f:
             for i, record in enumerate(rows):
                 env = ToolEnv("train", record["id"], root=str(env_root))
-                for example in replay_sample(record, catalog, env, split_dir, asr, args.max_tool_details):
+                try:
+                    examples = replay_sample(record, catalog, env, split_dir, asr, args.max_tool_details)
+                except UnexposedToolError as exc:
+                    if args.missing_tool_policy == "error":
+                        raise
+                    reason = {"sample_id": record["id"], "reason": str(exc)}
+                    skipped.append(reason)
+                    with (args.output_dir / f"{partition}_skipped.jsonl").open("a", encoding="utf-8") as report:
+                        report.write(json.dumps(reason, ensure_ascii=False) + "\n")
+                    print(f"WARNING skipped entire {partition} sample: {exc}", flush=True)
+                    continue
+                retained_ids.append(record["id"])
+                for example in examples:
                     f.write(json.dumps(example, ensure_ascii=False) + "\n")
                     count += 1
                 print(f"{partition}: {i+1}/{len(rows)} samples, {count} SFT steps", flush=True)
+        if not retained_ids:
+            raise ValueError(f"No usable {partition} samples; inspect skipped report and candidate selection")
         path.with_suffix(".partial").replace(path)
-        metadata["partitions"][partition] = dict(sample_ids=[r["id"] for r in rows],
-            samples=len(rows), examples=count, sha256=file_sha256(path))
+        metadata["partitions"][partition] = dict(sample_ids=retained_ids,
+            samples=len(retained_ids), source_samples=len(rows), skipped_samples=skipped,
+            examples=count, sha256=file_sha256(path))
+        print(f"{partition} summary: kept {len(retained_ids)}/{len(rows)}, skipped {len(skipped)}, {count} steps", flush=True)
     (args.output_dir / "manifest.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     print("Prepared TRAIN-only SFT data:", args.output_dir)
     if holder is not None:

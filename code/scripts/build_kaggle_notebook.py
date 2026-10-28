@@ -33,6 +33,7 @@ GPU_INDEX = 0         # dùng một GPU; không cộng gộp VRAM của 2 T4
 TRAIN_LLM = True
 TRAIN_BACKEND = "unsloth"  # backend mặc định; cần CUDA
 TRAIN_USE_ASR = False  # bật nếu train/history thiếu transcript
+TRAIN_MISSING_TOOL_POLICY = "skip"  # ghi log và bỏ cả mẫu nếu gold tool không có trong prompt; "error" để dừng
 TRAIN_DATA_ROOT = None  # None: tự tìm train/train.jsonl trong /kaggle/input
 LOCAL_ADAPTER = None   # TRAIN_LLM=False + đường dẫn adapter để dùng bản đã train
 TRAIN_EPOCHS = 3
@@ -337,6 +338,7 @@ if TRAIN_LLM:
         "--backend", TRAIN_BACKEND,
         "--validation-fraction", str(TRAIN_VALIDATION_FRACTION),
         "--max-tool-details", str(MAX_TOOL_DETAILS), "--seed", str(SEED),
+        "--missing-tool-policy", TRAIN_MISSING_TOOL_POLICY,
         "--epochs", str(TRAIN_EPOCHS), "--max-steps", str(TRAIN_MAX_STEPS),
         "--max-length", str(TRAIN_MAX_LENGTH),
         "--gradient-accumulation", str(TRAIN_GRAD_ACCUMULATION),
@@ -350,7 +352,8 @@ if TRAIN_LLM:
         if FT_RUN.is_dir():
             for filename in ("prepare_sft.log", "train_lora.log", "base_model.json",
                              "training/training_config.json", "training/eval_results.json",
-                             "training/train_results.json", "training/trainer_state.json", "sft/manifest.json"):
+                             "training/train_results.json", "training/trainer_state.json", "sft/manifest.json",
+                             "sft/train_skipped.jsonl", "sft/validation_skipped.jsonl"):
                 path = FT_RUN / filename
                 if path.is_file():
                     shutil.copy2(path, OUT / ("training_" + filename.replace("/", "_")))
