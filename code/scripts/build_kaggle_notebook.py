@@ -94,7 +94,7 @@ md('''## 1. Dependency và runtime
 Giữ nguyên PyTorch/CUDA do Kaggle cung cấp, không cài đè torch. Các thư viện ASR/LLM được cài trong tiến trình riêng trước khi dùng. CTranslate2 cần CUDA 12 + cuDNN 9 khi chạy GPU; bước suy luận thực tế sẽ kiểm tra việc nạp model. Nếu GPU memory không đủ, giảm `MAX_INPUT_TOKENS`, chọn model nhỏ hơn hoặc đổi GPU.''')
 code('''packages = [
     "numpy>=1.26,<3", "transformers==4.57.3", "accelerate==1.15.0",
-    "safetensors==0.8.0", "faster-whisper==1.2.1", "ctranslate2==4.6.0",
+    "safetensors==0.8.0", "faster-whisper==1.2.1", "av==16.1.0", "ctranslate2==4.6.0",
     "huggingface-hub==0.36.2", "pytest>=8,<10", "peft==0.19.1", "bitsandbytes>=0.45.5,<0.50,!=0.46.0,!=0.48.0",
     "unsloth==2025.12.10", "unsloth-zoo==2025.12.8",
 ]
@@ -202,7 +202,7 @@ Các cell dưới ghi mã vào `/kaggle/working/lifemate_app` để chạy trong
 for rel in ['lifemate/__init__.py', 'lifemate/catalog.py', 'lifemate/models.py', 'lifemate/agent.py',
             'main.py', 'score_train.py', 'lifemate/sft.py', 'prepare_sft.py', 'train_lora.py',
             'merge_lora.py', 'finetune.py', 'tests/test_baseline.py', 'tests/test_sft.py',
-            'tests/test_finetune_integration.py']:
+            'tests/test_finetune_integration.py', 'tests/test_audio.py']:
     md(f'### `{rel}`')
     code(f'%%writefile /kaggle/working/lifemate_app/{rel}\n' + (ROOT/'code'/rel).read_text())
 

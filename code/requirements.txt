@@ -5,6 +5,8 @@ transformers>=4.53,<5
 accelerate>=1.1,<2
 safetensors>=0.4,<1
 faster-whisper>=1.1,<2
+# PyAV 19 removed metadata_errors, still used by faster-whisper 1.2.1.
+av==16.1.0
 ctranslate2>=4.5,<5
 huggingface-hub>=0.25,<1
 pytest>=8,<10
