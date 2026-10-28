@@ -95,7 +95,7 @@ Giữ nguyên PyTorch/CUDA do Kaggle cung cấp, không cài đè torch. Các th
 code('''packages = [
     "numpy>=1.26,<3", "transformers==4.57.3", "accelerate==1.15.0",
     "safetensors==0.8.0", "faster-whisper==1.2.1", "ctranslate2==4.6.0",
-    "huggingface-hub==0.36.2", "pytest>=8,<10", "peft==0.18.0", "bitsandbytes>=0.45.5,<0.50,!=0.46.0,!=0.48.0",
+    "huggingface-hub==0.36.2", "pytest>=8,<10", "peft==0.19.1", "bitsandbytes>=0.45.5,<0.50,!=0.46.0,!=0.48.0",
     "unsloth==2025.12.10", "unsloth-zoo==2025.12.8",
 ]
 # Kiểm tra torch trước: tránh pip tự kéo một bản CUDA khác với Kaggle.

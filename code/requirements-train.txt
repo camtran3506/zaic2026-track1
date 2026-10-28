@@ -1,5 +1,6 @@
 -r requirements.txt
-peft==0.18.0
+# 0.19.1 supports TorchAO's TorchAOBaseTensor API (0.18.x imports removed types).
+peft==0.19.1
 # This Unsloth release supports Qwen3 and Transformers <=4.57.3.
 transformers==4.57.3
 unsloth==2025.12.10

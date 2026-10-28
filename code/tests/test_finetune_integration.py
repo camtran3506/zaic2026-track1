@@ -4,8 +4,26 @@ import os
 from pathlib import Path
 import subprocess
 import sys
+import types
 
 import pytest
+
+
+def test_lora_accepts_modern_torchao_api(monkeypatch):
+    """Modern TorchAO no longer exports LinearActivationQuantizedTensor."""
+    torch = pytest.importorskip('torch')
+    pytest.importorskip('peft')
+    from peft.tuners.lora import torchao as dispatch_module
+    from peft import LoraConfig, get_peft_model
+    from transformers import Qwen3Config, Qwen3ForCausalLM
+    fake_utils = types.ModuleType('torchao.utils')
+    fake_utils.TorchAOBaseTensor = type('TorchAOBaseTensor', (), {})
+    monkeypatch.setitem(sys.modules, 'torchao.utils', fake_utils)
+    monkeypatch.setattr(dispatch_module, 'is_torchao_available', lambda: True)
+    model = Qwen3ForCausalLM(Qwen3Config(vocab_size=8, hidden_size=16, intermediate_size=32,
+        num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=1, head_dim=8))
+    model = get_peft_model(model, LoraConfig(r=2, task_type='CAUSAL_LM', target_modules=['q_proj']))
+    assert any('lora_B' in name for name, _ in model.named_parameters())
 
 
 def test_train_adapter_reload_and_merge(tmp_path):
