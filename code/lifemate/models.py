@@ -37,13 +37,15 @@ class LocalASR:
 
 class LocalLLM:
     def __init__(self, model_path: Path, device: str = "cuda", dtype: str = "float16",
-                 max_input_tokens: int = 6000, max_new_tokens: int = 192):
+                 max_input_tokens: int = 6000, max_new_tokens: int = 192,
+                 adapter_path: Path | None = None):
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
         if not model_path.is_dir():
             raise FileNotFoundError(f"LLM model directory not found: {model_path}")
         self.torch = torch
-        self.tokenizer = AutoTokenizer.from_pretrained(str(model_path), local_files_only=True, trust_remote_code=False)
+        tokenizer_path = adapter_path if adapter_path and (adapter_path / "tokenizer_config.json").is_file() else model_path
+        self.tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_path), local_files_only=True, trust_remote_code=False)
         self.tokenizer.truncation_side = "right"
         torch_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[dtype]
         self.model = AutoModelForCausalLM.from_pretrained(
@@ -52,6 +54,12 @@ class LocalLLM:
             low_cpu_mem_usage=True,
             attn_implementation="sdpa",
         )
+        if adapter_path is not None:
+            if not (adapter_path / "adapter_config.json").is_file():
+                raise FileNotFoundError(f"LoRA adapter not found: {adapter_path}")
+            from peft import PeftModel
+            self.model = PeftModel.from_pretrained(self.model, str(adapter_path),
+                                                 local_files_only=True, is_trainable=False)
         self.model.to(device)
         self.model.eval()
         self.device = device
@@ -62,7 +70,8 @@ class LocalLLM:
         tokenizer = self.tokenizer
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         rendered = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
-        encoded = tokenizer(rendered, return_tensors="pt", truncation=True, max_length=self.max_input_tokens)
+        encoded = tokenizer(rendered, return_tensors="pt", truncation=True,
+                            max_length=self.max_input_tokens, return_token_type_ids=False)
         encoded = {k: v.to(self.device) for k, v in encoded.items()}
         with self.torch.inference_mode():
             ids = self.model.generate(

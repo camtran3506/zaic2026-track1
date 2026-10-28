@@ -158,6 +158,23 @@ class AgentConfig:
     use_train_transcript: bool = False
 
 
+def build_step_prompt(transcript, context, history, enabled, observations, last_tool, max_tool_details):
+    """Identical candidate selection and prompt payload for SFT and inference."""
+    search_query = transcript + " " + " ".join(
+        str(o.get("name", "")) + " " + short_json(o.get("result", ""), 900)
+        for o in observations[-2:]
+    )
+    tools = prompt_catalog(enabled, search_query, last_tool, max_tool_details)
+    info = {
+        "request_transcript": transcript,
+        "user_context": {k: v for k, v in context.items() if k != "installed_apps"},
+        "conversation_history": history,
+        "available_tools": tools,
+        "previous_actions_and_results": observations[-7:],
+    }
+    return tools, fit_prompt_payload(info)
+
+
 class LifeMateAgent:
     def __init__(self, asr: Any, llm: Any, catalog: dict[str, dict], cfg: AgentConfig):
         self.asr = asr
@@ -185,19 +202,9 @@ class LifeMateAgent:
         while executed < self.cfg.max_calls and invalid < self.cfg.max_invalid:
             if time.monotonic() - t0 > self.cfg.sample_seconds - self.cfg.reserve_seconds:
                 break
-            search_query = transcript + " " + " ".join(
-                str(o.get("name", "")) + " " + short_json(o.get("result", ""), 900)
-                for o in observations[-2:]
-            )
-            tools = prompt_catalog(enabled, search_query, last_tool, self.cfg.max_tool_details)
-            info = {
-                "request_transcript": transcript,
-                "user_context": {k: v for k, v in context.items() if k != "installed_apps"},
-                "conversation_history": history,
-                "available_tools": tools,
-                "previous_actions_and_results": observations[-7:],
-            }
-            raw = self.llm.generate(SYSTEM_PROMPT, fit_prompt_payload(info))
+            tools, user_prompt = build_step_prompt(
+                transcript, context, history, enabled, observations, last_tool, self.cfg.max_tool_details)
+            raw = self.llm.generate(SYSTEM_PROMPT, user_prompt)
             try:
                 decision = parse_decision(raw)
             except ValueError as exc:

@@ -32,6 +32,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--split", choices=["train", "public_test", "private_test"], default="public_test")
     p.add_argument("--asr-model", type=Path, required=True, help="Local CTranslate2 Whisper directory")
     p.add_argument("--llm-model", type=Path, required=True, help="Local HF Transformers LLM directory")
+    p.add_argument("--llm-adapter", type=Path, default=None, help="Optional local fine-tuned LoRA adapter")
     p.add_argument("--output", type=Path, default=Path("result/submission.jsonl"))
     p.add_argument("--log-path", type=Path, default=None, help="Optional diagnostic JSONL, never submitted")
     p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
@@ -95,7 +96,8 @@ def main() -> None:
     from lifemate.models import LocalASR, LocalLLM
     asr = LocalASR(args.asr_model, device=args.device, compute_type=args.asr_compute_type, beam_size=args.asr_beam)
     llm = LocalLLM(args.llm_model, device=args.device, dtype=args.llm_dtype,
-                   max_input_tokens=args.max_input_tokens, max_new_tokens=args.max_new_tokens)
+                   max_input_tokens=args.max_input_tokens, max_new_tokens=args.max_new_tokens,
+                   adapter_path=args.llm_adapter)
     cfg = AgentConfig(max_calls=args.max_calls, max_invalid=args.max_invalid,
                       max_tool_details=args.max_tool_details, sample_seconds=args.sample_seconds,
                       use_train_transcript=args.use_train_transcript)

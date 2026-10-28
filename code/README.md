@@ -54,6 +54,7 @@ All paths can also be supplied via CLI as shown below.
 ### Dataset root is the parent of split folders
 
 ```bash
+mkdir -p result
 python main.py \
     --data-root /your/storage/lifemate_data \
     --split public_test \
@@ -156,10 +157,118 @@ By default `docker run ... lifemate:baseline` targets **private_test** at `/data
 - The agent prompts the LLM to perform read calls before x-ref-dependent writes, but does not implement a full symbolic planner. Long/complex tasks will be imperfect.
 - The model's response is constrained by a JSON-only prompt and strict parser, not constrained decoder. Malformed generations consume retries.
 - No external API or online requests at inference. `state.json` is NEVER read directly.
-- Train labels are used only by the separate train evaluation command (or train audio_text in an explicit ablation). No public/private labeling or tuning is implemented.
+- Fine-tuning reads only `train/train.jsonl` labels. Public/private test labels are never used. See the training workflow below.
 - Random seeds and greedy decoding are set; deterministic GPU kernels may still depend on exact GPU, driver and library versions. Freeze versions and run repeatability checks before final Docker submission.
 - The `zaic_tools` API is integrated strictly according to the prompt-provided interface; if your package exposes different structures, adapt the catalog parsing only after inspecting its *public* API/documentation (never environment files).
 - For stronger models/ASR, replace local checkpoint paths but keep combined parameters <6B and LLM <5B.
+
+## Fine-tune the LLM for next-tool calling with Unsloth (LoRA / QLoRA)
+
+The training schema is the same as inference: `audio_text`, `context`, `history`, and
+`label.tool_calls` (ordered `{name, arguments}` objects). Empty call lists produce a
+`done` target; missing labels are errors. Only TRAIN data is accepted by the preparation
+entrypoint. Keep the organizer's train-specific `zaic_tools` next to `train.jsonl`.
+
+The default training backend is **Unsloth** (`FastLanguageModel`), imported before
+Transformers/PEFT in the training process. It uses Unsloth gradient checkpointing,
+QLoRA 4-bit and optimized LoRA kernels (dropout=0). Install a CUDA-enabled PyTorch
+suitable for your GPU first, then:
+
+```bash
+cd code
+python -m pip install -r requirements-train.txt
+
+# One command: stage base weights, prepare dialogues, train/evaluate, save adapter.
+# A local model path works fully offline. A HF ID downloads the resolved revision first.
+python finetune.py \
+  --data-root /path/to/lifemate_data \
+  --base-model Qwen/Qwen3-4B-Instruct-2507 \
+  --output-dir /path/to/runs/toolcalling_v1 \
+  --backend unsloth --epochs 3 --quantization 4bit --max-length 8192 \
+  --batch-size 1 --gradient-accumulation 8 --learning-rate 2e-4
+```
+
+QLoRA uses NF4 double quantization, LoRA on attention/MLP projections, SDPA,
+gradient checkpointing, and BF16 on supporting GPUs (FP16 on T4). Start with a
+16-GB+ CUDA GPU; required VRAM depends on sequence length. Reduce `--max-length`
+only if examples fit: preparation/training rejects oversized examples instead of
+silently truncating JSON targets. CPU LoRA (`--quantization none`) is supported for
+tiny smoke tests only with `--backend transformers --quantization none`; Unsloth
+requires a supported CUDA GPU and never silently falls back to another backend.
+Training and inference are single
+GPU by default; two T4 cards do not automatically combine VRAM.
+
+`prepare_sft.py` splits source sample IDs deterministically before expanding steps,
+preventing a sample's trajectory from leaking into validation. It replays each gold
+call through the real train `ToolEnv.validate/call`; the next prompt contains only
+previous real tool results. It never opens environment state files. Gold lists must
+be in execution order. It uses the **same candidate ranking and prompt builder** as
+inference; unavailable/schema-invalid/non-exposed targets fail with the sample ID.
+Use `--max-tool-details` consistently in preparation and inference if your gold tools
+need a larger candidate set. Training transcripts are required; pass `--asr-model`
+for records/history that need ASR. No synthetic tool results or gold arguments are
+inserted into earlier prompts. Loss masks system/user/padding tokens and trains only
+the assistant JSON and its end-of-turn tokens.
+
+Outputs: `sft/{train,validation}.jsonl`, split/hash manifest, `training/adapter/`,
+checkpoints (optimizer/scheduler/RNG), `training/{train,eval}_results.json`,
+`training/trainer_state.json`, training config, resolved base-model SHA (for HF IDs),
+and logs for every stage. Held-out teacher-forced `eval_loss` is **not tool-call F1**
+or an official competition score. Judge quality with real end-to-end runs on held-out
+train IDs, comparing the same IDs/base model/settings; a completed training run alone
+does not establish improved accuracy.
+
+### Run the main task with the fine-tuned adapter
+
+Keep the **exact base model** used for training. The adapter folder includes its tokenizer:
+
+```bash
+mkdir -p result
+python main.py \
+  --data-root /path/to/lifemate_data --split public_test \
+  --asr-model /path/to/asr \
+  --llm-model /path/to/exact-base-model \
+  --llm-adapter /path/to/runs/toolcalling_v1/training/adapter \
+  --llm-dtype float16 --device cuda \
+  --output result/submission.jsonl --log-path result/diagnostics.jsonl \
+  > result/inference.log 2>&1
+```
+
+Adapter loading is offline and requires PEFT. Inference loads full-precision base + LoRA, so QLoRA's
+low training VRAM is not a promise about inference VRAM.
+
+### Export a standalone model and resume training
+
+```bash
+# Can also request --export-merged in finetune.py. CPU merge needs RAM/disk for
+# the full base model; run it separately if training GPU memory is tight.
+python merge_lora.py --base-model /path/to/exact-base-model \
+  --adapter /path/to/runs/toolcalling_v1/training/adapter \
+  --output-dir /path/to/runs/toolcalling_v1/merged --dtype float16
+
+# Standalone inference: use merged as --llm-model and omit --llm-adapter.
+python train_lora.py --base-model /path/to/exact-base-model \
+  --sft-dir /path/to/runs/toolcalling_v1/sft \
+  --output-dir /path/to/runs/toolcalling_v1/training \
+  --resume-from-checkpoint /path/to/runs/toolcalling_v1/training/checkpoint-100 \
+  --backend unsloth --epochs 3 --quantization 4bit --max-length 8192
+```
+
+Resume with the same model, data, optimizer/batch/LoRA settings as the original run;
+change the total epoch/step budget as needed. New pipeline runs require an empty
+directory to avoid overwriting previous artifacts. Generated training datasets contain
+transcripts and tool results: keep them private. Merge does not require PEFT during
+later inference; keep both merged LLM and ASR inside the final offline image.
+
+The standalone Kaggle notebook in `../notebooks/LifeMate_Kaggle.ipynb` includes
+these training scripts and can train first, then pass the saved adapter into inference.
+`TRAIN_LLM=True` and `TRAIN_BACKEND="unsloth"` are the notebook defaults. Dependencies
+pin Unsloth 2025.12.10, unsloth-zoo 2025.12.8 and compatible Transformers 4.57.3;
+the notebook constrains Kaggle's existing Torch/Torchvision/Triton stack during pip
+resolution. If that stack is incompatible, installation stops with the resolver's
+error rather than replacing CUDA packages silently. Full Unsloth GPU training still
+needs validation on the actual Kaggle GPU; CPU tests exercise the shared SFT pipeline
+and the explicit Transformers backend.
 
 ## Unit tests (no competition data required)
 
@@ -167,6 +276,10 @@ By default `docker run ... lifemate:baseline` targets **private_test** at `/data
 python -m pytest -q
 python -m compileall -q main.py lifemate score_train.py
 ```
+
+With training dependencies installed, tests also run a tiny randomly initialized
+Qwen through actual LoRA updates, checkpoint resume, offline adapter generation,
+and merged-model equivalence. They do not download models or establish real dataset accuracy.
 
 ## Submission file
 
