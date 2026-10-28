@@ -95,6 +95,9 @@ class LocalLLM:
         self.max_new_tokens = min(max_new_tokens, 384)
 
     def generate(self, system: str, user: str) -> str:
+        # Import lazily: Unsloth must be imported before Transformers during training.
+        from transformers import StoppingCriteriaList
+        from .decoding import DecisionJsonStoppingCriteria
         tokenizer = self.tokenizer
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         rendered = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
@@ -103,12 +106,16 @@ class LocalLLM:
             raise ValueError(f"Prompt exceeds --max-input-tokens={self.max_input_tokens}; "
                              "increase the input budget instead of silently truncating tool schemas")
         encoded = {k: v.to(self.device) for k, v in encoded.items()}
+        stop = DecisionJsonStoppingCriteria(tokenizer, encoded["input_ids"].shape[1])
         with self.torch.inference_mode():
             ids = self.model.generate(
                 **encoded, max_new_tokens=self.max_new_tokens,
                 do_sample=False, num_beams=1,
                 pad_token_id=tokenizer.eos_token_id,
                 use_cache=True,
+                stopping_criteria=StoppingCriteriaList([stop]),
             )
+        if stop.completed_json is not None:
+            return stop.completed_json
         completion = ids[0, encoded["input_ids"].shape[1]:]
         return tokenizer.decode(completion, skip_special_tokens=True).strip()

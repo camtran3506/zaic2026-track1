@@ -10,7 +10,7 @@ def code(s):
 
 md('''# LifeMate — một notebook chạy trọn pipeline trên Kaggle
 
-**Cách chạy:** Add Input bộ dữ liệu đã giải nén, bật **Internet**, chọn **GPU T4 x2** rồi Run All.
+**Cách chạy:** Add Input bộ dữ liệu đã giải nén, bật **Internet**, chọn một GPU rồi Run All. Nếu chọn T4 x2, notebook vẫn chỉ dùng GPU được chỉ định ở `GPU_INDEX`.
 Không cần clone GitHub. Mặc định notebook fine-tune LLM trước trên TRAIN rồi dùng adapter vừa train. Notebook chứa toàn bộ mã nguồn: audio tiếng Việt → faster-whisper → Qwen → validate/call trên `ToolEnv` thật → submission + logs.
 
 Bộ dữ liệu cần có `<split>.jsonl`, `<split>_tools_catalog.json`, audio và **zaic_tools đúng phiên bản của split**. Notebook chỉ đọc manifest/catalog/audio; trạng thái ứng dụng do `ToolEnv` quản lý.
@@ -28,10 +28,8 @@ import os, sys, json, subprocess, datetime, shutil, zipfile, hashlib
 DATA_ROOT = None  # None: tự tìm trong /kaggle/input; hoặc "/kaggle/input/<dataset>/train+public_test"
 SPLIT = "public_test"  # train / public_test / private_test
 LIMIT = 0             # 0 = toàn bộ split; đặt 5 để smoke test
-REQUIRE_GPU = True    # notebook inference dùng 2 T4; chạy CPU/một GPU bằng CLI repo
+REQUIRE_GPU = True    # False nếu muốn chạy CPU
 GPU_INDEX = 0         # GPU cho các bước setup/train
-INFERENCE_GPU_IDS = (0, 1)  # ASR riêng trên GPU đầu; LLM chia lên cả hai GPU sau khi ASR thoát
-INFERENCE_MAX_WEIGHT_GIB = 6
 RUN_ASR = True        # False: chỉ dùng TRANSCRIPT_CACHE đã hoàn tất, không chạy lại ASR
 TRANSCRIPT_CACHE = None  # None: OUT/transcripts.jsonl; đặt đường dẫn cache để tái sử dụng
 REFRESH_TRANSCRIPTS = False  # True: thay cache hoàn tất nếu đổi ASR/dữ liệu/cấu hình
@@ -94,8 +92,7 @@ assert SPLIT in {"train", "public_test", "private_test"}
 assert isinstance(LIMIT, int) and LIMIT >= 0
 assert not USE_TRAIN_TRANSCRIPT or SPLIT == "train"
 assert ASR_FORMAT in {"ctranslate2", "transformers"}
-assert len(INFERENCE_GPU_IDS) == 2 and len(set(INFERENCE_GPU_IDS)) == 2
-assert INFERENCE_MAX_WEIGHT_GIB > 0
+assert isinstance(GPU_INDEX, int) and GPU_INDEX >= 0
 assert MAX_INPUT_TOKENS + MAX_NEW_TOKENS <= 16384
 print("Artifacts:", OUT)
 ''')
@@ -210,11 +207,11 @@ print(f"Split: {SPLIT_DIR}; samples cần chạy: {len(ITEMS)}")
 md('''## 3. Toàn bộ mã pipeline nhúng trong notebook
 
 Các cell dưới ghi mã vào `/kaggle/working/lifemate_app` để chạy trong subprocess, tách runtime tải model (online) khỏi suy luận (local-only). Logic baseline được giữ nguyên; không cần repository bên ngoài. Có cả mã fine-tune, bộ unit test và scorer train.''')
-for rel in ['lifemate/__init__.py', 'lifemate/catalog.py', 'lifemate/models.py', 'lifemate/agent.py', 'lifemate/transcripts.py',
+for rel in ['lifemate/__init__.py', 'lifemate/catalog.py', 'lifemate/models.py', 'lifemate/agent.py', 'lifemate/transcripts.py', 'lifemate/decoding.py',
             'main.py', 'score_train.py', 'lifemate/sft.py', 'prepare_sft.py', 'train_lora.py',
             'merge_lora.py', 'finetune.py', 'tests/test_baseline.py', 'tests/test_sft.py',
             'tests/test_finetune_integration.py', 'tests/test_audio.py', 'tests/test_catalog_inspection.py',
-            'tests/test_staged_pipeline.py']:
+            'tests/test_staged_pipeline.py', 'tests/test_decoding.py']:
     md(f'### `{rel}`')
     code(f'%%writefile /kaggle/working/lifemate_app/{rel}\n' + (ROOT/'code'/rel).read_text())
 
@@ -333,7 +330,7 @@ Tiến trình ASR chỉ nạp Whisper. Kết thúc thành công mới có cache 
 code('''TRANSCRIPTS = Path(TRANSCRIPT_CACHE) if TRANSCRIPT_CACHE else OUT / "transcripts.jsonl"
 TRANSCRIPT_MANIFEST = TRANSCRIPTS.with_suffix(".manifest.json")
 ASR_ENV = BASE_ENV.copy()
-ASR_ENV["CUDA_VISIBLE_DEVICES"] = str(INFERENCE_GPU_IDS[0])
+ASR_ENV["CUDA_VISIBLE_DEVICES"] = str(GPU_INDEX)
 ASR_ENV.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_DATASETS_OFFLINE="1")
 if RUN_ASR:
     asr_command = [sys.executable, "-u", APP / "main.py", "--stage", "asr",
@@ -405,7 +402,7 @@ print("Inference LLM:", LLM_PATH, "adapter:", ADAPTER_PATH)
 
 md('''## 7. LLM từ transcript cache → kiểm chứng → lưu kết quả và logs
 
-Inference chỉ nạp LLM, không nạp ASR, và mặc định không giới hạn thời gian từng mẫu. LLM được chia lên hai T4 bằng `device_map="balanced"`; mỗi GPU chừa bộ nhớ cho attention/KV cache. Context 16K vẫn có thể thiếu VRAM. Log ghi device map thực tế. stdout/stderr được ghi vào `inference.log`; `diagnostics.jsonl` có `sample_seconds` (LLM), `asr_seconds`, `total_sample_seconds` (tổng hai giai đoạn). Notebook kiểm tra đủ ID và schema output; không tự suy diễn tính đúng của state hash. Chạy lại cell dùng cache cũ và tạo thư mục kết quả mới.''')
+Inference chỉ nạp LLM trên một GPU (`GPU_INDEX`, `--llm-device-map single`), không nạp ASR, và mặc định không giới hạn thời gian từng mẫu. Greedy decoding dừng ngay khi sinh xong JSON quyết định hoàn chỉnh (`call`, `inspect` hoặc `done`); vẫn giữ `MAX_NEW_TOKENS` làm giới hạn an toàn. JSON lồng nhau, dấu ngoặc trong chuỗi và khối thinking không gây dừng sớm. Một GPU vẫn cần đủ VRAM cho trọng số và context. stdout/stderr được ghi vào `inference.log`; `diagnostics.jsonl` có `sample_seconds` (LLM), `asr_seconds`, `total_sample_seconds` (tổng hai giai đoạn). Notebook kiểm tra đủ ID và schema output; không tự suy diễn tính đúng của state hash. Chạy lại cell dùng cache cũ và tạo thư mục kết quả mới.''')
 code('''# Chạy lại cell này không ghi đè kết quả cũ.
 if (OUT / "inference.log").exists():
     previous_out = OUT
@@ -418,7 +415,7 @@ if (OUT / "inference.log").exists():
         if path.is_file():
             shutil.copy2(path, OUT / path.name)
 INFER_ENV = BASE_ENV.copy()
-INFER_ENV["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, INFERENCE_GPU_IDS))
+INFER_ENV["CUDA_VISIBLE_DEVICES"] = str(GPU_INDEX)
 INFER_ENV["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 INFER_ENV.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_DATASETS_OFFLINE="1")
 INFER_ENV.pop("HF_TOKEN", None)
@@ -426,7 +423,7 @@ SUBMISSION = OUT / "submission.jsonl"
 DIAGNOSTICS = OUT / "diagnostics.jsonl"
 command = [sys.executable, "-u", APP / "main.py",
     "--stage", "llm", "--transcript-cache", TRANSCRIPTS,
-    "--llm-device-map", "balanced", "--llm-max-memory-gib", str(INFERENCE_MAX_WEIGHT_GIB),
+    "--llm-device-map", "single",
     "--data-root", SPLIT_DIR, "--split", SPLIT,
     "--asr-model", ASR_PATH, "--llm-model", LLM_PATH,
     "--output", SUBMISSION, "--log-path", DIAGNOSTICS,
@@ -447,7 +444,7 @@ for source, name in ((TRANSCRIPTS, "transcripts.jsonl"), (TRANSCRIPT_MANIFEST, "
 run_config = dict(split=SPLIT, data_root=str(SPLIT_DIR), sample_count=len(EXPECTED_IDS),
                   unlimited_sample_time=SAMPLE_SECONDS == float("inf"), transcript_cache=str(TRANSCRIPTS),
                   asr_from_cache=json.loads(TRANSCRIPT_MANIFEST.read_text(encoding="utf-8"))["asr"],
-                  inference_gpu_ids=list(INFERENCE_GPU_IDS), inference_weight_gib=INFERENCE_MAX_WEIGHT_GIB,
+                  inference_gpu_ids=[GPU_INDEX], llm_device_map="single", stop_on_decision_json=True,
                   limit=LIMIT, hardware=HW, command=[str(x) for x in command], models=MODEL_MANIFEST)
 (OUT / "run_config.json").write_text(json.dumps(run_config, ensure_ascii=False, indent=2), encoding="utf-8")
 validation = {"status": "running", "expected_rows": len(EXPECTED_IDS)}

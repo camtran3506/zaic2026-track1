@@ -136,7 +136,7 @@ with empty predictions. LLM sample errors remain recorded in diagnostics.
 `sample_seconds` measures the LLM stage, `asr_seconds` the cached ASR work, and
 `total_sample_seconds` their sum. Cache reuse does not rerun/timestamp ASR work.
 
-### Two T4 inference in Kaggle or the CLI
+### Single-GPU defaults and optional multi-GPU CLI
 
 ```bash
 CUDA_VISIBLE_DEVICES=0,1 python main.py --stage llm \
@@ -151,12 +151,22 @@ Balanced sharding places LLM weights on multiple visible GPUs and routes input t
 the embedding device; it does not move the whole model onto GPU 0. Logs show the
 placement and weight budgets. The weight budget leaves room for KV cache/attention;
 it is not a total process VRAM limit. A 16K context may still exceed a T4's memory.
-The repo CLI/server defaults to `--llm-device-map single` on one GPU. The Kaggle
-notebook explicitly passes `balanced` and exposes two T4 GPUs for LLM inference;
-ASR runs alone on the first
-GPU and exits beforehand. Set `RUN_ASR=False` and `TRANSCRIPT_CACHE` to a completed
+The repo CLI/server and Kaggle notebook default to `--llm-device-map single` on
+one GPU. The notebook exposes only `GPU_INDEX` to both ASR and LLM subprocesses,
+even if Kaggle has two T4 cards. ASR exits before the LLM loads. Balanced multi-GPU
+sharding remains an explicit CLI option for deployments needing extra memory.
+Set `RUN_ASR=False` and `TRANSCRIPT_CACHE` to a completed
 cache to repeat only LLM inference; keep the manifest beside that cache. To run
 without fine-tuning set `TRAIN_LLM=False` and choose base weights or `LOCAL_ADAPTER`.
+
+Greedy inference now stops immediately after the first complete decision JSON
+(`call`, `inspect`, `done`, or the supported `tool_calls` wrapper). The stop check
+only examines generated tokens, respects nested objects/arrays and escaped strings,
+and ignores JSON inside thinking blocks. The generation returns the complete
+decision rather than trailing explanations. Tool availability and argument schema
+validation still happen in the agent; this is not constrained decoding.
+`--max-new-tokens` remains a safety limit for incomplete/invalid output. No model
+weights, precision, prompt or tool-call limits are changed by early stopping.
 
 ### Train evaluation (ASR ablation, NO test labels used)
 
