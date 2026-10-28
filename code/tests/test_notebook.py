@@ -30,6 +30,15 @@ def test_notebook_sources_and_training_defaults():
     assert {'train_lora.py', 'prepare_sft.py', 'finetune.py', 'merge_lora.py', 'lifemate/sft.py'} <= embedded
     assert 'TRAIN_BACKEND = "unsloth"' in sources[0]
     assert 'TRAIN_LLM = True' in sources[0]
+    assert 'SAMPLE_SECONDS = float("inf")' in sources[0]
+    assert 'INFERENCE_GPU_IDS = (0, 1)' in sources[0]
+    assert 'lifemate/transcripts.py' in embedded
+    asr_index = next(i for i, s in enumerate(sources) if s.startswith('TRANSCRIPTS ='))
+    llm_index = next(i for i, s in enumerate(sources) if s.startswith('# Chạy lại cell'))
+    assert asr_index < llm_index
+    assert '"--stage", "asr"' in sources[asr_index]
+    assert '"--stage", "llm"' in sources[llm_index]
+    assert '"--llm-device-map", "balanced"' in sources[llm_index]
     assert any('command.extend(["--llm-adapter", ADAPTER_PATH])' in s for s in sources)
 
 

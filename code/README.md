@@ -4,7 +4,13 @@ A runnable baseline for the challenge format supplied in the problem statement. 
 
 ## Architecture
 
-`16-kHz Vietnamese WAV -> local faster-whisper ASR -> Qwen3-4B-Instruct-2507 -> catalog-aware next-call JSON -> env.validate -> env.call -> result -> LLM (loop) -> env.get_tool_calls + env.get_state_hash`
+`All WAVs + history audio -> ASR process -> transcripts.jsonl + manifest -> ASR process exits -> LLM process reads text -> catalog-aware next-call JSON -> env.validate -> env.call -> result -> LLM (loop) -> env.get_tool_calls + env.get_state_hash`
+
+ASR and LLM weights are never resident together during the main pipeline. `main.py`
+defaults to `--stage full`: it waits for the ASR subprocess to complete and exit
+before launching the LLM subprocess. The notebook runs these two stages in separate
+cells/subprocesses. Per-sample time is unlimited by default (`--sample-seconds inf`);
+`max_calls`, `max_invalid`, schema-inspection and token/context limits still apply.
 
 Defaults: `Qwen/Qwen3-4B-Instruct-2507` (~4.0B, Apache-2.0) and `Systran/faster-whisper-small` (~244M, MIT). Total model parameters ~4.24B; LLM <5B. LLM context input is capped at 6,000 tokens by default (<16,384). Check all model/dependency licenses and freeze revisions before submission. Neither model is fetched at runtime.
 
@@ -63,7 +69,7 @@ python main.py \
     --output /your/outputs/submission.jsonl \
     --log-path /your/outputs/diagnostics.jsonl \
     --device cuda \
-    --sample-seconds 28
+    --sample-seconds inf
 ```
 
 `/your/storage/lifemate_data` contains `train/`, `public_test/`, etc.
@@ -90,6 +96,67 @@ python main.py --data-root /your/storage/lifemate_data --split public_test \
 ```
 
 Remove `--limit` for official submission, which requires exactly one JSONL line per sample.
+
+### Run ASR once, then evaluate LLMs from saved transcripts
+
+```bash
+# Stage 1: no LLM checkpoint is required or loaded.
+python main.py --stage asr --data-root /path/to/data --split public_test \
+    --asr-model /path/to/whisper-medium-ct2 --device cuda \
+    --transcript-cache result/medium_transcripts.jsonl
+
+# Stage 2: no Whisper checkpoint is required or loaded.
+python main.py --stage llm --data-root /path/to/data --split public_test \
+    --transcript-cache result/medium_transcripts.jsonl \
+    --llm-model /path/to/qwen --output result/submission.jsonl \
+    --log-path result/diagnostics.jsonl --device cuda --llm-dtype float16
+```
+
+The cache has one row per selected sample: `id`, full current `transcript`, full
+text `history`, and `asr_seconds`. All history audio is processed in advance;
+the agent retains the existing last-12-turn/1700-character prompt history limits.
+`--use-train-transcript` still requires `split=train`; test request audio is always
+transcribed rather than read from a possible `audio_text` field.
+
+The adjacent `.manifest.json` stores dataset/audio file stamps, IDs/order, ASR
+model file stamps and absolute path, precision, beam, library versions and seed.
+A checksum detects edited transcript files. Partial results stay in
+`.partial.jsonl`; failures are reported in `.errors.jsonl`. The LLM refuses an
+incomplete/mismatched cache. Matching partial ASR work resumes on retry. A completed
+cache is reused without reloading ASR; use a different cache per ASR variant, or
+`--refresh-transcripts` when deliberately replacing it. Model/audio file stamps
+detect ordinary replacement; they are not cryptographic hashes of all source audio
+and model weights. Keep the original data and frozen model revisions for reproduction.
+
+With `--stage full`, the default cache is `<output-stem>.transcripts.jsonl`, and
+stdout/stderr for both stages is saved to `<cache-stem>.asr.log` and
+`<output-stem>.llm.log`. Diagnostics default to `<output-stem>.diagnostics.jsonl`.
+An ASR failure stops the pipeline before LLM execution; it is never substituted
+with empty predictions. LLM sample errors remain recorded in diagnostics.
+`sample_seconds` measures the LLM stage, `asr_seconds` the cached ASR work, and
+`total_sample_seconds` their sum. Cache reuse does not rerun/timestamp ASR work.
+
+### Two T4 inference in Kaggle or the CLI
+
+```bash
+CUDA_VISIBLE_DEVICES=0,1 python main.py --stage llm \
+    --data-root /path/to/data --split public_test \
+    --transcript-cache result/medium_transcripts.jsonl \
+    --llm-model /path/to/qwen --llm-dtype float16 \
+    --llm-device-map balanced --llm-max-memory-gib 6 \
+    --output result/submission.jsonl
+```
+
+Balanced sharding places LLM weights on multiple visible GPUs and routes input to
+the embedding device; it does not move the whole model onto GPU 0. Logs show the
+placement and weight budgets. The weight budget leaves room for KV cache/attention;
+it is not a total process VRAM limit. A 16K context may still exceed a T4's memory.
+The repo CLI/server defaults to `--llm-device-map single` on one GPU. The Kaggle
+notebook explicitly passes `balanced` and exposes two T4 GPUs for LLM inference;
+ASR runs alone on the first
+GPU and exits beforehand. Set `RUN_ASR=False` and `TRANSCRIPT_CACHE` to a completed
+cache to repeat only LLM inference; keep the manifest beside that cache. To run
+without fine-tuning set `TRAIN_LLM=False` and choose base weights or `LOCAL_ADAPTER`.
 
 ### Train evaluation (ASR ablation, NO test labels used)
 
@@ -135,7 +202,9 @@ By default `docker run ... lifemate:baseline` targets **private_test** at `/data
 |---|---|---|
 | `--data-root` | split folder OR its parent | mandatory |
 | `--split` | train / public_test / private_test | public_test |
-| `--asr-model`, `--llm-model` | local checkpoint paths | mandatory |
+| `--asr-model`, `--llm-model` | local checkpoint paths | required only by their stage |
+| `--stage` | full (separate subprocesses) / asr / llm | full |
+| `--transcript-cache` | transcript JSONL + adjacent manifest | output stem + .transcripts.jsonl |
 | `--output` | submission JSONL output | result/submission.jsonl |
 | `--device` | cuda / cpu | cuda |
 | `--asr-compute-type` | faster-whisper precision | float16 |
@@ -146,13 +215,15 @@ By default `docker run ... lifemate:baseline` targets **private_test** at `/data
 | `--max-calls` | maximum executed tools/sample | 8 |
 | `--max-invalid` | maximum invalid model plans | 3 |
 | `--max-tool-details` | number of detailed tools shown per step | 35 |
-| `--sample-seconds` | cooperative budget (not hard interrupt) | 28 |
-| `--log-path` | diagnostics, separate from submission | unset |
+| `--sample-seconds` | optional LLM cooperative budget; inf disables it | inf |
+| `--llm-device-map` | single / balanced across visible GPUs | single |
+| `--llm-max-memory-gib` | weight budget per GPU for balanced | 6 |
+| `--log-path` | diagnostics, separate from submission | output stem + .diagnostics.jsonl |
 | `--limit` | debug: process only first N | 0 (all) |
 
 ## Important limitations and compliance notes
 
-- **30-second rule**: this is a *soft*, per-sample cooperative deadline; CUDA generation/ASR may overrun one call. Benchmark on A30 with real audio, reduce model size, output length or loop counts if needed. This code does NOT guarantee sub-30s inference.
+- **Timing**: there is no per-sample timeout by default. A finite `--sample-seconds` applies only to the LLM stage and is cooperative, not a hard interrupt. Offline ASR-precomputation experiments do NOT establish compliance with a competition's end-to-end 30-second rule.
 - `env.validate` catches schema-invalid arguments before they become logged calls; valid but semantically wrong IDs may still be rejected by `env.call`.
 - The agent prompts the LLM to perform read calls before x-ref-dependent writes, but does not implement a full symbolic planner. Long/complex tasks will be imperfect.
 - The model's response is constrained by a JSON-only prompt and strict parser, not constrained decoder. Malformed generations consume retries.

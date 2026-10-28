@@ -160,7 +160,7 @@ class AgentConfig:
     max_calls: int = 8
     max_invalid: int = 3
     max_tool_details: int = 35
-    sample_seconds: float = 28.0
+    sample_seconds: float = float("inf")
     # Reserving time is best effort, not a hard CUDA generation timeout.
     reserve_seconds: float = 1.0
     use_train_transcript: bool = False
@@ -193,17 +193,26 @@ class LifeMateAgent:
         self.catalog = catalog
         self.cfg = cfg
 
-    def run(self, item: dict, env: Any, split_dir: Path, split: str) -> dict:
+    def run(self, item: dict, env: Any, split_dir: Path, split: str,
+            prepared_transcript: dict | None = None) -> dict:
         """env is created exactly once by caller; never instantiate another here."""
         t0 = time.monotonic()
         context = item.get("context", {})
         enabled = allowed_tools(self.catalog, context.get("installed_apps", {}))
         if len(enabled) == 1:  # only sys.ask_missing_info; no app can act
-            return {"transcript": "", "elapsed_seconds": 0, "executed": 0, "invalid_proposals": 0}
-        transcript = _train_transcript(item) if self.cfg.use_train_transcript and split == "train" else None
-        if transcript is None:
-            transcript = self.asr.transcribe(audio_path(split_dir, item["audio"]))
-        history = history_text(item.get("history", []), split_dir, self.asr, t0, self.cfg.sample_seconds)
+            return {"transcript": prepared_transcript["transcript"] if prepared_transcript else "",
+                    "elapsed_seconds": 0, "executed": 0, "invalid_proposals": 0}
+        if prepared_transcript is not None:
+            if prepared_transcript.get("id") != item["id"]:
+                raise ValueError("Prepared transcript ID does not match current sample")
+            transcript = prepared_transcript["transcript"]
+            history = [{"role": turn["role"], "text": turn["text"][:1700]}
+                       for turn in prepared_transcript["history"][-12:]]
+        else:
+            transcript = _train_transcript(item) if self.cfg.use_train_transcript and split == "train" else None
+            if transcript is None:
+                transcript = self.asr.transcribe(audio_path(split_dir, item["audio"]))
+            history = history_text(item.get("history", []), split_dir, self.asr, t0, self.cfg.sample_seconds)
         observations: list[dict] = []
         invalid = 0
         executed = 0

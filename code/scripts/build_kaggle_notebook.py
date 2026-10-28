@@ -10,14 +10,16 @@ def code(s):
 
 md('''# LifeMate — một notebook chạy trọn pipeline trên Kaggle
 
-**Cách chạy:** Add Input bộ dữ liệu đã giải nén, bật **Internet**, chọn **GPU T4/P100** rồi Run All.
+**Cách chạy:** Add Input bộ dữ liệu đã giải nén, bật **Internet**, chọn **GPU T4 x2** rồi Run All.
 Không cần clone GitHub. Mặc định notebook fine-tune LLM trước trên TRAIN rồi dùng adapter vừa train. Notebook chứa toàn bộ mã nguồn: audio tiếng Việt → faster-whisper → Qwen → validate/call trên `ToolEnv` thật → submission + logs.
 
 Bộ dữ liệu cần có `<split>.jsonl`, `<split>_tools_catalog.json`, audio và **zaic_tools đúng phiên bản của split**. Notebook chỉ đọc manifest/catalog/audio; trạng thái ứng dụng do `ToolEnv` quản lý.
 
 Chỉnh cấu hình bên dưới. `LIMIT=0` chạy **toàn bộ split**. Model tải từ Hugging Face trước khi suy luận; có thể dùng model gắn sẵn ở `/kaggle/input`. Model ASR mặc định là `Systran/faster-whisper-small`; muốn dùng PhoWhisper, đặt `ASR_REPO="vinai/PhoWhisper-small"` và `ASR_FORMAT="transformers"` để tự chuyển sang CTranslate2.
 
-Kết quả lưu trong `/kaggle/working/lifemate_runs/<RUN_NAME>/`: `submission.jsonl`, `diagnostics.jsonl`, `inference.log`, `setup.log`, `models.log`, `validation.json`, `run_config.json`, `environment.txt`, và `lifemate_artifacts.zip`. Logs chẩn đoán có transcript; kiểm tra trước khi chia sẻ. Notebook không bảo đảm giới hạn 30 giây/mẫu hoặc điểm thi chính thức.''')
+ASR chạy toàn bộ split (bao gồm audio lịch sử), lưu transcript rồi thoát tiến trình và giải phóng GPU. LLM sau đó đọc cache; không nạp Whisper cùng lúc. Mặc định không giới hạn thời gian mỗi mẫu (`float("inf")`); vẫn giữ giới hạn tool calls và token/context ≤16.384.
+
+Kết quả lưu trong `/kaggle/working/lifemate_runs/<RUN_NAME>/`: `transcripts.jsonl`, `transcripts.manifest.json`, `asr.log`, `submission.jsonl`, `diagnostics.jsonl`, `inference.log`, `setup.log`, `models.log`, `validation.json`, `run_config.json`, `environment.txt`, và `lifemate_artifacts.zip`. Transcript/logs có nội dung người dùng; kiểm tra trước khi chia sẻ. Đây không phải chế độ bảo đảm giới hạn 30 giây/mẫu của cuộc thi.''')
 
 code('''from pathlib import Path
 import os, sys, json, subprocess, datetime, shutil, zipfile, hashlib
@@ -26,8 +28,13 @@ import os, sys, json, subprocess, datetime, shutil, zipfile, hashlib
 DATA_ROOT = None  # None: tự tìm trong /kaggle/input; hoặc "/kaggle/input/<dataset>/train+public_test"
 SPLIT = "public_test"  # train / public_test / private_test
 LIMIT = 0             # 0 = toàn bộ split; đặt 5 để smoke test
-REQUIRE_GPU = True    # False cho CPU (rất chậm; không bảo đảm giới hạn thời gian)
-GPU_INDEX = 0         # dùng một GPU; không cộng gộp VRAM của 2 T4
+REQUIRE_GPU = True    # notebook inference dùng 2 T4; chạy CPU/một GPU bằng CLI repo
+GPU_INDEX = 0         # GPU cho các bước setup/train
+INFERENCE_GPU_IDS = (0, 1)  # ASR riêng trên GPU đầu; LLM chia lên cả hai GPU sau khi ASR thoát
+INFERENCE_MAX_WEIGHT_GIB = 6
+RUN_ASR = True        # False: chỉ dùng TRANSCRIPT_CACHE đã hoàn tất, không chạy lại ASR
+TRANSCRIPT_CACHE = None  # None: OUT/transcripts.jsonl; đặt đường dẫn cache để tái sử dụng
+REFRESH_TRANSCRIPTS = False  # True: thay cache hoàn tất nếu đổi ASR/dữ liệu/cấu hình
 
 # Fine-tune trước rồi tự nạp adapter cho inference.
 TRAIN_LLM = True
@@ -51,7 +58,7 @@ LOCAL_ASR = None     # thư mục CTranslate2 có model.bin; bỏ qua tải/chuy
 LOCAL_LLM = None     # thư mục Transformers có config.json + tokenizer + trọng số
 HF_SECRET_NAME = None  # tùy chọn: tên Kaggle Secret chứa HF token (public models không cần)
 
-SAMPLE_SECONDS = 28.0  # soft budget giống baseline, không phải hard timeout
+SAMPLE_SECONDS = float("inf")  # không giới hạn thời gian mỗi mẫu
 MAX_INPUT_TOKENS = 6000
 MAX_NEW_TOKENS = 192
 MAX_CALLS = 8
@@ -87,6 +94,9 @@ assert SPLIT in {"train", "public_test", "private_test"}
 assert isinstance(LIMIT, int) and LIMIT >= 0
 assert not USE_TRAIN_TRANSCRIPT or SPLIT == "train"
 assert ASR_FORMAT in {"ctranslate2", "transformers"}
+assert len(INFERENCE_GPU_IDS) == 2 and len(set(INFERENCE_GPU_IDS)) == 2
+assert INFERENCE_MAX_WEIGHT_GIB > 0
+assert MAX_INPUT_TOKENS + MAX_NEW_TOKENS <= 16384
 print("Artifacts:", OUT)
 ''')
 
@@ -200,10 +210,11 @@ print(f"Split: {SPLIT_DIR}; samples cần chạy: {len(ITEMS)}")
 md('''## 3. Toàn bộ mã pipeline nhúng trong notebook
 
 Các cell dưới ghi mã vào `/kaggle/working/lifemate_app` để chạy trong subprocess, tách runtime tải model (online) khỏi suy luận (local-only). Logic baseline được giữ nguyên; không cần repository bên ngoài. Có cả mã fine-tune, bộ unit test và scorer train.''')
-for rel in ['lifemate/__init__.py', 'lifemate/catalog.py', 'lifemate/models.py', 'lifemate/agent.py',
+for rel in ['lifemate/__init__.py', 'lifemate/catalog.py', 'lifemate/models.py', 'lifemate/agent.py', 'lifemate/transcripts.py',
             'main.py', 'score_train.py', 'lifemate/sft.py', 'prepare_sft.py', 'train_lora.py',
             'merge_lora.py', 'finetune.py', 'tests/test_baseline.py', 'tests/test_sft.py',
-            'tests/test_finetune_integration.py', 'tests/test_audio.py', 'tests/test_catalog_inspection.py']:
+            'tests/test_finetune_integration.py', 'tests/test_audio.py', 'tests/test_catalog_inspection.py',
+            'tests/test_staged_pipeline.py']:
     md(f'### `{rel}`')
     code(f'%%writefile /kaggle/working/lifemate_app/{rel}\n' + (ROOT/'code'/rel).read_text())
 
@@ -314,7 +325,34 @@ LLM_PATH = Path(MODEL_MANIFEST["llm"]["path"])
 print("ASR:", ASR_PATH, "\\nLLM:", LLM_PATH)
 ''')
 
-md('''## 5. Fine-tune tool calling trên TRAIN (LoRA/QLoRA)
+md('''## 5. ASR trước — lưu toàn bộ transcript, giải phóng GPU
+
+Tiến trình ASR chỉ nạp Whisper. Kết thúc thành công mới có cache với manifest `complete` để LLM dùng. Cache lưu cả transcript hiện tại và toàn bộ lịch sử có audio/text; agent chỉ lấy phần lịch sử cần thiết vào prompt. Nếu lỗi ASR, cell dừng, giữ `.partial.jsonl` và báo lỗi; chạy lại cùng cấu hình sẽ tiếp tục từ mẫu chưa xong. Không biến lỗi ASR thành dự đoán rỗng.
+
+Để chạy LLM lại mà không chạy ASR, giữ đường dẫn `TRANSCRIPT_CACHE` và manifest cạnh nó, đặt `RUN_ASR=False`. Nếu đổi ASR để ablation, dùng cache khác hoặc `REFRESH_TRANSCRIPTS=True`. Mỗi cache ghi model/settings/seed và dấu vết dữ liệu để tránh dùng nhầm transcript.''')
+code('''TRANSCRIPTS = Path(TRANSCRIPT_CACHE) if TRANSCRIPT_CACHE else OUT / "transcripts.jsonl"
+TRANSCRIPT_MANIFEST = TRANSCRIPTS.with_suffix(".manifest.json")
+ASR_ENV = BASE_ENV.copy()
+ASR_ENV["CUDA_VISIBLE_DEVICES"] = str(INFERENCE_GPU_IDS[0])
+ASR_ENV.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_DATASETS_OFFLINE="1")
+if RUN_ASR:
+    asr_command = [sys.executable, "-u", APP / "main.py", "--stage", "asr",
+        "--data-root", SPLIT_DIR, "--split", SPLIT, "--asr-model", ASR_PATH,
+        "--transcript-cache", TRANSCRIPTS, "--device", DEVICE,
+        "--asr-compute-type", ASR_COMPUTE, "--asr-beam", str(ASR_BEAM),
+        "--limit", str(LIMIT), "--seed", str(SEED)]
+    if USE_TRAIN_TRANSCRIPT:
+        asr_command.append("--use-train-transcript")
+    if REFRESH_TRANSCRIPTS:
+        asr_command.append("--refresh-transcripts")
+    run_logged(asr_command, OUT / "asr.log", cwd=APP, env=ASR_ENV)
+elif not TRANSCRIPTS.is_file() or not TRANSCRIPT_MANIFEST.is_file():
+    raise FileNotFoundError("RUN_ASR=False cần cache JSONL và manifest đã hoàn tất.")
+print("Transcripts:", TRANSCRIPTS)
+print("ASR process has exited; LLM will read and verify cache before loading weights.")
+''')
+
+md('''## 6. Fine-tune tool calling trên TRAIN (LoRA/QLoRA)
 
 Mặc định `TRAIN_LLM=True`: huấn luyện LoRA/QLoRA, rồi tự chuyển sang **base model + adapter vừa train** cho task chính. Nhãn phải là `label.tool_calls` theo thứ tự thực thi. Replay dùng `ToolEnv` thật của train; kết quả tool trước được đưa vào prompt bước sau. Chỉ tính loss trên assistant JSON, split theo sample ID trước khi tạo các bước, không đọc nhãn test.
 
@@ -365,26 +403,30 @@ if ADAPTER_PATH is not None and not (ADAPTER_PATH / "adapter_config.json").is_fi
 print("Inference LLM:", LLM_PATH, "adapter:", ADAPTER_PATH)
 ''')
 
-md('''## 6. Chạy toàn bộ split → kiểm chứng → lưu kết quả và logs
+md('''## 7. LLM từ transcript cache → kiểm chứng → lưu kết quả và logs
 
-Inference sử dụng local-only model, giữ soft budget và thuật toán của baseline. stdout/stderr được stream ra cell và ghi vào `inference.log`; `diagnostics.jsonl` có transcript, thời gian, số calls và lỗi của từng mẫu. Notebook kiểm tra đủ ID, thứ tự và schema output; không tự suy diễn tính đúng của state hash. Nếu lỗi, file kết quả một phần và logs vẫn được đóng gói để chẩn đoán. Chạy lại cell tạo thư mục run mới, giữ kết quả cũ.''')
+Inference chỉ nạp LLM, không nạp ASR, và mặc định không giới hạn thời gian từng mẫu. LLM được chia lên hai T4 bằng `device_map="balanced"`; mỗi GPU chừa bộ nhớ cho attention/KV cache. Context 16K vẫn có thể thiếu VRAM. Log ghi device map thực tế. stdout/stderr được ghi vào `inference.log`; `diagnostics.jsonl` có `sample_seconds` (LLM), `asr_seconds`, `total_sample_seconds` (tổng hai giai đoạn). Notebook kiểm tra đủ ID và schema output; không tự suy diễn tính đúng của state hash. Chạy lại cell dùng cache cũ và tạo thư mục kết quả mới.''')
 code('''# Chạy lại cell này không ghi đè kết quả cũ.
 if (OUT / "inference.log").exists():
     previous_out = OUT
     OUT = OUT.parent / datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
     OUT.mkdir(parents=True)
-    for name in ("setup.log", "models.log", "hardware.log", "unit_tests.log", "environment.txt", "model_manifest.json"):
+    for name in ("setup.log", "models.log", "hardware.log", "unit_tests.log", "environment.txt", "model_manifest.json", "asr.log"):
         if (previous_out / name).is_file():
             shutil.copy2(previous_out / name, OUT / name)
     for path in previous_out.glob("training_*"):
         if path.is_file():
             shutil.copy2(path, OUT / path.name)
 INFER_ENV = BASE_ENV.copy()
+INFER_ENV["CUDA_VISIBLE_DEVICES"] = ",".join(map(str, INFERENCE_GPU_IDS))
+INFER_ENV["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 INFER_ENV.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_DATASETS_OFFLINE="1")
 INFER_ENV.pop("HF_TOKEN", None)
 SUBMISSION = OUT / "submission.jsonl"
 DIAGNOSTICS = OUT / "diagnostics.jsonl"
 command = [sys.executable, "-u", APP / "main.py",
+    "--stage", "llm", "--transcript-cache", TRANSCRIPTS,
+    "--llm-device-map", "balanced", "--llm-max-memory-gib", str(INFERENCE_MAX_WEIGHT_GIB),
     "--data-root", SPLIT_DIR, "--split", SPLIT,
     "--asr-model", ASR_PATH, "--llm-model", LLM_PATH,
     "--output", SUBMISSION, "--log-path", DIAGNOSTICS,
@@ -399,7 +441,13 @@ if FAIL_FAST:
     command.append("--fail-fast")
 if USE_TRAIN_TRANSCRIPT:
     command.append("--use-train-transcript")
+for source, name in ((TRANSCRIPTS, "transcripts.jsonl"), (TRANSCRIPT_MANIFEST, "transcripts.manifest.json")):
+    if source.resolve() != (OUT / name).resolve():
+        shutil.copy2(source, OUT / name)
 run_config = dict(split=SPLIT, data_root=str(SPLIT_DIR), sample_count=len(EXPECTED_IDS),
+                  unlimited_sample_time=SAMPLE_SECONDS == float("inf"), transcript_cache=str(TRANSCRIPTS),
+                  asr_from_cache=json.loads(TRANSCRIPT_MANIFEST.read_text(encoding="utf-8"))["asr"],
+                  inference_gpu_ids=list(INFERENCE_GPU_IDS), inference_weight_gib=INFERENCE_MAX_WEIGHT_GIB,
                   limit=LIMIT, hardware=HW, command=[str(x) for x in command], models=MODEL_MANIFEST)
 (OUT / "run_config.json").write_text(json.dumps(run_config, ensure_ascii=False, indent=2), encoding="utf-8")
 validation = {"status": "running", "expected_rows": len(EXPECTED_IDS)}
@@ -421,10 +469,13 @@ try:
             raise ValueError(f"Invalid calls/hash: {row['id']}")
     errors = [r["id"] for r in diagnostics if "error" in r]
     times = [r["sample_seconds"] for r in diagnostics]
+    total_times = [r["total_sample_seconds"] for r in diagnostics]
     validation.update(status="completed" if not errors else "completed_with_sample_errors",
         rows=len(rows), error_count=len(errors), error_ids=errors,
         mean_seconds=sum(times) / len(times), max_seconds=max(times),
-        samples_over_30s=sum(t > 30 for t in times),
+        mean_asr_seconds=sum(r["asr_seconds"] for r in diagnostics) / len(diagnostics),
+        mean_total_seconds=sum(total_times) / len(total_times),
+        samples_over_30s=sum(t > 30 for t in total_times),
         submission_sha256=hashlib.sha256(SUBMISSION.read_bytes()).hexdigest())
     if errors:
         raise RuntimeError(f"Đã xuất đủ mẫu nhưng {len(errors)} mẫu lỗi; xem diagnostics và inference.log.")
@@ -449,7 +500,7 @@ finally:
     print("ZIP:", archive)
 ''')
 code('''from IPython.display import display, FileLink
-for name in ("submission.jsonl", "diagnostics.jsonl", "inference.log", "validation.json", "lifemate_artifacts.zip"):
+for name in ("transcripts.jsonl", "transcripts.manifest.json", "asr.log", "submission.jsonl", "diagnostics.jsonl", "inference.log", "validation.json", "lifemate_artifacts.zip"):
     path = OUT / name
     if path.is_file():
         display(FileLink(str(path)))
