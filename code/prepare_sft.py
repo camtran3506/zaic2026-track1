@@ -7,7 +7,7 @@ import sys
 
 from main import resolve_data_layout
 from lifemate.catalog import load_catalog
-from lifemate.sft import UnexposedToolError, file_sha256, replay_sample, split_records
+from lifemate.sft import UnexposedToolError, file_sha256, prepare_train_transcript, replay_sample, split_records
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
 
 
@@ -45,6 +45,7 @@ def main():
                     catalog_sha256=file_sha256(catalog_path), seed=args.seed,
                     max_tool_details=args.max_tool_details, missing_tool_policy=args.missing_tool_policy,
                     partitions={})
+    rollout_rows = []
     for partition, rows in (("train", train), ("validation", validation)):
         path = args.output_dir / f"{partition}.jsonl"
         count = 0
@@ -55,7 +56,9 @@ def main():
             for i, record in enumerate(rows):
                 env = ToolEnv("train", record["id"], root=str(env_root))
                 try:
-                    examples = replay_sample(record, catalog, env, split_dir, asr, args.max_tool_details)
+                    prepared = prepare_train_transcript(record, split_dir, asr)
+                    examples = replay_sample(record, catalog, env, split_dir, asr, args.max_tool_details,
+                                             prepared_transcript=prepared)
                 except UnexposedToolError as exc:
                     if args.missing_tool_policy == "error":
                         raise
@@ -65,6 +68,18 @@ def main():
                         report.write(json.dumps(reason, ensure_ascii=False) + "\n")
                     print(f"WARNING skipped entire {partition} sample: {exc}", flush=True)
                     continue
+                if partition == "validation":
+                    gold_hash = env.get_state_hash()
+                    if not isinstance(gold_hash, str) or not gold_hash:
+                        raise ValueError(f"{record['id']}: ToolEnv returned an invalid gold state hash")
+                    supplied_hash = record.get("label", {}).get("state_hash")
+                    if supplied_hash is not None and supplied_hash != gold_hash:
+                        raise ValueError(f"{record['id']}: replayed gold hash differs from the provided gold hash")
+                    rollout_rows.append({
+                        "item": {k: v for k, v in record.items() if k not in ("label", "audio_text")},
+                        "prepared_transcript": prepared,
+                        "gold_tool_calls": record["label"]["tool_calls"], "gold_state_hash": gold_hash,
+                    })
                 retained_ids.append(record["id"])
                 for example in examples:
                     f.write(json.dumps(example, ensure_ascii=False) + "\n")
@@ -77,6 +92,11 @@ def main():
             samples=len(retained_ids), source_samples=len(rows), skipped_samples=skipped,
             examples=count, sha256=file_sha256(path))
         print(f"{partition} summary: kept {len(retained_ids)}/{len(rows)}, skipped {len(skipped)}, {count} steps", flush=True)
+    if metadata["partitions"]["validation"]["skipped_samples"]:
+        raise ValueError("State/tool checkpoint selection requires every held-out validation sample; do not skip them")
+    rollout_path = args.output_dir / "validation_rollouts.jsonl"
+    rollout_path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rollout_rows), encoding="utf-8")
+    metadata["validation_rollouts"] = {"path": rollout_path.name, "sha256": file_sha256(rollout_path)}
     (args.output_dir / "manifest.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     print("Prepared TRAIN-only SFT data:", args.output_dir)
     if holder is not None:

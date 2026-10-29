@@ -64,14 +64,16 @@ def test_prepare_skip_reports_whole_samples_and_retains_partition_ids(tmp_path, 
     source.mkdir(parents=True)
     records = [dict(labeled(), id=f'train_{i}') for i in range(8)]
     train, valid = split_records(records, 0.3, 42)
-    rejected = {train[0]['id'], valid[0]['id']}
+    rejected = {train[0]['id']}
     (source / 'train.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in records))
     (source / 'train_tools_catalog.json').write_text(json.dumps({'apps': [{'tools': list(CATALOG.values())}]}))
-    monkeypatch.setitem(sys.modules, 'zaic_tools', types.SimpleNamespace(ToolEnv=lambda *a, **k: FakeEnv()))
-    def replay(record, *args):
+    class HashEnv(FakeEnv):
+        def get_state_hash(self): return 'fixture-gold-hash'
+    monkeypatch.setitem(sys.modules, 'zaic_tools', types.SimpleNamespace(ToolEnv=lambda *a, **k: HashEnv()))
+    def replay(record, *args, **kwargs):
         if record['id'] in rejected:
             raise UnexposedToolError(f"{record['id']}: target not exposed")
-        return replay_sample(record, *args)
+        return replay_sample(record, *args, **kwargs)
     monkeypatch.setattr(prepare_sft, 'replay_sample', replay)
     out = tmp_path / 'sft'
     monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--data-root', str(source),
@@ -88,8 +90,11 @@ def test_prepare_skip_reports_whole_samples_and_retains_partition_ids(tmp_path, 
         assert not retained & ids
         retained |= ids
         assert metadata['source_samples'] == metadata['samples'] + len(metadata['skipped_samples'])
-        assert len((out / f'{part}_skipped.jsonl').read_text().splitlines()) == 1
-    assert len(retained) == 6
+        if part == 'train':
+            assert len((out / f'{part}_skipped.jsonl').read_text().splitlines()) == 1
+        else:
+            assert not metadata['skipped_samples']
+    assert len(retained) == 7
 
 
 def test_split_is_grouped_deterministic_and_order_independent():

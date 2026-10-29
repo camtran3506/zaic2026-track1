@@ -210,10 +210,11 @@ md('''## 3. Toàn bộ mã pipeline nhúng trong notebook
 
 Các cell dưới ghi mã vào `/kaggle/working/lifemate_app` để chạy trong subprocess, tách runtime tải model (online) khỏi suy luận (local-only). Logic baseline được giữ nguyên; không cần repository bên ngoài. Có cả mã fine-tune, bộ unit test và scorer train.''')
 for rel in ['lifemate/__init__.py', 'lifemate/catalog.py', 'lifemate/models.py', 'lifemate/agent.py', 'lifemate/transcripts.py', 'lifemate/decoding.py',
-            'lifemate/gpu.py', 'lifemate/context.py', 'main.py', 'score_train.py', 'lifemate/sft.py', 'prepare_sft.py', 'train_lora.py',
+            'lifemate/gpu.py', 'lifemate/context.py', 'lifemate/scoring.py', 'lifemate/evaluation.py',
+            'main.py', 'score_train.py', 'lifemate/sft.py', 'prepare_sft.py', 'train_lora.py',
             'merge_lora.py', 'finetune.py', 'tests/test_baseline.py', 'tests/test_sft.py',
             'tests/test_finetune_integration.py', 'tests/test_audio.py', 'tests/test_catalog_inspection.py',
-            'tests/test_staged_pipeline.py', 'tests/test_decoding.py']:
+            'tests/test_staged_pipeline.py', 'tests/test_decoding.py', 'tests/test_scoring.py', 'tests/test_evaluation.py']:
     md(f'### `{rel}`')
     code(f'%%writefile /kaggle/working/lifemate_app/{rel}\n' + (ROOT/'code'/rel).read_text())
 
@@ -359,7 +360,7 @@ Danh mục `tool_index` giữ toàn bộ tool được phép. Nếu gold tool ch
 
 Muốn dùng adapter đã có: đặt `TRAIN_LLM=False`, `LOCAL_ADAPTER` tới thư mục adapter. Muốn dùng model đã merge: đặt `TRAIN_LLM=False`, `LOCAL_ADAPTER=None`, `LOCAL_LLM` tới model merged. Nếu thiếu train data khi bật training, cell sẽ dừng rõ ràng thay vì dùng model gốc âm thầm.
 
-Backend huấn luyện mặc định là **Unsloth FastLanguageModel** với LoRA không lượng tử hóa, max length 16.384 token, batch size 32, LoRA dropout=0 và gradient checkpointing `unsloth`. Import Unsloth trước Transformers/PEFT trong subprocess riêng. T4 dùng FP16; GPU hỗ trợ thì BF16. Cấu hình batch 32 × 16K cần nhiều VRAM, chưa được xác nhận chạy vừa GPU Kaggle/T4. JSON target quá dài sẽ bị báo lỗi, không bị cắt âm thầm. `eval_loss` là loss trên validation theo teacher forcing, **không phải điểm F1 chính thức**. Checkpoint/adapter nằm dưới `/kaggle/working/lifemate_finetunes`; không nhét model nhiều GB vào ZIP logs. Nếu mất session, gắn lại base weights + adapter hoặc dùng checkpoint để resume bằng `train_lora.py`.''')
+Backend huấn luyện mặc định là **Unsloth FastLanguageModel** với LoRA không lượng tử hóa, max length 16.384 token, batch size 32, LoRA dropout=0 và gradient checkpointing `unsloth`. Import Unsloth trước Transformers/PEFT trong subprocess riêng. T4 dùng FP16; GPU hỗ trợ thì BF16. Cấu hình batch 32 × 16K cần nhiều VRAM, chưa được xác nhận chạy vừa GPU Kaggle/T4. JSON target quá dài sẽ bị báo lỗi, không bị cắt âm thầm. Checkpoint tốt nhất được chọn bằng `eval_state_tool_score` (0–100) sau mỗi epoch: rollout agent trên toàn bộ validation tách từ TRAIN, gate bằng state hash rồi tính tool-call F1. Gold hash được lấy qua `ToolEnv.get_state_hash()` sau replay gold calls; dự đoán dùng môi trường mới. `eval_loss` chỉ để theo dõi. Đây là điểm validation với transcript train đã chuẩn bị; tokenizer fuzzy dùng lowercase + NFC + tách khoảng trắng, kết quả BTC vẫn là quyết định cuối cùng. Checkpoint/adapter nằm dưới `/kaggle/working/lifemate_finetunes`; không nhét model nhiều GB vào ZIP logs. Nếu mất session, gắn lại base weights + adapter hoặc dùng checkpoint để resume bằng `train_lora.py`.''')
 code('''ADAPTER_PATH = Path(LOCAL_ADAPTER) if LOCAL_ADAPTER else None
 if TRAIN_LLM:
     if TRAIN_DATA_ROOT:
@@ -392,7 +393,7 @@ if TRAIN_LLM:
         if FT_RUN.is_dir():
             for filename in ("prepare_sft.log", "train_lora.log", "base_model.json",
                              "training/training_config.json", "training/eval_results.json",
-                             "training/train_results.json", "training/trainer_state.json", "sft/manifest.json",
+                             "training/train_results.json", "training/trainer_state.json", "training/validation_scores.jsonl", "sft/manifest.json",
                              "sft/train_skipped.jsonl", "sft/validation_skipped.jsonl"):
                 path = FT_RUN / filename
                 if path.is_file():

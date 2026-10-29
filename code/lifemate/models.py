@@ -97,6 +97,18 @@ class LocalLLM:
         self.max_input_tokens = max_input_tokens
         self.max_new_tokens = max_new_tokens
 
+    @classmethod
+    def from_loaded_model(cls, model, tokenizer, max_input_tokens=DEFAULT_MAX_INPUT_TOKENS,
+                          max_new_tokens=DEFAULT_MAX_NEW_TOKENS):
+        """Run identical agent decoding on current training weights without a second model."""
+        validate_inference_budget(max_input_tokens, max_new_tokens)
+        import torch
+        obj = cls.__new__(cls)
+        obj.torch, obj.model, obj.tokenizer = torch, model, tokenizer
+        obj.device = model.get_input_embeddings().weight.device
+        obj.max_input_tokens, obj.max_new_tokens = max_input_tokens, max_new_tokens
+        return obj
+
     def generate(self, system: str, user: str) -> str:
         # Import lazily: Unsloth must be imported before Transformers during training.
         from transformers import StoppingCriteriaList

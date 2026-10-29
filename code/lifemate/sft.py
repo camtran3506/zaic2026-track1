@@ -27,16 +27,8 @@ def split_records(records, validation_fraction=0.1, seed=42):
     return ordered[count:], ordered[:count]
 
 
-def replay_sample(item, catalog, env, split_dir, asr=None, max_tool_details=35):
-    """Read ONLY train labels; observe real ToolEnv returns before later targets.
-
-    Gold lists must be in execution order. Missing schemas are requested through
-    supervised inspect actions before calls, using the same protocol as inference.
-    No invented tool results, test labels, or direct access to environment files.
-    """
-    calls = item.get("label", {}).get("tool_calls")
-    if not isinstance(calls, list):
-        raise ValueError(f"{item['id']}: missing label.tool_calls list (empty list is valid)")
+def prepare_train_transcript(item, split_dir, asr=None):
+    """Resolve train text/audio once; reuse the same input for SFT and rollouts."""
     started = time.monotonic()
     transcript = _train_transcript(item)
     if transcript is None:
@@ -47,6 +39,17 @@ def replay_sample(item, catalog, env, split_dir, asr=None, max_tool_details=35):
         def transcribe(self, path):
             raise ValueError("History audio needs --asr-model or a train history transcript")
     history = history_text(item.get("history", []), split_dir, asr or MissingASR(), started, float("inf"))
+    return {"id": item["id"], "transcript": transcript, "history": history}
+
+
+def replay_sample(item, catalog, env, split_dir, asr=None, max_tool_details=35,
+                  prepared_transcript=None):
+    """Replay TRAIN gold in order; never expose future calls in earlier prompts."""
+    calls = item.get("label", {}).get("tool_calls")
+    if not isinstance(calls, list):
+        raise ValueError(f"{item['id']}: missing label.tool_calls list (empty list is valid)")
+    prepared = prepared_transcript or prepare_train_transcript(item, split_dir, asr)
+    transcript, history = prepared["transcript"], prepared["history"]
     context = item.get("context", {})
     enabled = allowed_tools(catalog, context.get("installed_apps", {}))
     observations, examples = [], []

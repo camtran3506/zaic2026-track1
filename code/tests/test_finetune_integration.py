@@ -57,9 +57,15 @@ def test_train_adapter_reload_and_merge(tmp_path):
         'label': {'tool_calls': [{'name': 'home.read', 'arguments': {}}]},
     }) + '\n' for i in range(4)))
     (data / 'zaic_tools.py').write_text('''class ToolEnv:
-    def __init__(self, split, id, root): assert split == 'train'
+    def __init__(self, split, id, root):
+        assert split == 'train'
+        self.calls = []
     def validate(self, name, args): return {'ok': True}
-    def call(self, name, args): return {'ok': True, 'devices': ['living_room']}
+    def call(self, name, args):
+        self.calls.append({'name': name, 'arguments': args})
+        return {'ok': True, 'devices': ['living_room']}
+    def get_tool_calls(self): return self.calls
+    def get_state_hash(self): return 'fixture-unchanged-state'
 ''')
     app = Path(__file__).resolve().parents[1]
     run = tmp_path / 'run'
@@ -75,13 +81,26 @@ def test_train_adapter_reload_and_merge(tmp_path):
     assert config['quantization'] == 'none'
     assert config['max_length'] == 16384
     assert config['batch_size'] == 32
+    assert config['eval_strategy'] == 'epoch'
     adapter = run / 'training' / 'adapter'
     assert (adapter / 'adapter_model.safetensors').is_file()
     from safetensors.torch import load_file
     weights = load_file(str(adapter / 'adapter_model.safetensors'))
-    assert any(torch.count_nonzero(v).item() > 0 for k, v in weights.items() if 'lora_B' in k)
+    # The selected first checkpoint may precede nonzero LR during warmup when
+    # all rollout scores tie at zero. Training must still have updated LoRA.
+    latest_weights = load_file(str(run / 'training/checkpoint-2/adapter_model.safetensors'))
+    assert any(torch.count_nonzero(v).item() > 0 for k, v in latest_weights.items() if 'lora_B' in k)
+    selected_weights = load_file(str(Path(config['best_checkpoint']) / 'adapter_model.safetensors'))
+    assert weights.keys() == selected_weights.keys()
+    assert all(torch.equal(weights[k], selected_weights[k]) for k in weights)
     metrics = json.loads((run / 'training/eval_results.json').read_text())
     assert 0 < metrics['eval_loss'] < 100
+    assert 0 <= metrics['eval_state_tool_score'] <= 100
+    assert metrics['eval_rollout_samples'] == 1
+    assert config['selection_metric'] == 'eval_state_tool_score'
+    trainer_state = json.loads((run / 'training/trainer_state.json').read_text())
+    assert config['best_state_tool_score'] == trainer_state['best_metric']
+    assert (run / 'training/validation_scores.jsonl').is_file()
     llm = LocalLLM(base, device='cpu', dtype='float32', adapter_path=adapter, max_new_tokens=2)
     merged = AutoModelForCausalLM.from_pretrained(run / 'merged', local_files_only=True, torch_dtype=torch.float32)
     llm.model.eval()

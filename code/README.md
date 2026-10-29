@@ -360,10 +360,54 @@ VRAM if necessary. The SFT `--max-length` budget includes prompt and target toke
 Outputs: `sft/{train,validation}.jsonl`, split/hash manifest, `training/adapter/`,
 checkpoints (optimizer/scheduler/RNG), `training/{train,eval}_results.json`,
 `training/trainer_state.json`, training config, resolved base-model SHA (for HF IDs),
-and logs for every stage. Held-out teacher-forced `eval_loss` is **not tool-call F1**
-or an official competition score. Judge quality with real end-to-end runs on held-out
-train IDs, comparing the same IDs/base model/settings; a completed training run alone
-does not establish improved accuracy.
+and logs for every stage.
+
+### Best-checkpoint selection: state match + tool-call F1
+
+The default selection metric is **`eval_state_tool_score` (0–100), higher is better**,
+not teacher-forced `eval_loss`. After each epoch, the current model runs the same
+agent/JSON decoding used for inference on every held-out TRAIN sample ID (10% by
+default, split before SFT expansion). ASR is not loaded during these rollouts:
+validation uses the train transcript/history resolved during preparation, so this
+measures the tool agent rather than end-to-end audio accuracy.
+
+Preparation replays gold calls through the train-specific `ToolEnv` and saves the
+result of `env.get_state_hash()`. If a gold hash is supplied in labels, it must
+agree with that replay. Each candidate prediction starts with a new `ToolEnv` for
+the same sample; only its `get_tool_calls()` and `get_state_hash()` are scored.
+No environment state files are opened directly. Gold calls/hashes are never
+passed to the model, and no public/private test labels are used.
+
+For a nonempty gold list, a hash mismatch or zero matched calls scores 0;
+otherwise the sample scores `2*M / (len(submitted) + len(gold))`. Matching is
+maximum one-to-one and ignores call order, while replay still preserves order.
+Unmatched submitted calls, including schema-invalid entries in the environment's
+call log, are penalized. Internal invalid proposals that are not submitted are
+not added to that log. `sys.ask_missing_info` is a normal scored call. For empty
+gold, score 1 only for an empty submitted list. The selection metric is **100 ×
+the mean over original validation samples**, not over SFT steps or tool calls.
+
+Fuzzy arguments use token-F1 **strictly greater than 0.6**, lowercase + Unicode
+NFC, with whitespace tokenization. Non-fuzzy arguments are compared exactly.
+The organisers' fuzzy tokenizer and authoritative replay may differ; this is a
+local validation metric following the supplied rules, not an official test score.
+
+Both evaluation and checkpoint saving default to `--eval-strategy epoch`.
+Use `--eval-strategy steps --save-steps 100` to evaluate/save every 100 optimizer
+steps instead; the final step is also evaluated. Full rollouts can add substantial
+time. At most two checkpoints are retained under Trainer's best/latest handling;
+ties retain the first best checkpoint. The best model is reloaded before saving
+`training/adapter/`. No model is selected by loss as a fallback.
+
+Audit files: `sft/validation_rollouts.jsonl` (inputs, replayed gold hashes/calls),
+`training/validation_rollouts/*.jsonl` (per-sample predictions/hashes/scores),
+`training/validation_scores.jsonl`, and `training/training_config.json`
+(`selection_metric`, `best_state_tool_score`, `best_checkpoint`). These contain
+private train text/tool results. All held-out IDs must be evaluated: skipped
+validation samples are rejected, and unexpected runtime/evaluation failures stop
+the run rather than silently reducing the denominator. Old SFT folders without
+rollout metadata must be regenerated; old loss-selected checkpoints cannot be
+resumed with the new selection settings.
 
 ### Run the main task with the fine-tuned adapter
 

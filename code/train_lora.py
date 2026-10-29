@@ -29,6 +29,8 @@ def main():
     p.add_argument("--lora-alpha", type=int, default=32)
     p.add_argument("--lora-dropout", type=float, default=0.0, help="0 enables Unsloth optimized LoRA kernels")
     p.add_argument("--save-steps", type=int, default=100)
+    p.add_argument("--eval-strategy", choices=["epoch", "steps"], default="epoch",
+                   help="Run full held-out agent rollouts and save candidates each epoch, or every --save-steps")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--resume-from-checkpoint", type=Path)
     args = p.parse_args()
@@ -90,10 +92,13 @@ def main():
         data[part] = SupervisedDataset(examples, tokenizer, args.max_length)
     if ids["train"] & ids["validation"]:
         raise ValueError("Train/validation sample leakage")
+    from lifemate.evaluation import StateToolEvaluator, score_callback
+    evaluator = StateToolEvaluator(args.sft_dir, manifest)
     run_config = {
         **{k: str(v.resolve()) if isinstance(v, Path) else v for k, v in vars(args).items()},
         "torch": torch.__version__, "train_steps": len(data["train"]),
         "validation_steps": len(data["validation"]), "data_manifest": manifest,
+        "selection_metric": "eval_state_tool_score",
     }
     if args.resume_from_checkpoint:
         original_path = args.resume_from_checkpoint.parent / "training_config.json"
@@ -102,7 +107,7 @@ def main():
         original = json.loads(original_path.read_text(encoding="utf-8"))
         for key in ("backend", "base_model", "data_manifest", "quantization", "max_length",
                     "batch_size", "gradient_accumulation", "learning_rate", "lora_r",
-                    "lora_alpha", "lora_dropout", "seed"):
+                    "lora_alpha", "lora_dropout", "seed", "eval_strategy"):
             if original.get(key) != run_config[key]:
                 raise ValueError(f"Resume configuration mismatch: {key}")
     # Save before training so interrupted runs can still be resumed safely.
@@ -137,23 +142,31 @@ def main():
         weight_decay=0.01, max_grad_norm=1.0, optim="adamw_torch",
         bf16=bf16, fp16=cuda and not bf16, use_cpu=not cuda,
         gradient_checkpointing=args.backend != "unsloth", gradient_checkpointing_kwargs={"use_reentrant": False},
-        logging_steps=1, eval_strategy="steps", eval_steps=args.save_steps,
-        save_strategy="steps", save_steps=args.save_steps, save_total_limit=2,
-        load_best_model_at_end=True, metric_for_best_model="eval_loss", greater_is_better=False,
+        logging_steps=1, eval_strategy=args.eval_strategy, eval_steps=args.save_steps,
+        save_strategy=args.eval_strategy, save_steps=args.save_steps, save_total_limit=2,
+        load_best_model_at_end=True, metric_for_best_model="state_tool_score", greater_is_better=True,
         prediction_loss_only=True, report_to="none", seed=args.seed, data_seed=args.seed,
         dataloader_num_workers=0, remove_unused_columns=False)
     trainer = Trainer(model=model, args=training_args, processing_class=tokenizer,
         train_dataset=data["train"], eval_dataset=data["validation"],
-        data_collator=AssistantCollator(tokenizer.pad_token_id))
-    train_result = trainer.train(resume_from_checkpoint=str(args.resume_from_checkpoint) if args.resume_from_checkpoint else None)
-    trainer.save_metrics("train", train_result.metrics)
-    metrics = trainer.evaluate()
-    trainer.save_metrics("eval", metrics)
-    trainer.save_state()
-    adapter = args.output_dir / "adapter"
-    trainer.save_model(str(adapter))
-    tokenizer.save_pretrained(str(adapter))
+        data_collator=AssistantCollator(tokenizer.pad_token_id),
+        callbacks=[score_callback(evaluator, tokenizer, args.output_dir, FastLanguageModel)])
+    try:
+        train_result = trainer.train(resume_from_checkpoint=str(args.resume_from_checkpoint) if args.resume_from_checkpoint else None)
+        trainer.save_metrics("train", train_result.metrics)
+        metrics = trainer.evaluate()
+        trainer.save_metrics("eval", metrics)
+        trainer.save_state()
+        adapter = args.output_dir / "adapter"
+        trainer.save_model(str(adapter))
+        tokenizer.save_pretrained(str(adapter))
+    finally:
+        evaluator.close()
     run_config["best_checkpoint"] = trainer.state.best_model_checkpoint
+    run_config["best_state_tool_score"] = trainer.state.best_metric
+    run_config["selection_metric"] = "eval_state_tool_score"
+    if not trainer.state.best_metric:
+        logging.warning("Best validation state/tool score is 0; the exported checkpoint has not demonstrated successful tool rollouts")
     config_path.write_text(json.dumps(run_config, ensure_ascii=False, indent=2), encoding="utf-8")
     print(f"Saved adapter and tokenizer: {adapter}; validation metrics: {metrics}")
 
