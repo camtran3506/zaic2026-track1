@@ -66,11 +66,15 @@ def test_train_adapter_reload_and_merge(tmp_path):
     env = {**os.environ, 'CUDA_VISIBLE_DEVICES': '', 'OMP_NUM_THREADS': '1',
            'PYTHONDONTWRITEBYTECODE': '1', 'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1'}
     result = subprocess.run([sys.executable, app / 'finetune.py', '--data-root', data.parent,
-        '--base-model', base, '--output-dir', run, '--backend', 'transformers', '--quantization', 'none',
+        '--base-model', base, '--output-dir', run, '--backend', 'transformers',
         '--max-steps', '2', '--gradient-accumulation', '1', '--save-steps', '1',
-        '--max-length', '4096', '--learning-rate', '0.01', '--export-merged'],
+        '--learning-rate', '0.01', '--export-merged'],
         env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
     assert result.returncode == 0, result.stdout
+    config = json.loads((run / 'training/training_config.json').read_text())
+    assert config['quantization'] == 'none'
+    assert config['max_length'] == 16384
+    assert config['batch_size'] == 32
     adapter = run / 'training' / 'adapter'
     assert (adapter / 'adapter_model.safetensors').is_file()
     from safetensors.torch import load_file
@@ -91,9 +95,9 @@ def test_train_adapter_reload_and_merge(tmp_path):
     assert (run / 'train_lora.log').is_file()
     assert (run / 'training/checkpoint-2/trainer_state.json').is_file()
     resume = subprocess.run([sys.executable, app / 'train_lora.py', '--base-model', base,
-        '--sft-dir', run / 'sft', '--output-dir', run / 'training', '--backend', 'transformers', '--quantization', 'none',
+        '--sft-dir', run / 'sft', '--output-dir', run / 'training', '--backend', 'transformers',
         '--max-steps', '3', '--gradient-accumulation', '1', '--save-steps', '1',
-        '--max-length', '4096', '--learning-rate', '0.01',
+        '--learning-rate', '0.01',
         '--resume-from-checkpoint', run / 'training/checkpoint-2'],
         env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
     assert resume.returncode == 0, resume.stdout

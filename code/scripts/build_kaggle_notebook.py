@@ -43,7 +43,9 @@ TRAIN_DATA_ROOT = None  # None: tự tìm train/train.jsonl trong /kaggle/input
 LOCAL_ADAPTER = None   # TRAIN_LLM=False + đường dẫn adapter để dùng bản đã train
 TRAIN_EPOCHS = 3
 TRAIN_MAX_STEPS = -1   # -1: theo epochs; đặt 2 cho kiểm tra ngắn, không phải model đủ chất lượng
-TRAIN_MAX_LENGTH = 8192
+TRAIN_MAX_LENGTH = 16384
+TRAIN_BATCH_SIZE = 32
+TRAIN_QUANTIZATION = "none"
 TRAIN_GRAD_ACCUMULATION = 8
 TRAIN_VALIDATION_FRACTION = 0.1
 
@@ -357,7 +359,7 @@ Danh mục `tool_index` giữ toàn bộ tool được phép. Nếu gold tool ch
 
 Muốn dùng adapter đã có: đặt `TRAIN_LLM=False`, `LOCAL_ADAPTER` tới thư mục adapter. Muốn dùng model đã merge: đặt `TRAIN_LLM=False`, `LOCAL_ADAPTER=None`, `LOCAL_LLM` tới model merged. Nếu thiếu train data khi bật training, cell sẽ dừng rõ ràng thay vì dùng model gốc âm thầm.
 
-Backend huấn luyện mặc định là **Unsloth FastLanguageModel** với QLoRA 4-bit, LoRA dropout=0 và gradient checkpointing `unsloth`. Import Unsloth trước Transformers/PEFT trong subprocess riêng. T4 dùng FP16; GPU hỗ trợ thì BF16. Sequence dài có thể hết VRAM: điều chỉnh cấu hình cho GPU thực tế. JSON target quá dài sẽ bị báo lỗi, không bị cắt âm thầm. `eval_loss` là loss trên validation theo teacher forcing, **không phải điểm F1 chính thức**. Checkpoint/adapter nằm dưới `/kaggle/working/lifemate_finetunes`; không nhét model nhiều GB vào ZIP logs. Nếu mất session, gắn lại base weights + adapter hoặc dùng checkpoint để resume bằng `train_lora.py`.''')
+Backend huấn luyện mặc định là **Unsloth FastLanguageModel** với LoRA không lượng tử hóa, max length 16.384 token, batch size 32, LoRA dropout=0 và gradient checkpointing `unsloth`. Import Unsloth trước Transformers/PEFT trong subprocess riêng. T4 dùng FP16; GPU hỗ trợ thì BF16. Cấu hình batch 32 × 16K cần nhiều VRAM, chưa được xác nhận chạy vừa GPU Kaggle/T4. JSON target quá dài sẽ bị báo lỗi, không bị cắt âm thầm. `eval_loss` là loss trên validation theo teacher forcing, **không phải điểm F1 chính thức**. Checkpoint/adapter nằm dưới `/kaggle/working/lifemate_finetunes`; không nhét model nhiều GB vào ZIP logs. Nếu mất session, gắn lại base weights + adapter hoặc dùng checkpoint để resume bằng `train_lora.py`.''')
 code('''ADAPTER_PATH = Path(LOCAL_ADAPTER) if LOCAL_ADAPTER else None
 if TRAIN_LLM:
     if TRAIN_DATA_ROOT:
@@ -378,8 +380,9 @@ if TRAIN_LLM:
         "--missing-tool-policy", TRAIN_MISSING_TOOL_POLICY,
         "--epochs", str(TRAIN_EPOCHS), "--max-steps", str(TRAIN_MAX_STEPS),
         "--max-length", str(TRAIN_MAX_LENGTH),
+        "--batch-size", str(TRAIN_BATCH_SIZE),
         "--gradient-accumulation", str(TRAIN_GRAD_ACCUMULATION),
-        "--quantization", "4bit" if HW["gpu"] else "none"]
+        "--quantization", TRAIN_QUANTIZATION]
     if TRAIN_USE_ASR:
         train_command.extend(["--asr-model", ASR_PATH, "--asr-device", DEVICE,
                               "--asr-compute-type", ASR_COMPUTE])

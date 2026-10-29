@@ -291,7 +291,10 @@ entrypoint. Keep the organizer's train-specific `zaic_tools` next to `train.json
 
 The default training backend is **Unsloth** (`FastLanguageModel`), imported before
 Transformers/PEFT in the training process. It uses Unsloth gradient checkpointing,
-QLoRA 4-bit and optimized LoRA kernels (dropout=0). Install a CUDA-enabled PyTorch
+unquantized LoRA and optimized LoRA kernels (dropout=0). The defaults are
+`--quantization none --max-length 16384 --batch-size 32`.
+Gradient accumulation remains 8, giving an effective batch size of 256 on one GPU.
+Install a CUDA-enabled PyTorch
 suitable for your GPU first, then:
 
 ```bash
@@ -304,14 +307,18 @@ python finetune.py \
   --data-root /path/to/lifemate_data \
   --base-model Qwen/Qwen3-4B-Instruct-2507 \
   --output-dir /path/to/runs/toolcalling_v1 \
-  --backend unsloth --epochs 3 --quantization 4bit --max-length 8192 \
-  --batch-size 1 --gradient-accumulation 8 --learning-rate 2e-4
+  --backend unsloth --epochs 3 --quantization none --max-length 16384 \
+  --batch-size 32 --gradient-accumulation 8 --learning-rate 2e-4
 ```
 
-QLoRA uses NF4 double quantization, LoRA on attention/MLP projections, SDPA,
-gradient checkpointing, and BF16 on supporting GPUs (FP16 on T4). Start with a
-16-GB+ CUDA GPU; required VRAM depends on sequence length. Reduce `--max-length`
-only if examples fit: preparation/training rejects oversized examples instead of
+LoRA updates attention/MLP projections, with gradient checkpointing and BF16 on
+supporting GPUs (FP16 otherwise on CUDA). No 4-bit/8-bit weight quantization is
+enabled by default. `--quantization 4bit` remains an explicit QLoRA option.
+An unquantized batch of 32 at up to 16,384 tokens requires substantial VRAM; this
+configuration has not been validated to fit an RTX A5000/T4 or this CPU environment.
+Padding is to the longest example in each batch. These defaults change training
+only: inference still defaults to `--max-input-tokens 6000`, and
+`--max-new-tokens 192`. Reduce `--max-length` only if examples fit: preparation/training rejects oversized examples instead of
 silently truncating JSON targets. CPU LoRA (`--quantization none`) is supported for
 tiny smoke tests only with `--backend transformers --quantization none`; Unsloth
 requires a supported CUDA GPU and never silently falls back to another backend.
@@ -369,8 +376,9 @@ python main.py \
   > result/inference.log 2>&1
 ```
 
-Adapter loading is offline and requires PEFT. Inference loads full-precision base + LoRA, so QLoRA's
-low training VRAM is not a promise about inference VRAM.
+Adapter loading is offline and requires PEFT. Inference loads the base model + LoRA
+in the selected inference dtype; training batch size and sequence length do not
+change the inference settings.
 
 ### Export a standalone model and resume training
 
@@ -386,7 +394,7 @@ python train_lora.py --base-model /path/to/exact-base-model \
   --sft-dir /path/to/runs/toolcalling_v1/sft \
   --output-dir /path/to/runs/toolcalling_v1/training \
   --resume-from-checkpoint /path/to/runs/toolcalling_v1/training/checkpoint-100 \
-  --backend unsloth --epochs 3 --quantization 4bit --max-length 8192
+  --backend unsloth --epochs 3 --quantization none --max-length 16384
 ```
 
 Resume with the same model, data, optimizer/batch/LoRA settings as the original run;

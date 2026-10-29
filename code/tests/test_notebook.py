@@ -30,6 +30,9 @@ def test_notebook_sources_and_training_defaults():
     assert {'train_lora.py', 'prepare_sft.py', 'finetune.py', 'merge_lora.py', 'lifemate/sft.py'} <= embedded
     assert 'TRAIN_BACKEND = "unsloth"' in sources[0]
     assert 'TRAIN_LLM = True' in sources[0]
+    assert 'TRAIN_MAX_LENGTH = 16384' in sources[0]
+    assert 'TRAIN_BATCH_SIZE = 32' in sources[0]
+    assert 'TRAIN_QUANTIZATION = "none"' in sources[0]
     assert 'SAMPLE_SECONDS = float("inf")' in sources[0]
     assert 'GPU_INDEX = 0' in sources[0]
     assert 'INFERENCE_GPU_IDS' not in sources[0]
@@ -44,6 +47,8 @@ def test_notebook_sources_and_training_defaults():
     assert 'lifemate/decoding.py' in embedded
     assert 'lifemate/gpu.py' in embedded
     assert any('command.extend(["--llm-adapter", ADAPTER_PATH])' in s for s in sources)
+    assert any('"--batch-size", str(TRAIN_BATCH_SIZE)' in s and
+               '"--quantization", TRAIN_QUANTIZATION' in s for s in sources)
     dependencies = next(s for s in sources if s.startswith('packages ='))
     packages = ast.literal_eval(ast.parse(dependencies).body[0].value)
     requirements = [
