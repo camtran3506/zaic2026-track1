@@ -22,7 +22,7 @@ def main():
     p.add_argument("--max-length", type=int, default=MAX_CONTEXT_TOKENS)
     p.add_argument("--epochs", type=float, default=3)
     p.add_argument("--max-steps", type=int, default=-1)
-    p.add_argument("--batch-size", type=int, default=16)
+    p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--gradient-accumulation", type=int, default=8)
     p.add_argument("--learning-rate", type=float, default=2e-4)
     p.add_argument("--lora-r", type=int, default=16)

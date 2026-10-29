@@ -80,7 +80,7 @@ def test_train_adapter_reload_and_merge(tmp_path):
     config = json.loads((run / 'training/training_config.json').read_text())
     assert config['quantization'] == 'none'
     assert config['max_length'] == 16384
-    assert config['batch_size'] == 16
+    assert config['batch_size'] == 1
     assert config['eval_strategy'] == 'epoch'
     adapter = run / 'training' / 'adapter'
     assert (adapter / 'adapter_model.safetensors').is_file()
