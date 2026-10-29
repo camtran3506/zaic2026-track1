@@ -12,7 +12,7 @@ before launching the LLM subprocess. The notebook runs these two stages in separ
 cells/subprocesses. Per-sample time is unlimited by default (`--sample-seconds inf`);
 `max_calls`, `max_invalid`, schema-inspection and token/context limits still apply.
 
-Defaults: `Qwen/Qwen3-4B-Instruct-2507` (~4.0B, Apache-2.0) and `Systran/faster-whisper-medium` (~769M, MIT). Total model parameters ~4.77B; LLM <5B. LLM context input is capped at 6,000 tokens by default (<16,384). Check all model/dependency licenses and freeze revisions before submission. Neither model is fetched at runtime.
+Defaults: `Qwen/Qwen3-4B-Instruct-2507` (~4.0B, Apache-2.0) and `Systran/faster-whisper-medium` (~769M, MIT). Total model parameters ~4.77B; LLM <5B. Training and inference share a 16,384-token context limit. Inference defaults to 16,000 prompt tokens + up to 384 generated tokens per decision. Check all model/dependency licenses and freeze revisions before submission. Neither model is fetched at runtime.
 
 ## 1. Install dependencies on the server
 
@@ -259,8 +259,8 @@ By default `docker run ... lifemate:baseline` targets **private_test** at `/data
 | `--asr-compute-type` | faster-whisper precision | float16 |
 | `--llm-dtype` | LLM weight dtype | bfloat16 |
 | `--asr-beam` | deterministic beam width | 1 |
-| `--max-input-tokens` | maximum prompt tokens | 6000 |
-| `--max-new-tokens` | per-agent-step generated tokens | 192 |
+| `--max-input-tokens` | maximum prompt tokens | 16000 |
+| `--max-new-tokens` | per-agent-step generated tokens | 384 |
 | `--max-calls` | maximum executed tools/sample | 8 |
 | `--max-invalid` | maximum invalid model plans | 3 |
 | `--max-tool-details` | number of detailed tools shown per step | 35 |
@@ -316,9 +316,14 @@ supporting GPUs (FP16 otherwise on CUDA). No 4-bit/8-bit weight quantization is
 enabled by default. `--quantization 4bit` remains an explicit QLoRA option.
 An unquantized batch of 32 at up to 16,384 tokens requires substantial VRAM; this
 configuration has not been validated to fit an RTX A5000/T4 or this CPU environment.
-Padding is to the longest example in each batch. These defaults change training
-only: inference still defaults to `--max-input-tokens 6000`, and
-`--max-new-tokens 192`. Reduce `--max-length` only if examples fit: preparation/training rejects oversized examples instead of
+Padding is to the longest example in each batch. The shared context limit is defined in `lifemate/context.py`: train defaults to
+16,384 total tokens (prompt + target), and inference to `--max-input-tokens 16000`
+plus `--max-new-tokens 384`. Chat template/special tokens count toward these budgets.
+For longer JSON outputs, an explicit alternative is 15,360 input + 1,024 output;
+the CLI and model wrapper reject nonpositive budgets or a sum above 16,384 before
+loading models. Budgets are never silently clamped, and prompts are never silently
+truncated. Training examples need not use a fixed prompt/target split, but their
+combined token count must fit the same context limit. Reduce `--max-length` only if examples fit: preparation/training rejects oversized examples instead of
 silently truncating JSON targets. CPU LoRA (`--quantization none`) is supported for
 tiny smoke tests only with `--backend transformers --quantization none`; Unsloth
 requires a supported CUDA GPU and never silently falls back to another backend.

@@ -8,6 +8,7 @@ from pathlib import Path
 
 from lifemate.sft import AssistantCollator, SupervisedDataset, file_sha256
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
+from lifemate.context import MAX_CONTEXT_TOKENS, validate_training_length
 
 
 def main():
@@ -18,7 +19,7 @@ def main():
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--backend", choices=["unsloth", "transformers"], default="unsloth")
     p.add_argument("--quantization", choices=["4bit", "none"], default="none")
-    p.add_argument("--max-length", type=int, default=16384)
+    p.add_argument("--max-length", type=int, default=MAX_CONTEXT_TOKENS)
     p.add_argument("--epochs", type=float, default=3)
     p.add_argument("--max-steps", type=int, default=-1)
     p.add_argument("--batch-size", type=int, default=32)
@@ -31,6 +32,7 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--resume-from-checkpoint", type=Path)
     args = p.parse_args()
+    validate_training_length(args.max_length)
     configure_cuda_device(args)
     # Unsloth must patch Transformers/PEFT BEFORE either is imported.
     FastLanguageModel = None

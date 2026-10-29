@@ -5,6 +5,8 @@ from collections import OrderedDict
 import logging
 from pathlib import Path
 
+from .context import DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_NEW_TOKENS, validate_inference_budget
+
 
 class LocalASR:
     def __init__(self, model_path: Path, device: str = "cuda", compute_type: str = "float16", beam_size: int = 1):
@@ -38,9 +40,10 @@ class LocalASR:
 
 class LocalLLM:
     def __init__(self, model_path: Path, device: str = "cuda", dtype: str = "float16",
-                 max_input_tokens: int = 6000, max_new_tokens: int = 192,
+                 max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS, max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
                  adapter_path: Path | None = None, device_map: str = "single",
                  max_memory_gib: float = 6):
+        validate_inference_budget(max_input_tokens, max_new_tokens)
         import torch
         from transformers import AutoModelForCausalLM, AutoTokenizer
         if not model_path.is_dir():
@@ -91,8 +94,8 @@ class LocalLLM:
             self.model.to(device)
         self.model.eval()
         self.device = self.model.get_input_embeddings().weight.device if sharding else device
-        self.max_input_tokens = min(max_input_tokens, 16000)
-        self.max_new_tokens = min(max_new_tokens, 384)
+        self.max_input_tokens = max_input_tokens
+        self.max_new_tokens = max_new_tokens
 
     def generate(self, system: str, user: str) -> str:
         # Import lazily: Unsloth must be imported before Transformers during training.

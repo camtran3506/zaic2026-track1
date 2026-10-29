@@ -24,6 +24,7 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 from lifemate.catalog import load_catalog
 from lifemate.agent import AgentConfig, LifeMateAgent
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
+from lifemate.context import DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_NEW_TOKENS, validate_inference_budget
 
 LOG = logging.getLogger("lifemate")
 
@@ -50,8 +51,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--asr-compute-type", default="float16", choices=["float16", "int8_float16", "int8", "float32"])
     p.add_argument("--llm-dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"])
     p.add_argument("--asr-beam", type=int, default=1)
-    p.add_argument("--max-input-tokens", type=int, default=6000)
-    p.add_argument("--max-new-tokens", type=int, default=192)
+    p.add_argument("--max-input-tokens", type=int, default=DEFAULT_MAX_INPUT_TOKENS)
+    p.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     p.add_argument("--max-calls", type=int, default=8)
     p.add_argument("--max-invalid", type=int, default=3)
     p.add_argument("--max-tool-details", type=int, default=35)
@@ -194,6 +195,7 @@ def run_llm_stage(args, items, transcript_rows, split_dir, env_root):
 
 def main() -> None:
     args = parse_args()
+    validate_inference_budget(args.max_input_tokens, args.max_new_tokens)
     configure_cuda_device(args)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.use_train_transcript and args.split != "train":

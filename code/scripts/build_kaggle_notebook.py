@@ -21,8 +21,7 @@ ASR chạy toàn bộ split (bao gồm audio lịch sử), lưu transcript rồi
 
 Kết quả lưu trong `/kaggle/working/lifemate_runs/<RUN_NAME>/`: `transcripts.jsonl`, `transcripts.manifest.json`, `asr.log`, `submission.jsonl`, `diagnostics.jsonl`, `inference.log`, `setup.log`, `models.log`, `validation.json`, `run_config.json`, `environment.txt`, và `lifemate_artifacts.zip`. Transcript/logs có nội dung người dùng; kiểm tra trước khi chia sẻ. Đây không phải chế độ bảo đảm giới hạn 30 giây/mẫu của cuộc thi.''')
 
-code('''from pathlib import Path
-import os, sys, json, subprocess, datetime, shutil, zipfile, hashlib
+code('from pathlib import Path\n' + (ROOT / 'code/lifemate/context.py').read_text() + '\n' + '''import os, sys, json, subprocess, datetime, shutil, zipfile, hashlib
 
 # ===== CẤU HÌNH — thông thường chỉ cần chỉnh DATA_ROOT =====
 DATA_ROOT = None  # None: tự tìm trong /kaggle/input; hoặc "/kaggle/input/<dataset>/train+public_test"
@@ -43,7 +42,7 @@ TRAIN_DATA_ROOT = None  # None: tự tìm train/train.jsonl trong /kaggle/input
 LOCAL_ADAPTER = None   # TRAIN_LLM=False + đường dẫn adapter để dùng bản đã train
 TRAIN_EPOCHS = 3
 TRAIN_MAX_STEPS = -1   # -1: theo epochs; đặt 2 cho kiểm tra ngắn, không phải model đủ chất lượng
-TRAIN_MAX_LENGTH = 16384
+TRAIN_MAX_LENGTH = MAX_CONTEXT_TOKENS
 TRAIN_BATCH_SIZE = 32
 TRAIN_QUANTIZATION = "none"
 TRAIN_GRAD_ACCUMULATION = 8
@@ -59,8 +58,8 @@ LOCAL_LLM = None     # thư mục Transformers có config.json + tokenizer + tr�
 HF_SECRET_NAME = None  # tùy chọn: tên Kaggle Secret chứa HF token (public models không cần)
 
 SAMPLE_SECONDS = float("inf")  # không giới hạn thời gian mỗi mẫu
-MAX_INPUT_TOKENS = 6000
-MAX_NEW_TOKENS = 192
+MAX_INPUT_TOKENS = DEFAULT_MAX_INPUT_TOKENS
+MAX_NEW_TOKENS = DEFAULT_MAX_NEW_TOKENS
 MAX_CALLS = 8
 MAX_INVALID = 3
 MAX_TOOL_DETAILS = 35
@@ -95,7 +94,8 @@ assert isinstance(LIMIT, int) and LIMIT >= 0
 assert not USE_TRAIN_TRANSCRIPT or SPLIT == "train"
 assert ASR_FORMAT in {"ctranslate2", "transformers"}
 assert isinstance(GPU_INDEX, int) and GPU_INDEX >= 0
-assert MAX_INPUT_TOKENS + MAX_NEW_TOKENS <= 16384
+validate_inference_budget(MAX_INPUT_TOKENS, MAX_NEW_TOKENS)
+validate_training_length(TRAIN_MAX_LENGTH)
 print("Artifacts:", OUT)
 ''')
 
@@ -210,7 +210,7 @@ md('''## 3. Toàn bộ mã pipeline nhúng trong notebook
 
 Các cell dưới ghi mã vào `/kaggle/working/lifemate_app` để chạy trong subprocess, tách runtime tải model (online) khỏi suy luận (local-only). Logic baseline được giữ nguyên; không cần repository bên ngoài. Có cả mã fine-tune, bộ unit test và scorer train.''')
 for rel in ['lifemate/__init__.py', 'lifemate/catalog.py', 'lifemate/models.py', 'lifemate/agent.py', 'lifemate/transcripts.py', 'lifemate/decoding.py',
-            'lifemate/gpu.py', 'main.py', 'score_train.py', 'lifemate/sft.py', 'prepare_sft.py', 'train_lora.py',
+            'lifemate/gpu.py', 'lifemate/context.py', 'main.py', 'score_train.py', 'lifemate/sft.py', 'prepare_sft.py', 'train_lora.py',
             'merge_lora.py', 'finetune.py', 'tests/test_baseline.py', 'tests/test_sft.py',
             'tests/test_finetune_integration.py', 'tests/test_audio.py', 'tests/test_catalog_inspection.py',
             'tests/test_staged_pipeline.py', 'tests/test_decoding.py']:

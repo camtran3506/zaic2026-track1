@@ -30,7 +30,10 @@ def test_notebook_sources_and_training_defaults():
     assert {'train_lora.py', 'prepare_sft.py', 'finetune.py', 'merge_lora.py', 'lifemate/sft.py'} <= embedded
     assert 'TRAIN_BACKEND = "unsloth"' in sources[0]
     assert 'TRAIN_LLM = True' in sources[0]
-    assert 'TRAIN_MAX_LENGTH = 16384' in sources[0]
+    assert 'TRAIN_MAX_LENGTH = MAX_CONTEXT_TOKENS' in sources[0]
+    assert 'MAX_INPUT_TOKENS = DEFAULT_MAX_INPUT_TOKENS' in sources[0]
+    assert 'MAX_NEW_TOKENS = DEFAULT_MAX_NEW_TOKENS' in sources[0]
+    assert (root / 'code/lifemate/context.py').read_text() in sources[0]
     assert 'TRAIN_BATCH_SIZE = 32' in sources[0]
     assert 'TRAIN_QUANTIZATION = "none"' in sources[0]
     assert 'SAMPLE_SECONDS = float("inf")' in sources[0]
@@ -46,6 +49,7 @@ def test_notebook_sources_and_training_defaults():
     assert 'INFER_ENV["CUDA_VISIBLE_DEVICES"] = str(GPU_INDEX)' in sources[llm_index]
     assert 'lifemate/decoding.py' in embedded
     assert 'lifemate/gpu.py' in embedded
+    assert 'lifemate/context.py' in embedded
     assert any('command.extend(["--llm-adapter", ADAPTER_PATH])' in s for s in sources)
     assert any('"--batch-size", str(TRAIN_BATCH_SIZE)' in s and
                '"--quantization", TRAIN_QUANTIZATION' in s for s in sources)
