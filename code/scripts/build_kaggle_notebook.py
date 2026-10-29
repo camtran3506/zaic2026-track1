@@ -100,12 +100,12 @@ print("Artifacts:", OUT)
 md('''## 1. Dependency và runtime
 
 Giữ nguyên PyTorch/CUDA do Kaggle cung cấp, không cài đè torch. Các thư viện ASR/LLM được cài trong tiến trình riêng trước khi dùng. CTranslate2 cần CUDA 12 + cuDNN 9 khi chạy GPU; bước suy luận thực tế sẽ kiểm tra việc nạp model. Nếu GPU memory không đủ, giảm `MAX_INPUT_TOKENS`, chọn model nhỏ hơn hoặc đổi GPU.''')
-code('''packages = [
-    "numpy>=1.26,<3", "transformers==4.57.3", "accelerate==1.15.0",
-    "safetensors==0.8.0", "faster-whisper==1.2.1", "av==16.1.0", "ctranslate2==4.6.0",
-    "huggingface-hub==0.36.2", "pytest>=8,<10", "peft==0.19.1", "bitsandbytes>=0.45.5,<0.50,!=0.46.0,!=0.48.0",
-    "unsloth==2025.12.10", "unsloth-zoo==2025.12.8",
+# Embed the shared manifest so the standalone notebook uses the same constraints.
+packages = [
+    line.strip() for line in (ROOT / "code" / "requirements.txt").read_text().splitlines()
+    if line.strip() and not line.lstrip().startswith("#")
 ]
+code('''packages = ''' + repr(packages) + '''
 # Kiểm tra torch trước: tránh pip tự kéo một bản CUDA khác với Kaggle.
 run_logged([sys.executable, "-c", "import torch; print('Kaggle torch:', torch.__version__)"], OUT / "setup.log")
 # Constrain the preinstalled CUDA stack so dependency resolution cannot replace it.

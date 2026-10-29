@@ -16,6 +16,11 @@ Defaults: `Qwen/Qwen3-4B-Instruct-2507` (~4.0B, Apache-2.0) and `Systran/faster-
 
 ## 1. Install dependencies on the server
 
+`requirements.txt` is the shared dependency list for inference and fine-tuning.
+It includes Unsloth/PEFT and pins Transformers 4.57.3 for the Unsloth stack;
+PyAV 16.1.0 preserves the audio decoding API used by faster-whisper.
+Install a compatible PyTorch/CUDA stack first; Unsloth training requires a supported GPU.
+
 Tested only with Python syntax/unit tests; use Linux + CUDA 12.x + GPU for actual inference. The GPU container image supplies PyTorch. For local runs, install a CUDA-enabled PyTorch compatible with your GPU first.
 
 ```bash
@@ -257,7 +262,7 @@ suitable for your GPU first, then:
 
 ```bash
 cd code
-python -m pip install -r requirements-train.txt
+python -m pip install -r requirements.txt
 
 # One command: stage base weights, prepare dialogues, train/evaluate, save adapter.
 # A local model path works fully offline. A HF ID downloads the resolved revision first.

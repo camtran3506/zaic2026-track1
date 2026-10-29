@@ -1,9 +1,0 @@
--r requirements.txt
-# 0.19.1 supports TorchAO's TorchAOBaseTensor API (0.18.x imports removed types).
-peft==0.19.1
-# This Unsloth release supports Qwen3 and Transformers <=4.57.3.
-transformers==4.57.3
-unsloth==2025.12.10
-unsloth-zoo==2025.12.8
-# CUDA is required for Unsloth; CPU tests explicitly use --backend transformers.
-bitsandbytes>=0.45.5,<0.50,!=0.46.0,!=0.48.0; platform_system == "Linux"

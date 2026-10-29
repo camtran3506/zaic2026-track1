@@ -43,6 +43,13 @@ def test_notebook_sources_and_training_defaults():
     assert 'INFER_ENV["CUDA_VISIBLE_DEVICES"] = str(GPU_INDEX)' in sources[llm_index]
     assert 'lifemate/decoding.py' in embedded
     assert any('command.extend(["--llm-adapter", ADAPTER_PATH])' in s for s in sources)
+    dependencies = next(s for s in sources if s.startswith('packages ='))
+    packages = ast.literal_eval(ast.parse(dependencies).body[0].value)
+    requirements = [
+        line.strip() for line in (root / 'code/requirements.txt').read_text().splitlines()
+        if line.strip() and not line.lstrip().startswith('#')
+    ]
+    assert packages == requirements
 
 
 @pytest.mark.parametrize('missing', [False, True])

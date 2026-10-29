@@ -35,7 +35,7 @@ def main():
         try:
             from unsloth import FastLanguageModel
         except ImportError as exc:
-            raise RuntimeError("Install requirements-train.txt in a supported CUDA environment for Unsloth") from exc
+            raise RuntimeError("Install requirements.txt in a supported CUDA environment for Unsloth") from exc
     import torch
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
     from transformers import (AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig,
