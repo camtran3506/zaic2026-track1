@@ -1,3 +1,4 @@
 train+public_test/
 __MACOSX/
-code/models/
+code/models/*
+!code/models/.gitignore

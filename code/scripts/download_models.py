@@ -6,13 +6,15 @@ from huggingface_hub import snapshot_download
 
 MODELS = {
     "llm": "Qwen/Qwen3-4B-Instruct-2507",
-    "asr": "Systran/faster-whisper-small",
+    "asr": "Systran/faster-whisper-medium",
 }
 
 
 def main():
     p = argparse.ArgumentParser()
-    p.add_argument("--models-dir", type=Path, default=Path("models"))
+    p.add_argument("--models-dir", type=Path,
+                   default=Path(__file__).resolve().parents[1] / "models",
+                   help="Download root (default: code/models, independent of working directory)")
     p.add_argument("--only", choices=["llm", "asr", "both"], default="both")
     p.add_argument("--llm-revision", default=None, help="Pin a git commit before final submission")
     p.add_argument("--asr-revision", default=None, help="Pin a git commit before final submission")

@@ -12,7 +12,7 @@ before launching the LLM subprocess. The notebook runs these two stages in separ
 cells/subprocesses. Per-sample time is unlimited by default (`--sample-seconds inf`);
 `max_calls`, `max_invalid`, schema-inspection and token/context limits still apply.
 
-Defaults: `Qwen/Qwen3-4B-Instruct-2507` (~4.0B, Apache-2.0) and `Systran/faster-whisper-small` (~244M, MIT). Total model parameters ~4.24B; LLM <5B. LLM context input is capped at 6,000 tokens by default (<16,384). Check all model/dependency licenses and freeze revisions before submission. Neither model is fetched at runtime.
+Defaults: `Qwen/Qwen3-4B-Instruct-2507` (~4.0B, Apache-2.0) and `Systran/faster-whisper-medium` (~769M, MIT). Total model parameters ~4.77B; LLM <5B. LLM context input is capped at 6,000 tokens by default (<16,384). Check all model/dependency licenses and freeze revisions before submission. Neither model is fetched at runtime.
 
 ## 1. Install dependencies on the server
 
@@ -24,7 +24,7 @@ Install a compatible PyTorch/CUDA stack first; Unsloth training requires a suppo
 Tested only with Python syntax/unit tests; use Linux + CUDA 12.x + GPU for actual inference. The GPU container image supplies PyTorch. For local runs, install a CUDA-enabled PyTorch compatible with your GPU first.
 
 ```bash
-cd lifemate_baseline
+cd code
 python -m pip install -r requirements.txt
 ```
 
@@ -34,10 +34,15 @@ python -m pip install -r requirements.txt
 python scripts/download_models.py --models-dir ./models
 ```
 
+By default the script writes to `code/models/`, even when invoked from the repository root
+with `python code/scripts/download_models.py`. Use `--models-dir` to override it.
+`run_server.sh` uses `models/asr` and `models/llm` beside itself by default.
+The directory is tracked through `.gitignore`; downloaded weights stay out of Git.
+
 This creates:
 
 ```text
-lifemate_baseline/
+code/
 ├── main.py
 ├── lifemate/
 ├── scripts/
@@ -56,7 +61,7 @@ For final scoring, keep **both** model folders inside the Docker image. The down
 
 ```bash
 DATA_ROOT=/mnt/datasets/LifeMate SPLIT=public_test \
-ASR_MODEL=/mnt/weights/whisper-small LLM_MODEL=/mnt/weights/qwen3-4b \
+ASR_MODEL=/mnt/weights/whisper-medium LLM_MODEL=/mnt/weights/qwen3-4b \
 OUTPUT=/mnt/results/submission.jsonl bash run_server.sh
 ```
 
@@ -69,7 +74,7 @@ mkdir -p result
 python main.py \
     --data-root /your/storage/lifemate_data \
     --split public_test \
-    --asr-model /your/weights/faster-whisper-small \
+    --asr-model /your/weights/faster-whisper-medium \
     --llm-model /your/weights/Qwen3-4B-Instruct-2507 \
     --output /your/outputs/submission.jsonl \
     --log-path /your/outputs/diagnostics.jsonl \

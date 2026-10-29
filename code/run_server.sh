@@ -9,12 +9,12 @@ DATA_ROOT="${DATA_ROOT:-/mnt/mmlab2024nas/trantran/lifemate/train+public_test}"
 # Tên split, KHÔNG phải đường dẫn
 SPLIT="${SPLIT:-public_test}"
 
-# Models đã được tải trong Hugging Face cache
-# ASR - Whisper Small
-ASR_MODEL="${ASR_MODEL:-${SCRIPT_DIR}/models/phowhisper-small-ct2}"
+# Models tải bằng scripts/download_models.py
+# ASR - Systran/faster-whisper-medium (CTranslate2)
+ASR_MODEL="${ASR_MODEL:-${SCRIPT_DIR}/models/asr}"
 
 # LLM - Qwen3-4B-Instruct-2507
-LLM_MODEL="${LLM_MODEL:-/mnt/mmlab2024nas/trantran/hf_cache/hub/models--Qwen--Qwen3-4B-Instruct-2507/snapshots/cdbee75f17c01a7cc42f958dc650907174af0554}"
+LLM_MODEL="${LLM_MODEL:-${SCRIPT_DIR}/models/llm}"
 
 # Output
 OUTPUT="${OUTPUT:-${SCRIPT_DIR}/result/submission.jsonl}"

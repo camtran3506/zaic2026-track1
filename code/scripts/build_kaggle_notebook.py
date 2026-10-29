@@ -15,7 +15,7 @@ Không cần clone GitHub. Mặc định notebook fine-tune LLM trước trên T
 
 Bộ dữ liệu cần có `<split>.jsonl`, `<split>_tools_catalog.json`, audio và **zaic_tools đúng phiên bản của split**. Notebook chỉ đọc manifest/catalog/audio; trạng thái ứng dụng do `ToolEnv` quản lý.
 
-Chỉnh cấu hình bên dưới. `LIMIT=0` chạy **toàn bộ split**. Model tải từ Hugging Face trước khi suy luận; có thể dùng model gắn sẵn ở `/kaggle/input`. Model ASR mặc định là `Systran/faster-whisper-small`; muốn dùng PhoWhisper, đặt `ASR_REPO="vinai/PhoWhisper-small"` và `ASR_FORMAT="transformers"` để tự chuyển sang CTranslate2.
+Chỉnh cấu hình bên dưới. `LIMIT=0` chạy **toàn bộ split**. Model tải từ Hugging Face trước khi suy luận; có thể dùng model gắn sẵn ở `/kaggle/input`. Model ASR mặc định là `Systran/faster-whisper-medium`, dùng trực tiếp định dạng CTranslate2.
 
 ASR chạy toàn bộ split (bao gồm audio lịch sử), lưu transcript rồi thoát tiến trình và giải phóng GPU. LLM sau đó đọc cache; không nạp Whisper cùng lúc. Mặc định không giới hạn thời gian mỗi mẫu (`float("inf")`); vẫn giữ giới hạn tool calls và token/context ≤16.384.
 
@@ -47,8 +47,8 @@ TRAIN_MAX_LENGTH = 8192
 TRAIN_GRAD_ACCUMULATION = 8
 TRAIN_VALIDATION_FRACTION = 0.1
 
-ASR_REPO = "Systran/faster-whisper-small"
-ASR_FORMAT = "ctranslate2"  # hoặc "transformers" (ví dụ vinai/PhoWhisper-small)
+ASR_REPO = "Systran/faster-whisper-medium"
+ASR_FORMAT = "ctranslate2"  # Systran/faster-whisper-medium đã ở định dạng CTranslate2
 LLM_REPO = "Qwen/Qwen3-4B-Instruct-2507"
 ASR_REVISION = None  # None: resolve main thành SHA và ghi lại trong model_manifest.json
 LLM_REVISION = None
