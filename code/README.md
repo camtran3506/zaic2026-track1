@@ -292,8 +292,8 @@ entrypoint. Keep the organizer's train-specific `zaic_tools` next to `train.json
 The default training backend is **Unsloth** (`FastLanguageModel`), imported before
 Transformers/PEFT in the training process. It uses Unsloth gradient checkpointing,
 unquantized LoRA and optimized LoRA kernels (dropout=0). The defaults are
-`--quantization none --max-length 16384 --batch-size 32`.
-Gradient accumulation remains 8, giving an effective batch size of 256 on one GPU.
+`--quantization none --max-length 16384 --batch-size 16`.
+Gradient accumulation remains 8, giving an effective batch size of 128 on one GPU.
 Install a CUDA-enabled PyTorch
 suitable for your GPU first, then:
 
@@ -308,13 +308,13 @@ python finetune.py \
   --base-model Qwen/Qwen3-4B-Instruct-2507 \
   --output-dir /path/to/runs/toolcalling_v1 \
   --backend unsloth --epochs 3 --quantization none --max-length 16384 \
-  --batch-size 32 --gradient-accumulation 8 --learning-rate 2e-4
+  --batch-size 16 --gradient-accumulation 8 --learning-rate 2e-4
 ```
 
 LoRA updates attention/MLP projections, with gradient checkpointing and BF16 on
 supporting GPUs (FP16 otherwise on CUDA). No 4-bit/8-bit weight quantization is
 enabled by default. `--quantization 4bit` remains an explicit QLoRA option.
-An unquantized batch of 32 at up to 16,384 tokens requires substantial VRAM; this
+An unquantized batch of 16 at up to 16,384 tokens requires substantial VRAM; this
 configuration has not been validated to fit an RTX A5000/T4 or this CPU environment.
 Padding is to the longest example in each batch. The shared context limit is defined in `lifemate/context.py`: train defaults to
 16,384 total tokens (prompt + target), and inference to `--max-input-tokens 16000`

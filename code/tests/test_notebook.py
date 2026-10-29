@@ -34,7 +34,7 @@ def test_notebook_sources_and_training_defaults():
     assert 'MAX_INPUT_TOKENS = DEFAULT_MAX_INPUT_TOKENS' in sources[0]
     assert 'MAX_NEW_TOKENS = DEFAULT_MAX_NEW_TOKENS' in sources[0]
     assert (root / 'code/lifemate/context.py').read_text() in sources[0]
-    assert 'TRAIN_BATCH_SIZE = 32' in sources[0]
+    assert 'TRAIN_BATCH_SIZE = 16' in sources[0]
     assert 'TRAIN_QUANTIZATION = "none"' in sources[0]
     assert 'SAMPLE_SECONDS = float("inf")' in sources[0]
     assert 'GPU_INDEX = 0' in sources[0]

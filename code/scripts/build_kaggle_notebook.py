@@ -43,7 +43,7 @@ LOCAL_ADAPTER = None   # TRAIN_LLM=False + đường dẫn adapter để dùng b
 TRAIN_EPOCHS = 3
 TRAIN_MAX_STEPS = -1   # -1: theo epochs; đặt 2 cho kiểm tra ngắn, không phải model đủ chất lượng
 TRAIN_MAX_LENGTH = MAX_CONTEXT_TOKENS
-TRAIN_BATCH_SIZE = 32
+TRAIN_BATCH_SIZE = 16
 TRAIN_QUANTIZATION = "none"
 TRAIN_GRAD_ACCUMULATION = 8
 TRAIN_VALIDATION_FRACTION = 0.1
@@ -360,7 +360,7 @@ Danh mục `tool_index` giữ toàn bộ tool được phép. Nếu gold tool ch
 
 Muốn dùng adapter đã có: đặt `TRAIN_LLM=False`, `LOCAL_ADAPTER` tới thư mục adapter. Muốn dùng model đã merge: đặt `TRAIN_LLM=False`, `LOCAL_ADAPTER=None`, `LOCAL_LLM` tới model merged. Nếu thiếu train data khi bật training, cell sẽ dừng rõ ràng thay vì dùng model gốc âm thầm.
 
-Backend huấn luyện mặc định là **Unsloth FastLanguageModel** với LoRA không lượng tử hóa, max length 16.384 token, batch size 32, LoRA dropout=0 và gradient checkpointing `unsloth`. Import Unsloth trước Transformers/PEFT trong subprocess riêng. T4 dùng FP16; GPU hỗ trợ thì BF16. Cấu hình batch 32 × 16K cần nhiều VRAM, chưa được xác nhận chạy vừa GPU Kaggle/T4. JSON target quá dài sẽ bị báo lỗi, không bị cắt âm thầm. Checkpoint tốt nhất được chọn bằng `eval_state_tool_score` (0–100) sau mỗi epoch: rollout agent trên toàn bộ validation tách từ TRAIN, gate bằng state hash rồi tính tool-call F1. Gold hash được lấy qua `ToolEnv.get_state_hash()` sau replay gold calls; dự đoán dùng môi trường mới. `eval_loss` chỉ để theo dõi. Đây là điểm validation với transcript train đã chuẩn bị; tokenizer fuzzy dùng lowercase + NFC + tách khoảng trắng, kết quả BTC vẫn là quyết định cuối cùng. Checkpoint/adapter nằm dưới `/kaggle/working/lifemate_finetunes`; không nhét model nhiều GB vào ZIP logs. Nếu mất session, gắn lại base weights + adapter hoặc dùng checkpoint để resume bằng `train_lora.py`.''')
+Backend huấn luyện mặc định là **Unsloth FastLanguageModel** với LoRA không lượng tử hóa, max length 16.384 token, batch size 16, LoRA dropout=0 và gradient checkpointing `unsloth`. Import Unsloth trước Transformers/PEFT trong subprocess riêng. T4 dùng FP16; GPU hỗ trợ thì BF16. Cấu hình batch 16 × 16K cần nhiều VRAM, chưa được xác nhận chạy vừa GPU Kaggle/T4. JSON target quá dài sẽ bị báo lỗi, không bị cắt âm thầm. Checkpoint tốt nhất được chọn bằng `eval_state_tool_score` (0–100) sau mỗi epoch: rollout agent trên toàn bộ validation tách từ TRAIN, gate bằng state hash rồi tính tool-call F1. Gold hash được lấy qua `ToolEnv.get_state_hash()` sau replay gold calls; dự đoán dùng môi trường mới. `eval_loss` chỉ để theo dõi. Đây là điểm validation với transcript train đã chuẩn bị; tokenizer fuzzy dùng lowercase + NFC + tách khoảng trắng, kết quả BTC vẫn là quyết định cuối cùng. Checkpoint/adapter nằm dưới `/kaggle/working/lifemate_finetunes`; không nhét model nhiều GB vào ZIP logs. Nếu mất session, gắn lại base weights + adapter hoặc dùng checkpoint để resume bằng `train_lora.py`.''')
 code('''ADAPTER_PATH = Path(LOCAL_ADAPTER) if LOCAL_ADAPTER else None
 if TRAIN_LLM:
     if TRAIN_DATA_ROOT:
