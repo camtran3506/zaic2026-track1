@@ -7,9 +7,12 @@ from pathlib import Path
 import subprocess
 import sys
 
+from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
+
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
+    add_cuda_device_argument(p)
     p.add_argument("--data-root", type=Path, required=True)
     p.add_argument("--base-model", required=True, help="Local directory or Hugging Face model ID")
     p.add_argument("--revision", default="main", help="HF commit or revision; resolved SHA is logged")
@@ -24,6 +27,7 @@ def main():
     p.add_argument("--export-merged", action="store_true", help="Needs RAM/disk for full-precision base + adapter")
     # Remaining args are forwarded to train_lora.py, e.g. --max-steps or --quantization.
     args, training_options = p.parse_known_args()
+    configure_cuda_device(args)
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise FileExistsError("Choose an empty run directory. To resume training use train_lora.py directly.")
     args.output_dir.mkdir(parents=True, exist_ok=True)

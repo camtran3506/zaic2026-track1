@@ -23,12 +23,14 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 
 from lifemate.catalog import load_catalog
 from lifemate.agent import AgentConfig, LifeMateAgent
+from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
 
 LOG = logging.getLogger("lifemate")
 
 
 def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="Offline LifeMate ASR -> LLM -> ToolEnv baseline")
+    add_cuda_device_argument(p)
     p.add_argument("--data-root", type=Path, required=True,
                    help="Folder holding <split>/ OR the split folder itself (e.g. /data in Docker)")
     p.add_argument("--split", choices=["train", "public_test", "private_test"], default="public_test")
@@ -192,6 +194,7 @@ def run_llm_stage(args, items, transcript_rows, split_dir, env_root):
 
 def main() -> None:
     args = parse_args()
+    configure_cuda_device(args)
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.use_train_transcript and args.split != "train":
         raise ValueError("--use-train-transcript is forbidden for test splits")

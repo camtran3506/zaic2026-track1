@@ -7,10 +7,12 @@ import os
 from pathlib import Path
 
 from lifemate.sft import AssistantCollator, SupervisedDataset, file_sha256
+from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
+    add_cuda_device_argument(p)
     p.add_argument("--base-model", type=Path, required=True, help="Local model directory (stage HF weights first)")
     p.add_argument("--sft-dir", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, required=True)
@@ -29,6 +31,7 @@ def main():
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--resume-from-checkpoint", type=Path)
     args = p.parse_args()
+    configure_cuda_device(args)
     # Unsloth must patch Transformers/PEFT BEFORE either is imported.
     FastLanguageModel = None
     if args.backend == "unsloth":

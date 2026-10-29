@@ -146,25 +146,54 @@ with empty predictions. LLM sample errors remain recorded in diagnostics.
 `sample_seconds` measures the LLM stage, `asr_seconds` the cached ASR work, and
 `total_sample_seconds` their sum. Cache reuse does not rerun/timestamp ASR work.
 
-### Single-GPU defaults and optional multi-GPU CLI
+### Select one GPU for inference and fine-tuning
+
+All CUDA entrypoints (`main.py`, `finetune.py`, `train_lora.py`, `prepare_sft.py`)
+accept `--cuda-visible-devices` with **one** GPU index or GPU/MIG UUID. The mask is
+set before importing Unsloth, PyTorch, or CTranslate2 and inherited by child
+processes. Multiple GPU IDs such as `0,1` are rejected. Without an explicit flag,
+the first entry in the inherited `CUDA_VISIBLE_DEVICES` is used, otherwise GPU 0.
+An empty inherited mask or `--cuda-visible-devices -1` disables CUDA for CPU runs;
+select the CPU device/backend separately as appropriate.
 
 ```bash
-CUDA_VISIBLE_DEVICES=0,1 python main.py --stage llm \
-    --data-root /path/to/data --split public_test \
-    --transcript-cache result/medium_transcripts.jsonl \
-    --llm-model /path/to/qwen --llm-dtype float16 \
-    --llm-device-map balanced --llm-max-memory-gib 6 \
-    --output result/submission.jsonl
+# From code/, select GPU 2 for both ASR and LLM.
+bash run_server.sh --cuda-visible-devices 2
+
+# Select GPU 2 for preparation and Unsloth training.
+python finetune.py --cuda-visible-devices 2 \
+    --data-root /path/to/data --base-model "$PWD/models/llm" \
+    --asr-model "$PWD/models/asr" --output-dir "$PWD/result/finetune_gpu2"
 ```
 
-Balanced sharding places LLM weights on multiple visible GPUs and routes input to
-the embedding device; it does not move the whole model onto GPU 0. Logs show the
-placement and weight budgets. The weight budget leaves room for KV cache/attention;
-it is not a total process VRAM limit. A 16K context may still exceed a T4's memory.
-The repo CLI/server and Kaggle notebook default to `--llm-device-map single` on
-one GPU. The notebook exposes only `GPU_INDEX` to both ASR and LLM subprocesses,
-even if Kaggle has two T4 cards. ASR exits before the LLM loads. Balanced multi-GPU
-sharding remains an explicit CLI option for deployments needing extra memory.
+The chosen physical GPU is remapped to local CUDA device 0 in each process. Do
+not change model placement to `cuda:2` after selecting GPU 2. Selection does not
+reserve the GPU; choose one with sufficient free VRAM. `--llm-device-map single`
+is the inference default. The legacy `balanced` option is limited to the one
+selected GPU through these entrypoints. ASR exits before the LLM loads.
+The Kaggle notebook retains its `GPU_INDEX` setting and passes that selection
+through the environment to all subprocesses.
+
+A complete background run, using the existing training defaults:
+
+```bash
+mkdir -p logs
+nohup bash -c '
+  set -e
+  GPU=2
+  RUN_DIR="$PWD/result/finetune_$(date +%Y%m%d_%H%M%S)"
+  python scripts/download_models.py
+  python finetune.py --cuda-visible-devices "$GPU" \
+    --data-root /path/to/data --base-model "$PWD/models/llm" \
+    --asr-model "$PWD/models/asr" --output-dir "$RUN_DIR"
+  bash run_server.sh --cuda-visible-devices "$GPU" \
+    --data-root /path/to/data --llm-adapter "$RUN_DIR/training/adapter"
+' > logs/finetune_pipeline.log 2>&1 < /dev/null &
+```
+
+Use a new/empty fine-tuning output directory for each fresh run. The shared GPU
+flag is also available on `train_lora.py` when resuming an existing checkpoint.
+
 Set `RUN_ASR=False` and `TRANSCRIPT_CACHE` to a completed
 cache to repeat only LLM inference; keep the manifest beside that cache. To run
 without fine-tuning set `TRAIN_LLM=False` and choose base weights or `LOCAL_ADAPTER`.

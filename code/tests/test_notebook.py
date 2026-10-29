@@ -42,6 +42,7 @@ def test_notebook_sources_and_training_defaults():
     assert '"--llm-device-map", "single"' in sources[llm_index]
     assert 'INFER_ENV["CUDA_VISIBLE_DEVICES"] = str(GPU_INDEX)' in sources[llm_index]
     assert 'lifemate/decoding.py' in embedded
+    assert 'lifemate/gpu.py' in embedded
     assert any('command.extend(["--llm-adapter", ADAPTER_PATH])' in s for s in sources)
     dependencies = next(s for s in sources if s.startswith('packages ='))
     packages = ast.literal_eval(ast.parse(dependencies).body[0].value)

@@ -208,7 +208,7 @@ md('''## 3. Toàn bộ mã pipeline nhúng trong notebook
 
 Các cell dưới ghi mã vào `/kaggle/working/lifemate_app` để chạy trong subprocess, tách runtime tải model (online) khỏi suy luận (local-only). Logic baseline được giữ nguyên; không cần repository bên ngoài. Có cả mã fine-tune, bộ unit test và scorer train.''')
 for rel in ['lifemate/__init__.py', 'lifemate/catalog.py', 'lifemate/models.py', 'lifemate/agent.py', 'lifemate/transcripts.py', 'lifemate/decoding.py',
-            'main.py', 'score_train.py', 'lifemate/sft.py', 'prepare_sft.py', 'train_lora.py',
+            'lifemate/gpu.py', 'main.py', 'score_train.py', 'lifemate/sft.py', 'prepare_sft.py', 'train_lora.py',
             'merge_lora.py', 'finetune.py', 'tests/test_baseline.py', 'tests/test_sft.py',
             'tests/test_finetune_integration.py', 'tests/test_audio.py', 'tests/test_catalog_inspection.py',
             'tests/test_staged_pipeline.py', 'tests/test_decoding.py']:

@@ -8,10 +8,12 @@ import sys
 from main import resolve_data_layout
 from lifemate.catalog import load_catalog
 from lifemate.sft import UnexposedToolError, file_sha256, replay_sample, split_records
+from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
+    add_cuda_device_argument(p)
     p.add_argument("--data-root", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--validation-fraction", type=float, default=0.1)
@@ -23,6 +25,7 @@ def main():
     p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     p.add_argument("--asr-compute-type", default="float16")
     args = p.parse_args()
+    configure_cuda_device(args)
     split_dir, env_root, holder = resolve_data_layout(args.data_root, "train")
     source = split_dir / "train.jsonl"
     records = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line.strip()]

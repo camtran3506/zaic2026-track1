@@ -23,6 +23,7 @@ SAMPLE_SECONDS="${SAMPLE_SECONDS:-inf}"
 
 # GPU
 DEVICE="${DEVICE:-cuda}"
+# main.py accepts --cuda-visible-devices N through "$@" and defaults to one GPU.
 
 # Chạy inference
 exec python "${SCRIPT_DIR}/main.py" \
