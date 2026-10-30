@@ -206,6 +206,13 @@ def main() -> None:
         raise ValueError("--asr-model is required for the ASR stage")
     if args.stage in ("full", "llm") and args.llm_model is None:
         raise ValueError("--llm-model is required for the LLM stage")
+    LOG.info("Starting stage=%s pid=%d", args.stage, os.getpid())
+    for name in ("asr_model", "llm_model", "llm_adapter"):
+        path = getattr(args, name)
+        if path is not None:
+            path = path.expanduser().resolve()
+            setattr(args, name, path)
+            LOG.info("%s=%s", name.upper(), path)
     if args.transcript_cache is None:
         args.transcript_cache = args.output.with_suffix(".transcripts.jsonl")
     if args.log_path is None:

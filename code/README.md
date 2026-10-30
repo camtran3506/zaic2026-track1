@@ -36,7 +36,8 @@ python scripts/download_models.py --models-dir ./models
 
 By default the script writes to `code/models/`, even when invoked from the repository root
 with `python code/scripts/download_models.py`. Use `--models-dir` to override it.
-`run_server.sh` uses `models/asr` and `models/llm` beside itself by default.
+`run_server.sh` loads the local folders configured by its `ASR_MODEL` and
+`LLM_MODEL` assignments (`models/asr` and `models/llm` beside itself).
 The directory is tracked through `.gitignore`; downloaded weights stay out of Git.
 
 This creates:
@@ -57,15 +58,40 @@ For final scoring, keep **both** model folders inside the Docker image. The down
 
 ## 3. Customize paths and run public_test
 
-**Simplest way to configure server paths:** edit the first variables in `run_server.sh`, or use environment variables:
+**Model folders for the server launcher are configured only in `run_server.sh`:**
+
+```bash
+ASR_MODEL="${SCRIPT_DIR}/models/asr"
+LLM_MODEL="${SCRIPT_DIR}/models/llm"
+```
+
+Edit these assignments to change folders. The launcher ignores inherited
+`ASR_MODEL`/`LLM_MODEL` values and appends these two model-path arguments last, so
+even a legacy `--asr-model`/`--llm-model` option cannot select another folder.
+It logs both configured paths; Python logs the resolved paths, stage and PID.
+Changing the repo in `scripts/download_models.py` changes which weights are
+downloaded, not the inference path. To download ASR without touching the base LLM:
+
+```bash
+python scripts/download_models.py --only asr
+```
+
+Both scripts use `code/models/{asr,llm}` regardless of the caller's working
+directory. If you change the configured folders, stage the matching checkpoints
+there. ASR must be a complete CTranslate2 export; the launcher does not search
+old folders or download a fallback model. The adapter remains an explicit
+`--llm-adapter /path/to/training/adapter` argument; keep the correct base LLM.
+
+Dataset, output and device settings still accept environment variables or CLI:
 
 ```bash
 DATA_ROOT=/mnt/datasets/LifeMate SPLIT=public_test \
-ASR_MODEL=/mnt/weights/whisper-medium LLM_MODEL=/mnt/weights/qwen3-4b \
 OUTPUT=/mnt/results/submission.jsonl bash run_server.sh
 ```
 
-All paths can also be supplied via CLI as shown below.
+For per-command model-path selection, invoke `python main.py` directly as shown
+below. The CLI, Docker and notebook keep their own explicit local model paths;
+this launcher policy does not change fine-tuning or adapter files.
 
 ### Dataset root is the parent of split folders
 
