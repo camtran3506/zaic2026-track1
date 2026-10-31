@@ -10,7 +10,6 @@ from typing import Any
 
 from .catalog import allowed_tools, prompt_catalog
 from .text import history_turn_text, normalize_transcript
-from .guard import CallGuard, GuardError, validated_arguments
 
 SYSTEM_PROMPT = """Bạn là AI Agent LifeMate. Chỉ xuất ĐÚNG MỘT JSON object, KHÔNG markdown hoặc diễn giải.
 Bạn có transcript yêu cầu nói tiếng Việt, context, history, các tool được cài và kết quả các calls trước.
