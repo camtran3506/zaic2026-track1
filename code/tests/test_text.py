@@ -1,11 +1,9 @@
 """Numeric-preserving transcript normalization across the pipeline."""
 import json
-from types import SimpleNamespace
 
 import pytest
 
 from lifemate.agent import AgentConfig, LifeMateAgent, _train_transcript, history_text
-from lifemate.models import LocalASR
 from lifemate.sft import prepare_train_transcript, replay_sample
 from lifemate.text import TEXT_NORMALIZATION_VERSION, normalize_transcript
 from lifemate.transcripts import cache_paths, dataset_identity, load_transcripts, prepare_transcripts
@@ -42,22 +40,6 @@ def test_llm_normalization_preserves_numeric_structure_without_guessing(raw, exp
     assert normalize_transcript(expected) == expected
 
 
-def test_local_asr_normalizes_joined_segments_before_caching(tmp_path, monkeypatch):
-    import faster_whisper
-    calls = []
-    class Whisper:
-        def __init__(self, *args, **kwargs): pass
-        def transcribe(self, path, **kwargs):
-            calls.append(path)
-            return iter([SimpleNamespace(text=' BẬT đèn, '),
-                         SimpleNamespace(text=' lúc 08:30!\n')]), None
-    monkeypatch.setattr(faster_whisper, 'WhisperModel', Whisper)
-    audio = tmp_path / 'speech.wav'
-    audio.write_bytes(b'fixture; decoding stubbed')
-    asr = LocalASR(tmp_path, device='cpu')
-    assert asr.transcribe(audio) == 'bật đèn lúc 08:30'
-    assert asr.transcribe(audio) == 'bật đèn lúc 08:30'
-    assert len(calls) == 1
 
 
 @pytest.mark.parametrize('audio_text', [

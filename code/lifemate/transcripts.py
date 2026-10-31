@@ -68,18 +68,19 @@ def dataset_identity(items, split_dir, split, use_train_transcript=False):
             "sha256": hashlib.sha256(serialized.encode("utf-8")).hexdigest()}
 
 
-def asr_identity(model_path, compute_type, beam_size, seed):
-    model_path = Path(model_path).resolve()
-    if not model_path.is_dir():
-        raise FileNotFoundError(model_path)
-    # Detect normal local model replacement without hashing multi-GB weights every run.
+def asr_identity(model_path, precision, num_threads):
+    from .asr import ASR_BACKEND, ASR_REPO_ID, asr_files
+    if num_threads < 1:
+        raise ValueError("ASR num_threads must be positive")
+    model_path = Path(model_path).expanduser().resolve()
+    files = asr_files(model_path, precision)
     stamps = [[str(p.relative_to(model_path)), p.stat().st_size, p.stat().st_mtime_ns]
-              for p in sorted(model_path.rglob("*")) if p.is_file() and ".cache" not in p.relative_to(model_path).parts]
+              for p in files.values()]
     return {"model_path": str(model_path), "file_stamps": stamps,
-            "compute_type": compute_type, "beam_size": beam_size, "seed": seed,
-            "language": "vi", "temperature": 0,
-            "faster_whisper_version": version("faster-whisper"),
-            "ctranslate2_version": version("ctranslate2"), "av_version": version("av")}
+            "repo_id": ASR_REPO_ID, "backend": ASR_BACKEND, "device": "cpu",
+            "precision": precision, "num_threads": num_threads,
+            "sample_rate": 16000, "feature_dim": 80, "decoding_method": "greedy_search",
+            "sherpa_onnx_version": version("sherpa-onnx"), "soundfile_version": version("soundfile")}
 
 
 def validate_rows(rows, identity, complete=True):

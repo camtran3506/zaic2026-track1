@@ -140,6 +140,8 @@ class LocalLLM:
 ''')
     model = tmp_path / 'asr-model'
     model.mkdir()
+    for name in ('encoder.int8.onnx', 'decoder.int8.onnx', 'joiner.int8.onnx', 'tokens.txt'):
+        (model / name).write_bytes(b'fixture checkpoint')
     events = tmp_path / 'events.jsonl'
     output = tmp_path / 'submission.jsonl'
     cache = tmp_path / 'transcripts.jsonl'
@@ -189,6 +191,22 @@ def test_repo_cli_defaults_to_single_gpu_and_unlimited_time(monkeypatch):
     assert args.llm_device_map == 'single'
     assert args.sample_seconds == float('inf')
     assert args.stage == 'full'
+
+
+def test_llm_stage_rejects_whisper_cache_before_loading_llm(dataset, tmp_path, monkeypatch):
+    import main
+    split, items = dataset
+    cache = tmp_path / 'legacy.jsonl'
+    identity = dataset_identity(items, split, 'public_test')
+    prepare_transcripts(items, split, cache, identity, {'backend': 'faster-whisper'}, ASR)
+    def must_not_load(*args):
+        raise AssertionError('The LLM must not load when ASR provenance is wrong')
+    monkeypatch.setattr(main, 'run_llm_stage', must_not_load)
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '')
+    monkeypatch.setattr(sys, 'argv', ['main.py', '--stage', 'llm', '--data-root', str(split),
+        '--transcript-cache', str(cache), '--llm-model', str(tmp_path / 'llm')])
+    with pytest.raises(ValueError, match='Transcript ASR source is not GIPformer'):
+        main.main()
 
 
 def test_balanced_llm_routes_input_without_moving_entire_model(tmp_path, monkeypatch):

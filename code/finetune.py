@@ -18,8 +18,9 @@ def main():
     p.add_argument("--revision", default="main", help="HF commit or revision; resolved SHA is logged")
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--asr-model", type=Path, help="Optional fallback for train audio/history without text")
-    p.add_argument("--asr-device", choices=["cuda", "cpu"], default="cuda")
-    p.add_argument("--asr-compute-type", default="float16")
+    p.add_argument("--asr-device", choices=["cpu"], default="cpu")
+    p.add_argument("--asr-precision", choices=["int8", "fp32"], default="int8")
+    p.add_argument("--asr-threads", type=int, default=4)
     p.add_argument("--validation-fraction", type=float, default=0.1)
     p.add_argument("--max-tool-details", type=int, default=35)
     p.add_argument("--missing-tool-policy", choices=["error", "skip"], default="error")
@@ -60,7 +61,7 @@ def main():
                "--max-tool-details", args.max_tool_details, "--missing-tool-policy", args.missing_tool_policy]
     if args.asr_model:
         prepare.extend(["--asr-model", args.asr_model, "--device", args.asr_device,
-                        "--asr-compute-type", args.asr_compute_type])
+                        "--asr-precision", args.asr_precision, "--asr-threads", str(args.asr_threads)])
     run("prepare_sft.py", prepare)
     run("train_lora.py", [*training_options, "--base-model", base, "--sft-dir", args.output_dir / "sft",
                           "--output-dir", args.output_dir / "training", "--seed", args.seed])

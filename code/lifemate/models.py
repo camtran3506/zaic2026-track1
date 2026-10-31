@@ -1,42 +1,11 @@
 """Two completely local, deterministic model wrappers."""
 from __future__ import annotations
 
-from collections import OrderedDict
 import logging
 from pathlib import Path
 
 from .context import DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_NEW_TOKENS, validate_inference_budget
-from .text import normalize_transcript
-
-
-class LocalASR:
-    def __init__(self, model_path: Path, device: str = "cuda", compute_type: str = "float16", beam_size: int = 1):
-        from faster_whisper import WhisperModel
-        if not model_path.is_dir():
-            raise FileNotFoundError(f"ASR model directory not found: {model_path}")
-        self.model = WhisperModel(
-            str(model_path), device=device, compute_type=compute_type,
-            local_files_only=True, cpu_threads=4,
-        )
-        self.beam_size = beam_size
-        self.cache: OrderedDict[str, str] = OrderedDict()
-
-    def transcribe(self, path: Path) -> str:
-        key = str(path.resolve())
-        if key in self.cache:
-            self.cache.move_to_end(key)
-            return self.cache[key]
-        if not path.is_file():
-            raise FileNotFoundError(f"Audio file not found: {path}")
-        segments, _ = self.model.transcribe(
-            str(path), language="vi", task="transcribe", beam_size=self.beam_size,
-            temperature=0, condition_on_previous_text=False, vad_filter=False,
-        )
-        result = normalize_transcript(" ".join(seg.text for seg in segments))
-        self.cache[key] = result
-        if len(self.cache) > 512:
-            self.cache.popitem(last=False)
-        return result
+from .asr import LocalASR
 
 
 class LocalLLM:

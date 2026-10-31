@@ -39,7 +39,7 @@ def parse_args() -> argparse.Namespace:
                    help="full runs ASR then LLM in separate processes; llm only reads a complete transcript cache")
     p.add_argument("--transcript-cache", type=Path, help="JSONL of all current/history transcripts, plus manifest")
     p.add_argument("--refresh-transcripts", action="store_true", help="Replace completed ASR cache; resume matching partial work")
-    p.add_argument("--asr-model", type=Path, help="Local CTranslate2 Whisper directory; not required for --stage llm")
+    p.add_argument("--asr-model", type=Path, help="Local GIPformer ONNX directory; not required for --stage llm")
     p.add_argument("--llm-model", type=Path, help="Local HF Transformers LLM directory; not required for --stage asr")
     p.add_argument("--llm-device-map", choices=["single", "balanced"], default="single")
     p.add_argument("--llm-max-memory-gib", type=float, default=6,
@@ -48,9 +48,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output", type=Path, default=Path("result/submission.jsonl"))
     p.add_argument("--log-path", type=Path, default=None, help="Optional diagnostic JSONL, never submitted")
     p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
-    p.add_argument("--asr-compute-type", default="float16", choices=["float16", "int8_float16", "int8", "float32"])
+    p.add_argument("--asr-precision", default="int8", choices=["int8", "fp32"])
+    p.add_argument("--asr-threads", type=int, default=4, help="GIPformer CPU threads; independent of LLM device")
     p.add_argument("--llm-dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"])
-    p.add_argument("--asr-beam", type=int, default=1)
     p.add_argument("--max-input-tokens", type=int, default=DEFAULT_MAX_INPUT_TOKENS)
     p.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     p.add_argument("--max-calls", type=int, default=8)
@@ -125,14 +125,9 @@ def run_child_stage(args, stage):
 def run_asr_stage(args, items, split_dir, identity):
     from lifemate.transcripts import asr_identity, prepare_transcripts
     from lifemate.models import LocalASR
-    settings = asr_identity(args.asr_model, args.asr_compute_type, args.asr_beam, args.seed)
-    settings["device"] = args.device
+    settings = asr_identity(args.asr_model, args.asr_precision, args.asr_threads)
     def factory():
-        seed_everything(args.seed)
-        import ctranslate2
-        ctranslate2.set_random_seed(args.seed)
-        return LocalASR(args.asr_model, device=args.device,
-                        compute_type=args.asr_compute_type, beam_size=args.asr_beam)
+        return LocalASR(args.asr_model, precision=args.asr_precision, num_threads=args.asr_threads)
     prepare_transcripts(items, split_dir, args.transcript_cache, identity, settings, factory,
                         refresh=args.refresh_transcripts)
 
@@ -144,7 +139,7 @@ def run_llm_stage(args, items, transcript_rows, split_dir, env_root):
     seed_everything(args.seed)
     catalog = load_catalog(split_dir / f"{args.split}_tools_catalog.json")
     from lifemate.models import LocalLLM
-    LOG.info("LLM-only stage: reading complete transcript cache; Whisper is not loaded")
+    LOG.info("LLM-only stage: reading complete transcript cache; GIPformer is not loaded")
     llm = LocalLLM(args.llm_model, device=args.device, dtype=args.llm_dtype,
                    max_input_tokens=args.max_input_tokens, max_new_tokens=args.max_new_tokens,
                    adapter_path=args.llm_adapter, device_map=args.llm_device_map,
@@ -197,6 +192,10 @@ def main() -> None:
     args = parse_args()
     validate_inference_budget(args.max_input_tokens, args.max_new_tokens)
     configure_cuda_device(args)
+    if args.stage == "asr":
+        os.environ["CUDA_VISIBLE_DEVICES"] = ""
+    if args.asr_threads < 1:
+        raise ValueError("--asr-threads must be positive")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.use_train_transcript and args.split != "train":
         raise ValueError("--use-train-transcript is forbidden for test splits")
@@ -221,9 +220,9 @@ def main() -> None:
         raise ValueError("Submission, transcripts and diagnostics need distinct paths")
     if args.stage == "full":
         # Parent never initializes either model or a CUDA context. Process exit frees
-        # all CTranslate2/PyTorch VRAM before LLM initialization, including caches.
+        # all ASR runtime allocations before LLM initialization, including caches.
         run_child_stage(args, "asr")
-        LOG.info("ASR process exited and released its GPU context; starting LLM stage")
+        LOG.info("ASR CPU process exited; starting LLM stage")
         run_child_stage(args, "llm")
         return
     from lifemate.transcripts import dataset_identity, load_transcripts, read_jsonl
@@ -242,6 +241,9 @@ def main() -> None:
         else:
             # Validate completeness, IDs, source fingerprint and checksum BEFORE loading LLM.
             rows, manifest = load_transcripts(args.transcript_cache, identity)
+            from lifemate.asr import ASR_BACKEND, ASR_REPO_ID
+            if manifest["asr"].get("backend") != ASR_BACKEND or manifest["asr"].get("repo_id") != ASR_REPO_ID:
+                raise ValueError("Transcript ASR source is not GIPformer 1.5; rerun ASR with --refresh-transcripts")
             LOG.info("Transcript provenance: %s", json.dumps(manifest["asr"], ensure_ascii=False))
             run_llm_stage(args, items, rows, split_dir, env_root)
     finally:

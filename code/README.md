@@ -12,16 +12,16 @@ before launching the LLM subprocess. The notebook runs these two stages in separ
 cells/subprocesses. Per-sample time is unlimited by default (`--sample-seconds inf`);
 `max_calls`, `max_invalid`, schema-inspection and token/context limits still apply.
 
-Defaults: `Qwen/Qwen3-4B-Instruct-2507` (~4.0B, Apache-2.0) and `Systran/faster-whisper-medium` (~769M, MIT). Total model parameters ~4.77B; LLM <5B. Training and inference share a 16,384-token context limit. Inference defaults to 16,000 prompt tokens + up to 384 generated tokens per decision. Check all model/dependency licenses and freeze revisions before submission. Neither model is fetched at runtime.
+Defaults: `Qwen/Qwen3-4B-Instruct-2507` (~4.0B, Apache-2.0) and `g-group-ai-lab/gipformer1.5-68M-rnnt` (~68M). Total model parameters ~4.07B; LLM <5B. Training and inference share a 16,384-token context limit. Inference defaults to 16,000 prompt tokens + up to 384 generated tokens per decision. Check all model/dependency licenses and freeze revisions before submission. Neither model is fetched at runtime.
 
 ## 1. Install dependencies on the server
 
 `requirements.txt` is the shared dependency list for inference and fine-tuning.
 It includes Unsloth/PEFT and pins Transformers 4.57.3 for the Unsloth stack;
-PyAV 16.1.0 preserves the audio decoding API used by faster-whisper.
-Install a compatible PyTorch/CUDA stack first; Unsloth training requires a supported GPU.
+GIPformer uses `sherpa-onnx` (ONNX Runtime CPU) and `soundfile` for audio decoding.
+Install a compatible PyTorch/CUDA stack for the LLM first; Unsloth training requires a supported GPU. ASR itself runs on CPU and does not import PyTorch.
 
-Tested only with Python syntax/unit tests; use Linux + CUDA 12.x + GPU for actual inference. The GPU container image supplies PyTorch. For local runs, install a CUDA-enabled PyTorch compatible with your GPU first.
+The ASR runtime is CPU-only; use Linux + CUDA 12.x + GPU for the standard LLM workflow. The GPU container image supplies PyTorch. For local runs, install a CUDA-enabled PyTorch compatible with your GPU first.
 
 ```bash
 cd code
@@ -48,13 +48,45 @@ code/
 ├── lifemate/
 ├── scripts/
 ├── models/
-│   ├── asr/  # Whisper converted to CTranslate2 (model.bin etc.)
+│   ├── asr/  # GIPformer encoder/decoder/joiner.int8.onnx + tokens.txt
 │   └── llm/  # Qwen Transformers weights and tokenizer
 ├── Dockerfile
 └── requirements.txt
 ```
 
 For final scoring, keep **both** model folders inside the Docker image. The download script is NOT invoked during inference.
+
+GIPformer uses the local ONNX transducer artifacts from
+[g-group-ai-lab/gipformer1.5-68M-rnnt](https://huggingface.co/g-group-ai-lab/gipformer1.5-68M-rnnt):
+`encoder.int8.onnx`, `decoder.int8.onnx`, `joiner.int8.onnx`, `tokens.txt` by default.
+Use `python scripts/download_models.py --only asr --asr-precision fp32` to stage
+`encoder.onnx`, `decoder.onnx`, `joiner.onnx`, then pass `--asr-precision fp32`
+to inference/preparation (or download `--asr-precision both` to stage both).
+No Whisper/CTranslate2 conversion is used. Missing files for the requested
+precision are errors; the code never silently selects another precision/model.
+
+The CPU recognizer uses `OfflineRecognizer.from_transducer`, 16 kHz features,
+80 feature dimensions and greedy decoding. SoundFile decodes PCM to float32,
+channels are averaged to mono, and `accept_waveform` receives the original
+sample rate so sherpa-onnx resamples internally if needed. Empty, nonfinite and
+out-of-range audio is rejected. The resulting text uses the shared transcript
+normalizer before caching. `--asr-threads 4` controls CPU concurrency independently
+of `--device` / CUDA GPU selection for the LLM.
+
+Example ASR-only run (no LLM weights or Torch/CUDA needed for this stage):
+
+```bash
+python main.py --stage asr --data-root /path/to/data --split train \
+    --asr-model ./models/asr --asr-precision int8 --asr-threads 4 \
+    --transcript-cache /path/to/new/train.transcripts.jsonl
+```
+
+`--asr-compute-type` and `--asr-beam` from the Whisper backend are removed.
+Rebuild old Whisper/PhoWhisper caches with `--refresh-transcripts` in ASR/full
+mode or choose a new cache path. LLM-only mode checks the ASR source before
+loading the LLM; it does not require the ASR weight directory to remain present.
+The Dockerfile checks the default int8 artifacts; include that set when building.
+
 
 ## 3. Customize paths and run public_test
 
@@ -78,7 +110,7 @@ python scripts/download_models.py --only asr
 
 Both scripts use `code/models/{asr,llm}` regardless of the caller's working
 directory. If you change the configured folders, stage the matching checkpoints
-there. ASR must be a complete CTranslate2 export; the launcher does not search
+there. ASR must contain a complete GIPformer ONNX transducer export; the launcher does not search
 old folders or download a fallback model. The adapter remains an explicit
 `--llm-adapter /path/to/training/adapter` argument; keep the correct base LLM.
 
@@ -100,7 +132,7 @@ mkdir -p result
 python main.py \
     --data-root /your/storage/lifemate_data \
     --split public_test \
-    --asr-model /your/weights/faster-whisper-medium \
+    --asr-model /your/weights/gipformer1.5-68M-rnnt \
     --llm-model /your/weights/Qwen3-4B-Instruct-2507 \
     --output /your/outputs/submission.jsonl \
     --log-path /your/outputs/diagnostics.jsonl \
@@ -138,10 +170,10 @@ Remove `--limit` for official submission, which requires exactly one JSONL line 
 ```bash
 # Stage 1: no LLM checkpoint is required or loaded.
 python main.py --stage asr --data-root /path/to/data --split public_test \
-    --asr-model /path/to/whisper-medium-ct2 --device cuda \
+    --asr-model /path/to/gipformer-onnx --device cuda \
     --transcript-cache result/medium_transcripts.jsonl
 
-# Stage 2: no Whisper checkpoint is required or loaded.
+# Stage 2: no GIPformer checkpoint is required or loaded.
 python main.py --stage llm --data-root /path/to/data --split public_test \
     --transcript-cache result/medium_transcripts.jsonl \
     --llm-model /path/to/qwen --output result/submission.jsonl \
@@ -155,7 +187,7 @@ the agent retains the existing last-12-turn/1700-character prompt history limits
 transcribed rather than read from a possible `audio_text` field.
 
 The adjacent `.manifest.json` stores dataset/audio file stamps, IDs/order, ASR
-model file stamps and absolute path, precision, beam, library versions and seed.
+model file stamps and absolute path, ONNX precision, CPU threads, sample rate, decoder and runtime library versions.
 A checksum detects edited transcript files. Partial results stay in
 `.partial.jsonl`; failures are reported in `.errors.jsonl`. The LLM refuses an
 incomplete/mismatched cache. Matching partial ASR work resumes on retry. A completed
@@ -202,14 +234,14 @@ with empty predictions. LLM sample errors remain recorded in diagnostics.
 
 All CUDA entrypoints (`main.py`, `finetune.py`, `train_lora.py`, `prepare_sft.py`)
 accept `--cuda-visible-devices` with **one** GPU index or GPU/MIG UUID. The mask is
-set before importing Unsloth, PyTorch, or CTranslate2 and inherited by child
+set before importing Unsloth or PyTorch and inherited by child
 processes. Multiple GPU IDs such as `0,1` are rejected. Without an explicit flag,
 the first entry in the inherited `CUDA_VISIBLE_DEVICES` is used, otherwise GPU 0.
 An empty inherited mask or `--cuda-visible-devices -1` disables CUDA for CPU runs;
 select the CPU device/backend separately as appropriate.
 
 ```bash
-# From code/, select GPU 2 for both ASR and LLM.
+# From code/, select GPU 2 for both the LLM; GIPformer ASR remains on CPU.
 bash run_server.sh --cuda-visible-devices 2
 
 # Select GPU 2 for preparation and Unsloth training.
@@ -307,10 +339,10 @@ By default `docker run ... lifemate:baseline` targets **private_test** at `/data
 | `--stage` | full (separate subprocesses) / asr / llm | full |
 | `--transcript-cache` | transcript JSONL + adjacent manifest | output stem + .transcripts.jsonl |
 | `--output` | submission JSONL output | result/submission.jsonl |
-| `--device` | cuda / cpu | cuda |
-| `--asr-compute-type` | faster-whisper precision | float16 |
+| `--device` | LLM cuda / cpu; ASR always uses CPU | cuda |
+| `--asr-precision` | GIPformer ONNX int8 / fp32 | int8 |
 | `--llm-dtype` | LLM weight dtype | bfloat16 |
-| `--asr-beam` | deterministic beam width | 1 |
+| `--asr-threads` | GIPformer CPU threads; greedy decoding | 4 |
 | `--max-input-tokens` | maximum prompt tokens | 16000 |
 | `--max-new-tokens` | per-agent-step generated tokens | 384 |
 | `--max-calls` | maximum executed tools/sample | 8 |

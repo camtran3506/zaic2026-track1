@@ -83,13 +83,16 @@ def test_download_default_matches_launcher_and_only_asr_preserves_llm(server, mo
 
     def snapshot(**kwargs):
         calls.append(kwargs)
-        (Path(kwargs["local_dir"]) / "model.bin").write_bytes(b"downloaded ASR")
+        for name in ("encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt"):
+            (Path(kwargs["local_dir"]) / name).write_bytes(b"downloaded ASR")
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot)
     monkeypatch.chdir(app.parent)  # Download location is independent of CWD.
     monkeypatch.setattr(sys, "argv", [str(script), "--only", "asr"])
     runpy.run_path(str(script), run_name="__main__")
     assert len(calls) == 1
+    assert calls[0]["repo_id"] == "g-group-ai-lab/gipformer1.5-68M-rnnt"
+    assert "encoder.int8.onnx" in calls[0]["allow_patterns"]
     assert calls[0]["local_dir"] == str(app / "models/asr")
     assert weights.read_bytes() == b"existing base used to train adapter"
 
@@ -117,7 +120,8 @@ class LocalLLM:
 ''')
     asr = app / "models/asr"
     asr.mkdir(parents=True)
-    (asr / "model.bin").write_bytes(b"fixture checkpoint")
+    for name in ("encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt"):
+        (asr / name).write_bytes(b"fixture checkpoint")
     split = tmp_path / "dataset/public_test"
     split.mkdir(parents=True)
     (split / "audio.wav").write_bytes(b"fixture audio")
@@ -154,7 +158,7 @@ class LocalLLM:
     assert "Starting stage=asr" in result.stdout
     assert "Starting stage=llm" in result.stdout
     # Replacing a checkpoint in the same configured folder must not reuse old text.
-    (asr / "model.bin").write_bytes(b"a different ASR checkpoint")
+    (asr / "encoder.int8.onnx").write_bytes(b"a different ASR checkpoint")
     result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=120, cwd=tmp_path)
     assert result.returncode != 0
     assert "ASR model/settings changed" in result.stdout + result.stderr

@@ -23,8 +23,9 @@ def main():
     p.add_argument("--missing-tool-policy", choices=["error", "skip"], default="error",
                    help="Skip/report whole samples whose gold tools are absent from prompts, or stop")
     p.add_argument("--asr-model", type=Path)
-    p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
-    p.add_argument("--asr-compute-type", default="float16")
+    p.add_argument("--device", choices=["cpu"], default="cpu", help="ASR is CPU-only")
+    p.add_argument("--asr-precision", choices=["int8", "fp32"], default="int8")
+    p.add_argument("--asr-threads", type=int, default=4)
     args = p.parse_args()
     configure_cuda_device(args)
     split_dir, env_root, holder = resolve_data_layout(args.data_root, "train")
@@ -41,7 +42,7 @@ def main():
     asr = None
     if args.asr_model:
         from lifemate.models import LocalASR
-        asr = LocalASR(args.asr_model, device=args.device, compute_type=args.asr_compute_type)
+        asr = LocalASR(args.asr_model, precision=args.asr_precision, num_threads=args.asr_threads)
     metadata = dict(source=str(source), source_sha256=file_sha256(source),
                     text_normalization=TEXT_NORMALIZATION_VERSION,
                     catalog_sha256=file_sha256(catalog_path), seed=args.seed,

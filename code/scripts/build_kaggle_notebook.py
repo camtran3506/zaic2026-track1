@@ -11,13 +11,13 @@ def code(s):
 md('''# LifeMate — một notebook chạy trọn pipeline trên Kaggle
 
 **Cách chạy:** Add Input bộ dữ liệu đã giải nén, bật **Internet**, chọn một GPU rồi Run All. Nếu chọn T4 x2, notebook vẫn chỉ dùng GPU được chỉ định ở `GPU_INDEX`.
-Không cần clone GitHub. Mặc định notebook fine-tune LLM trước trên TRAIN rồi dùng adapter vừa train. Notebook chứa toàn bộ mã nguồn: audio tiếng Việt → faster-whisper → Qwen → validate/call trên `ToolEnv` thật → submission + logs.
+Không cần clone GitHub. Mặc định notebook fine-tune LLM trước trên TRAIN rồi dùng adapter vừa train. Notebook chứa toàn bộ mã nguồn: audio tiếng Việt → GIPformer ONNX → Qwen → validate/call trên `ToolEnv` thật → submission + logs.
 
 Bộ dữ liệu cần có `<split>.jsonl`, `<split>_tools_catalog.json`, audio và **zaic_tools đúng phiên bản của split**. Notebook chỉ đọc manifest/catalog/audio; trạng thái ứng dụng do `ToolEnv` quản lý.
 
-Chỉnh cấu hình bên dưới. `LIMIT=0` chạy **toàn bộ split**. Model tải từ Hugging Face trước khi suy luận; có thể dùng model gắn sẵn ở `/kaggle/input`. Model ASR mặc định là `Systran/faster-whisper-medium`, dùng trực tiếp định dạng CTranslate2.
+Chỉnh cấu hình bên dưới. `LIMIT=0` chạy **toàn bộ split**. Model tải từ Hugging Face trước khi suy luận; có thể dùng model gắn sẵn ở `/kaggle/input`. Model ASR mặc định là `g-group-ai-lab/gipformer1.5-68M-rnnt`, dùng trực tiếp định dạng ONNX.
 
-ASR chạy toàn bộ split (bao gồm audio lịch sử), lưu transcript rồi thoát tiến trình và giải phóng GPU. LLM sau đó đọc cache; không nạp Whisper cùng lúc. Mặc định không giới hạn thời gian mỗi mẫu (`float("inf")`); vẫn giữ giới hạn tool calls và token/context ≤16.384.
+ASR chạy toàn bộ split (bao gồm audio lịch sử), lưu transcript rồi thoát tiến trình và giải phóng runtime CPU. LLM sau đó đọc cache; không nạp GIPformer cùng lúc. Mặc định không giới hạn thời gian mỗi mẫu (`float("inf")`); vẫn giữ giới hạn tool calls và token/context ≤16.384.
 
 Kết quả lưu trong `/kaggle/working/lifemate_runs/<RUN_NAME>/`: `transcripts.jsonl`, `transcripts.manifest.json`, `asr.log`, `submission.jsonl`, `diagnostics.jsonl`, `inference.log`, `setup.log`, `models.log`, `validation.json`, `run_config.json`, `environment.txt`, và `lifemate_artifacts.zip`. Transcript/logs có nội dung người dùng; kiểm tra trước khi chia sẻ. Đây không phải chế độ bảo đảm giới hạn 30 giây/mẫu của cuộc thi.''')
 
@@ -48,12 +48,12 @@ TRAIN_QUANTIZATION = "none"
 TRAIN_GRAD_ACCUMULATION = 8
 TRAIN_VALIDATION_FRACTION = 0.1
 
-ASR_REPO = "Systran/faster-whisper-medium"
-ASR_FORMAT = "ctranslate2"  # Systran/faster-whisper-medium đã ở định dạng CTranslate2
+ASR_REPO = "g-group-ai-lab/gipformer1.5-68M-rnnt"
+ASR_FORMAT = "onnx"
 LLM_REPO = "Qwen/Qwen3-4B-Instruct-2507"
 ASR_REVISION = None  # None: resolve main thành SHA và ghi lại trong model_manifest.json
 LLM_REVISION = None
-LOCAL_ASR = None     # thư mục CTranslate2 có model.bin; bỏ qua tải/chuyển ASR khi đã có
+LOCAL_ASR = None     # encoder/decoder/joiner ONNX + tokens.txt
 LOCAL_LLM = None     # thư mục Transformers có config.json + tokenizer + trọng số
 HF_SECRET_NAME = None  # tùy chọn: tên Kaggle Secret chứa HF token (public models không cần)
 
@@ -63,7 +63,8 @@ MAX_NEW_TOKENS = DEFAULT_MAX_NEW_TOKENS
 MAX_CALLS = 8
 MAX_INVALID = 3
 MAX_TOOL_DETAILS = 35
-ASR_BEAM = 1
+ASR_PRECISION = "int8"
+ASR_THREADS = 4
 SEED = 42
 FAIL_FAST = False      # False: lưu lỗi từng mẫu và tiếp tục, báo lỗi ở bước kiểm chứng
 USE_TRAIN_TRANSCRIPT = False  # chỉ được bật cho split train
@@ -92,7 +93,9 @@ def run_logged(command, log_path, *, env=None, cwd=None):
 assert SPLIT in {"train", "public_test", "private_test"}
 assert isinstance(LIMIT, int) and LIMIT >= 0
 assert not USE_TRAIN_TRANSCRIPT or SPLIT == "train"
-assert ASR_FORMAT in {"ctranslate2", "transformers"}
+assert ASR_FORMAT == "onnx"
+assert ASR_PRECISION in {"int8", "fp32"}
+assert ASR_THREADS > 0
 assert isinstance(GPU_INDEX, int) and GPU_INDEX >= 0
 validate_inference_budget(MAX_INPUT_TOKENS, MAX_NEW_TOKENS)
 validate_training_length(TRAIN_MAX_LENGTH)
@@ -101,7 +104,7 @@ print("Artifacts:", OUT)
 
 md('''## 1. Dependency và runtime
 
-Giữ nguyên PyTorch/CUDA do Kaggle cung cấp, không cài đè torch. Các thư viện ASR/LLM được cài trong tiến trình riêng trước khi dùng. CTranslate2 cần CUDA 12 + cuDNN 9 khi chạy GPU; bước suy luận thực tế sẽ kiểm tra việc nạp model. Nếu GPU memory không đủ, giảm `MAX_INPUT_TOKENS`, chọn model nhỏ hơn hoặc đổi GPU.''')
+Giữ nguyên PyTorch/CUDA do Kaggle cung cấp, không cài đè torch. Các thư viện ASR/LLM được cài trong tiến trình riêng trước khi dùng. GIPformer chạy CPU bằng sherpa-onnx, không dùng CUDA; bước suy luận thực tế sẽ kiểm tra việc nạp model. Nếu GPU memory không đủ, giảm `MAX_INPUT_TOKENS`, chọn model nhỏ hơn hoặc đổi GPU.''')
 # Embed the shared manifest so the standalone notebook uses the same constraints.
 packages = [
     line.strip() for line in (ROOT / "code" / "requirements.txt").read_text().splitlines()
@@ -133,14 +136,14 @@ for site_dir in site.getsitepackages():
     lib_dirs.extend(str(p) for p in Path(site_dir).glob("nvidia/*/lib") if p.is_dir())
 BASE_ENV["LD_LIBRARY_PATH"] = os.pathsep.join(lib_dirs + [BASE_ENV.get("LD_LIBRARY_PATH", "")])
 hardware_script = """
-import json, torch, ctranslate2
+import json, torch, sherpa_onnx, soundfile
 from transformers.models.qwen3.modeling_qwen3 import Qwen3ForCausalLM
-from faster_whisper import WhisperModel
+
 gpu = torch.cuda.is_available()
 print(json.dumps(dict(torch=torch.__version__, cuda=torch.version.cuda, gpu=gpu,
     gpu_name=torch.cuda.get_device_name(0) if gpu else None,
     bf16=torch.cuda.is_bf16_supported() if gpu else False,
-    ct2=ctranslate2.__version__)))
+    sherpa_onnx=sherpa_onnx.__version__)))
 """
 hardware = subprocess.run([sys.executable, "-c", hardware_script], env=BASE_ENV,
                           capture_output=True, text=True)
@@ -153,7 +156,6 @@ if REQUIRE_GPU and not HW["gpu"]:
     raise RuntimeError("Bật GPU trong Kaggle Settings rồi Run All, hoặc đặt REQUIRE_GPU=False.")
 DEVICE = "cuda" if HW["gpu"] else "cpu"
 LLM_DTYPE = ("bfloat16" if HW["bf16"] else "float16") if HW["gpu"] else "float32"
-ASR_COMPUTE = "float16" if HW["gpu"] else "int8"
 run_logged([sys.executable, "-m", "pip", "freeze"], OUT / "environment.txt")
 ''')
 
@@ -210,7 +212,7 @@ md('''## 3. Toàn bộ mã pipeline nhúng trong notebook
 
 Các cell dưới ghi mã vào `/kaggle/working/lifemate_app` để chạy trong subprocess, tách runtime tải model (online) khỏi suy luận (local-only). Logic baseline được giữ nguyên; không cần repository bên ngoài. Có cả mã fine-tune, bộ unit test và scorer train.''')
 for rel in ['lifemate/__init__.py', 'lifemate/catalog.py', 'lifemate/models.py', 'lifemate/agent.py', 'lifemate/transcripts.py', 'lifemate/decoding.py',
-            'lifemate/gpu.py', 'lifemate/context.py', 'lifemate/text.py', 'lifemate/guard.py', 'lifemate/scoring.py', 'lifemate/evaluation.py',
+            'lifemate/gpu.py', 'lifemate/context.py', 'lifemate/asr.py', 'lifemate/text.py', 'lifemate/guard.py', 'lifemate/scoring.py', 'lifemate/evaluation.py',
             'main.py', 'score_train.py', 'lifemate/sft.py', 'prepare_sft.py', 'train_lora.py',
             'merge_lora.py', 'finetune.py', 'tests/test_baseline.py', 'tests/test_sft.py',
             'tests/test_finetune_integration.py', 'tests/test_audio.py', 'tests/test_catalog_inspection.py',
@@ -244,8 +246,8 @@ run_logged([sys.executable, "-c", toolenv_check_script, SPLIT_DIR, SPLIT, EXPECT
 
 md('''## 4. Tải Hugging Face model và chuyển ASR nếu cần
 
-Hai model mặc định là public, không yêu cầu token. Với model cần xác thực, thêm Kaggle Secret rồi đặt `HF_SECRET_NAME`; token chỉ truyền qua environment, không ghi vào cấu hình/logs. SHA thực tế được lưu để tái lập lần chạy. `LOCAL_ASR` luôn phải trỏ tới model CTranslate2 đã chuyển đổi. Không tải model trong bước inference.''')
-code('''download_settings = dict(asr_repo=ASR_REPO, llm_repo=LLM_REPO, asr_format=ASR_FORMAT,
+Hai model mặc định là public, không yêu cầu token. Với model cần xác thực, thêm Kaggle Secret rồi đặt `HF_SECRET_NAME`; token chỉ truyền qua environment, không ghi vào cấu hình/logs. SHA thực tế được lưu để tái lập lần chạy. `LOCAL_ASR` luôn phải trỏ tới model ONNX transducer. Không tải model trong bước inference.''')
+code('''download_settings = dict(asr_repo=ASR_REPO, llm_repo=LLM_REPO, asr_format=ASR_FORMAT, asr_precision=ASR_PRECISION,
     asr_revision=ASR_REVISION, llm_revision=LLM_REVISION,
     local_asr=LOCAL_ASR, local_llm=LOCAL_LLM, model_root=str(MODEL_ROOT), out=str(OUT))
 (OUT / "download_settings.json").write_text(json.dumps(download_settings, indent=2), encoding="utf-8")
@@ -277,30 +279,16 @@ for part in ("asr", "llm"):
     sha = api.model_info(repo, revision=requested).sha
     target = root / part / sha
     print(f"Downloading {part}: {repo}@{sha}", flush=True)
-    snapshot_download(repo_id=repo, revision=sha, local_dir=str(target), max_workers=4)
-    if part == "asr" and cfg["asr_format"] == "transformers":
-        from ctranslate2.converters import TransformersConverter
-        converted = root / "asr_ct2" / sha
-        if not (converted / ".conversion_complete").is_file():
-            # Rebuild only notebook-generated incomplete conversion, never user LOCAL_ASR.
-            import shutil
-            if converted.exists():
-                shutil.rmtree(converted)
-            converted.parent.mkdir(parents=True, exist_ok=True)
-            converter = TransformersConverter(str(target))
-            converter.convert(str(converted), quantization="float16")
-            from transformers import AutoTokenizer
-            AutoTokenizer.from_pretrained(str(target), use_fast=True, local_files_only=True).save_pretrained(str(converted))
-            if (target / "preprocessor_config.json").is_file():
-                shutil.copy2(target / "preprocessor_config.json", converted / "preprocessor_config.json")
-            if not (converted / "tokenizer.json").is_file():
-                raise FileNotFoundError("ASR conversion needs a local fast tokenizer.json")
-            (converted / ".conversion_complete").touch()
-        target = converted
+    options = {}
+    if part == "asr":
+        suffix = ".int8.onnx" if cfg["asr_precision"] == "int8" else ".onnx"
+        options["allow_patterns"] = ["tokens.txt", "README.md", *[p + suffix for p in ("encoder", "decoder", "joiner")]]
+    snapshot_download(repo_id=repo, revision=sha, local_dir=str(target), max_workers=4, **options)
     manifest[part] = {"path": str(target), "repo": repo, "revision": sha, "source": "huggingface"}
 asr = Path(manifest["asr"]["path"])
 llm = Path(manifest["llm"]["path"])
-for file in (asr / "model.bin", asr / "config.json", llm / "config.json"):
+suffix = ".int8.onnx" if cfg["asr_precision"] == "int8" else ".onnx"
+for file in (asr / "tokens.txt", *[asr / (p + suffix) for p in ("encoder", "decoder", "joiner")], llm / "config.json"):
     if not file.is_file():
         raise FileNotFoundError(f"Missing model file: {file}")
 if not any(llm.glob("*.safetensors")):
@@ -325,21 +313,21 @@ LLM_PATH = Path(MODEL_MANIFEST["llm"]["path"])
 print("ASR:", ASR_PATH, "\\nLLM:", LLM_PATH)
 ''')
 
-md('''## 5. ASR trước — lưu toàn bộ transcript, giải phóng GPU
+md('''## 5. ASR trước — lưu toàn bộ transcript, giải phóng runtime CPU
 
-Tiến trình ASR chỉ nạp Whisper. Kết thúc thành công mới có cache với manifest `complete` để LLM dùng. Cache lưu cả transcript hiện tại và toàn bộ lịch sử có audio/text; agent chỉ lấy phần lịch sử cần thiết vào prompt. Nếu lỗi ASR, cell dừng, giữ `.partial.jsonl` và báo lỗi; chạy lại cùng cấu hình sẽ tiếp tục từ mẫu chưa xong. Không biến lỗi ASR thành dự đoán rỗng.
+Tiến trình ASR chỉ nạp GIPformer. Kết thúc thành công mới có cache với manifest `complete` để LLM dùng. Cache lưu cả transcript hiện tại và toàn bộ lịch sử có audio/text; agent chỉ lấy phần lịch sử cần thiết vào prompt. Nếu lỗi ASR, cell dừng, giữ `.partial.jsonl` và báo lỗi; chạy lại cùng cấu hình sẽ tiếp tục từ mẫu chưa xong. Không biến lỗi ASR thành dự đoán rỗng.
 
 Để chạy LLM lại mà không chạy ASR, giữ đường dẫn `TRANSCRIPT_CACHE` và manifest cạnh nó, đặt `RUN_ASR=False`. Nếu đổi ASR để ablation, dùng cache khác hoặc `REFRESH_TRANSCRIPTS=True`. Mỗi cache ghi model/settings/seed và dấu vết dữ liệu để tránh dùng nhầm transcript.''')
 code('''TRANSCRIPTS = Path(TRANSCRIPT_CACHE) if TRANSCRIPT_CACHE else OUT / "transcripts.jsonl"
 TRANSCRIPT_MANIFEST = TRANSCRIPTS.with_suffix(".manifest.json")
 ASR_ENV = BASE_ENV.copy()
-ASR_ENV["CUDA_VISIBLE_DEVICES"] = str(GPU_INDEX)
+ASR_ENV["CUDA_VISIBLE_DEVICES"] = ""
 ASR_ENV.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_DATASETS_OFFLINE="1")
 if RUN_ASR:
     asr_command = [sys.executable, "-u", APP / "main.py", "--stage", "asr",
         "--data-root", SPLIT_DIR, "--split", SPLIT, "--asr-model", ASR_PATH,
         "--transcript-cache", TRANSCRIPTS, "--device", DEVICE,
-        "--asr-compute-type", ASR_COMPUTE, "--asr-beam", str(ASR_BEAM),
+        "--asr-precision", ASR_PRECISION, "--asr-threads", str(ASR_THREADS),
         "--limit", str(LIMIT), "--seed", str(SEED)]
     if USE_TRAIN_TRANSCRIPT:
         asr_command.append("--use-train-transcript")
@@ -385,8 +373,8 @@ if TRAIN_LLM:
         "--gradient-accumulation", str(TRAIN_GRAD_ACCUMULATION),
         "--quantization", TRAIN_QUANTIZATION]
     if TRAIN_USE_ASR:
-        train_command.extend(["--asr-model", ASR_PATH, "--asr-device", DEVICE,
-                              "--asr-compute-type", ASR_COMPUTE])
+        train_command.extend(["--asr-model", ASR_PATH, "--asr-device", "cpu",
+                              "--asr-precision", ASR_PRECISION, "--asr-threads", str(ASR_THREADS)])
     try:
         run_logged(train_command, OUT / "training_pipeline.log", cwd=APP, env=FT_ENV)
     finally:
@@ -431,11 +419,11 @@ command = [sys.executable, "-u", APP / "main.py",
     "--data-root", SPLIT_DIR, "--split", SPLIT,
     "--asr-model", ASR_PATH, "--llm-model", LLM_PATH,
     "--output", SUBMISSION, "--log-path", DIAGNOSTICS,
-    "--device", DEVICE, "--asr-compute-type", ASR_COMPUTE, "--llm-dtype", LLM_DTYPE,
+    "--device", DEVICE, "--asr-precision", ASR_PRECISION, "--asr-threads", str(ASR_THREADS), "--llm-dtype", LLM_DTYPE,
     "--limit", str(LIMIT), "--sample-seconds", str(SAMPLE_SECONDS),
     "--max-input-tokens", str(MAX_INPUT_TOKENS), "--max-new-tokens", str(MAX_NEW_TOKENS),
     "--max-calls", str(MAX_CALLS), "--max-invalid", str(MAX_INVALID),
-    "--max-tool-details", str(MAX_TOOL_DETAILS), "--asr-beam", str(ASR_BEAM), "--seed", str(SEED)]
+    "--max-tool-details", str(MAX_TOOL_DETAILS), "--seed", str(SEED)]
 if ADAPTER_PATH is not None:
     command.extend(["--llm-adapter", ADAPTER_PATH])
 if FAIL_FAST:

@@ -12,8 +12,8 @@ SPLIT="${SPLIT:-public_test}"
 # Model directories are configured HERE. Inherited ASR_MODEL/LLM_MODEL variables
 # and model-path CLI options must not select another checkpoint for this launcher.
 # scripts/download_models.py stages the selected ASR repo into models/asr.
-# ASR must be a local CTranslate2 Whisper checkpoint (model.bin, config.json, ...).
-ASR_MODEL="${SCRIPT_DIR}/models/phowhisper-large-ct2"
+# ASR must be a local GIPformer ONNX transducer (encoder/decoder/joiner + tokens.txt).
+ASR_MODEL="${SCRIPT_DIR}/models/asr"
 
 # LLM - Qwen3-4B-Instruct-2507
 LLM_MODEL="${SCRIPT_DIR}/models/llm"
