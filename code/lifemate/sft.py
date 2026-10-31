@@ -10,6 +10,7 @@ from .agent import (SYSTEM_PROMPT, _train_transcript, audio_path, build_step_pro
                     history_text, short_json)
 from .catalog import allowed_tools
 from .text import normalize_transcript
+from .guard import CallGuard, GuardError
 
 
 class UnexposedToolError(ValueError):
