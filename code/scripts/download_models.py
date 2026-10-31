@@ -6,7 +6,7 @@ from huggingface_hub import snapshot_download
 
 MODELS = {
     "llm": "Qwen/Qwen3-4B-Instruct-2507",
-    "asr": "Systran/faster-whisper-medium",
+    "asr": "vinai/PhoWhisper-large",
 }
 
 

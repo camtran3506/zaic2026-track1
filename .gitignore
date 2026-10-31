@@ -1,4 +1,5 @@
-train+public_test/
-__MACOSX/
 code/models/*
 !code/models/.gitignore
+code/unsloth_compiled_cache
+code/result/finetune_20261029_212030
+train+public_test/
