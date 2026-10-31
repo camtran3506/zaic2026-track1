@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .catalog import allowed_tools, prompt_catalog
+from .text import normalize_text
 
 SYSTEM_PROMPT = """Bạn là AI Agent LifeMate. Chỉ xuất ĐÚNG MỘT JSON object, KHÔNG markdown hoặc diễn giải.
 Bạn có transcript yêu cầu nói tiếng Việt, context, history, các tool được cài và kết quả các calls trước.
@@ -164,6 +165,7 @@ class AgentConfig:
     # Reserving time is best effort, not a hard CUDA generation timeout.
     reserve_seconds: float = 1.0
     use_train_transcript: bool = False
+    normalize_input: bool = True
 
 
 def build_step_prompt(transcript, context, history, enabled, observations, last_tool, max_tool_details,
@@ -213,6 +215,10 @@ class LifeMateAgent:
             if transcript is None:
                 transcript = self.asr.transcribe(audio_path(split_dir, item["audio"]))
             history = history_text(item.get("history", []), split_dir, self.asr, t0, self.cfg.sample_seconds)
+        if self.cfg.normalize_input:
+            transcript = normalize_text(transcript)
+            history = [{"role": turn["role"], "text": normalize_text(turn["text"])[:1700]}
+                       for turn in history]
         observations: list[dict] = []
         invalid = 0
         executed = 0

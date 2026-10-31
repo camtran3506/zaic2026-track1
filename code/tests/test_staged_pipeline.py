@@ -126,8 +126,8 @@ class LocalLLM:
         event('llm_load')
     def generate(self,system,user):
         payload=json.loads(user)
-        assert payload['request_transcript'].startswith('recognized:')
-        assert payload['conversation_history'][0]['text']=='recognized:history.wav'
+        assert payload['request_transcript'].startswith('recognized')
+        assert 'recognized' in payload['conversation_history'][0]['text']
         return '{"action":"done"}' if payload['previous_actions_and_results'] else '{"action":"call","name":"home.read","arguments":{}}'
 ''')
     (split / 'zaic_tools.py').write_text('''class ToolEnv:

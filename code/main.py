@@ -59,6 +59,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sample-seconds", type=float, default=float("inf"),
                    help="LLM agent time budget, default inf = no per-sample timeout")
     p.add_argument("--use-train-transcript", action="store_true", help="TRAIN ONLY: ablate ASR with train audio_text")
+    p.add_argument("--no-normalize-input", dest="normalize_input", action="store_false", default=True,
+                   help="Disable Unicode NFC/lowercase/punctuation-stripping input normalization for LLM prompts")
     p.add_argument("--limit", type=int, default=0, help="0 means run entire split; debugging only")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--fail-fast", action="store_true")
@@ -101,6 +103,10 @@ def run_child_stage(args, stage):
     command = [sys.executable, "-u", str(Path(__file__).resolve()), "--stage", stage]
     for key, value in vars(args).items():
         if key == "stage" or value is None:
+            continue
+        if key == "normalize_input":
+            if not value:
+                command.append("--no-normalize-input")
             continue
         flag = "--" + key.replace("_", "-")
         if isinstance(value, bool):
@@ -151,7 +157,8 @@ def run_llm_stage(args, items, transcript_rows, split_dir, env_root):
                    max_memory_gib=args.llm_max_memory_gib)
     cfg = AgentConfig(max_calls=args.max_calls, max_invalid=args.max_invalid,
                       max_tool_details=args.max_tool_details, sample_seconds=args.sample_seconds,
-                      use_train_transcript=args.use_train_transcript)
+                      use_train_transcript=args.use_train_transcript,
+                      normalize_input=args.normalize_input)
     if args.use_train_transcript and args.split != "train":
         raise ValueError("--use-train-transcript is forbidden for test splits")
     agent = LifeMateAgent(asr=None, llm=llm, catalog=catalog, cfg=cfg)

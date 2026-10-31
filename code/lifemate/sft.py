@@ -9,6 +9,7 @@ import time
 from .agent import (SYSTEM_PROMPT, _train_transcript, audio_path, build_step_prompt,
                     history_text, short_json)
 from .catalog import allowed_tools
+from .text import normalize_text
 
 
 class UnexposedToolError(ValueError):
@@ -27,7 +28,7 @@ def split_records(records, validation_fraction=0.1, seed=42):
     return ordered[count:], ordered[:count]
 
 
-def prepare_train_transcript(item, split_dir, asr=None):
+def prepare_train_transcript(item, split_dir, asr=None, normalize_input=True):
     """Resolve train text/audio once; reuse the same input for SFT and rollouts."""
     started = time.monotonic()
     transcript = _train_transcript(item)
@@ -39,16 +40,20 @@ def prepare_train_transcript(item, split_dir, asr=None):
         def transcribe(self, path):
             raise ValueError("History audio needs --asr-model or a train history transcript")
     history = history_text(item.get("history", []), split_dir, asr or MissingASR(), started, float("inf"))
+    if normalize_input:
+        transcript = normalize_text(transcript)
+        history = [{"role": turn["role"], "text": normalize_text(turn["text"])[:1700]}
+                   for turn in history]
     return {"id": item["id"], "transcript": transcript, "history": history}
 
 
 def replay_sample(item, catalog, env, split_dir, asr=None, max_tool_details=35,
-                  prepared_transcript=None):
+                  prepared_transcript=None, normalize_input=True):
     """Replay TRAIN gold in order; never expose future calls in earlier prompts."""
     calls = item.get("label", {}).get("tool_calls")
     if not isinstance(calls, list):
         raise ValueError(f"{item['id']}: missing label.tool_calls list (empty list is valid)")
-    prepared = prepared_transcript or prepare_train_transcript(item, split_dir, asr)
+    prepared = prepared_transcript or prepare_train_transcript(item, split_dir, asr, normalize_input=normalize_input)
     transcript, history = prepared["transcript"], prepared["history"]
     context = item.get("context", {})
     enabled = allowed_tools(catalog, context.get("installed_apps", {}))

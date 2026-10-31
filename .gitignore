@@ -3,3 +3,8 @@ code/models/*
 code/unsloth_compiled_cache
 code/result/finetune_20261029_212030
 train+public_test/
+code/result/finetune_20261029_212030.zip
+code/result/asr_benchmark/
+code/logs/diagnostics.jsonl
+__pycache__/
+*.pyc

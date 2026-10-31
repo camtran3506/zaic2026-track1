@@ -24,6 +24,8 @@ def main():
     p.add_argument("--asr-model", type=Path)
     p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     p.add_argument("--asr-compute-type", default="float16")
+    p.add_argument("--no-normalize-input", dest="normalize_input", action="store_false", default=True,
+                   help="Disable text normalization for train transcript and history")
     args = p.parse_args()
     configure_cuda_device(args)
     split_dir, env_root, holder = resolve_data_layout(args.data_root, "train")
@@ -44,7 +46,7 @@ def main():
     metadata = dict(source=str(source), source_sha256=file_sha256(source),
                     catalog_sha256=file_sha256(catalog_path), seed=args.seed,
                     max_tool_details=args.max_tool_details, missing_tool_policy=args.missing_tool_policy,
-                    partitions={})
+                    normalize_input=args.normalize_input, partitions={})
     rollout_rows = []
     for partition, rows in (("train", train), ("validation", validation)):
         path = args.output_dir / f"{partition}.jsonl"
@@ -56,9 +58,9 @@ def main():
             for i, record in enumerate(rows):
                 env = ToolEnv("train", record["id"], root=str(env_root))
                 try:
-                    prepared = prepare_train_transcript(record, split_dir, asr)
+                    prepared = prepare_train_transcript(record, split_dir, asr, normalize_input=args.normalize_input)
                     examples = replay_sample(record, catalog, env, split_dir, asr, args.max_tool_details,
-                                             prepared_transcript=prepared)
+                                             prepared_transcript=prepared, normalize_input=args.normalize_input)
                 except UnexposedToolError as exc:
                     if args.missing_tool_policy == "error":
                         raise
