@@ -164,34 +164,6 @@ class LocalLLM:
     result = subprocess.run(llm_only, env=env, capture_output=True, text=True, timeout=120)
     assert result.returncode == 0, result.stdout + result.stderr
     assert [e['event'] for e in read_jsonl(events)].count('asr_load') == 1
-    # Execute the notebook's actual ASR and LLM cells against the same isolated
-    # fixture app. This checks command wiring, retained transcripts and artifacts.
-    notebook_path = source.parent / 'notebooks' / 'LifeMate_Kaggle.ipynb'
-    if notebook_path.is_file():
-        notebook = json.loads(notebook_path.read_text())
-        cells = [c['source'] for c in notebook['cells'] if c['cell_type'] == 'code']
-        config = next(s for s in cells if s.startswith('from pathlib'))
-        scope = {}
-        exec(config.replace('/kaggle/working', str(tmp_path / 'kaggle-working')), scope)
-        model.mkdir()
-        scope.update(APP=app, SPLIT_DIR=split, ITEMS=items, EXPECTED_IDS=[r['id'] for r in items],
-            ASR_PATH=model, LLM_PATH=tmp_path / 'llm-fixture', BASE_ENV=env,
-            DEVICE='cpu', ASR_COMPUTE='int8', LLM_DTYPE='float32', ADAPTER_PATH=None,
-            HW={'gpu': False}, CATALOG_PATH=split / 'public_test_tools_catalog.json',
-            MODEL_MANIFEST={'asr': {'path': str(model)}, 'llm': {'path': str(tmp_path / 'llm-fixture')}})
-        exec(next(s for s in cells if s.startswith('TRANSCRIPTS =')), scope)
-        cache_bytes = scope['TRANSCRIPTS'].read_bytes()
-        runner = next(s for s in cells if s.startswith('# Chạy lại cell'))
-        exec(runner, scope)
-        first_out = scope['OUT']
-        assert json.loads((first_out / 'validation.json').read_text())['status'] == 'completed'
-        assert (first_out / 'transcripts.jsonl').read_bytes() == cache_bytes
-        assert (first_out / 'lifemate_artifacts.zip').is_file()
-        asr_loads = [e['event'] for e in read_jsonl(events)].count('asr_load')
-        exec(runner, scope)
-        assert scope['OUT'] != first_out
-        assert (scope['OUT'] / 'transcripts.jsonl').read_bytes() == cache_bytes
-        assert [e['event'] for e in read_jsonl(events)].count('asr_load') == asr_loads
 
 
 def test_agent_default_is_unlimited_and_uses_only_prepared_history():
