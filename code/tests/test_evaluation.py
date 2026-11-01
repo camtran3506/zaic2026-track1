@@ -96,6 +96,11 @@ def test_mean_is_over_original_samples_not_sft_steps_or_calls(prepared, tmp_path
     empty = next(r for r in records if r['id'] == valid[0]['id'])
     empty['label']['tool_calls'] = []
     empty['context']['installed_apps'] = {}
+    # A prediction must now read before writing. Make the nonempty gold have
+    # one extra post-write read, retaining a partial-score case for aggregation.
+    for record in records:
+        if record['label']['tool_calls']:
+            record['label']['tool_calls'].append({'name': 'smart_home.get_status', 'arguments': {}})
     (source / 'train.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in records))
     out = tmp_path / 'two-samples'
     monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--data-root', str(source),
@@ -105,14 +110,17 @@ def test_mean_is_over_original_samples_not_sft_steps_or_calls(prepared, tmp_path
 
     class LLM:
         def generate(self, system, user):
-            if json.loads(user)['previous_actions_and_results']:
+            observations = json.loads(user)['previous_actions_and_results']
+            if len(observations) >= 2:
                 return '{"action":"done"}'
+            if not observations:
+                return '{"action":"call","name":"smart_home.get_status","arguments":{}}'
             return '{"action":"call","name":"smart_home.light_set","arguments":{"device_id":"light_living","power":"on"}}'
 
     try:
         result = evaluator.evaluate(LLM(), tmp_path / 'mean.jsonl')
         assert result['eval_rollout_samples'] == 2
-        assert result['eval_state_tool_score'] == pytest.approx(100 * (1 + 2 / 3) / 2)
+        assert result['eval_state_tool_score'] == pytest.approx(100 * (1 + 4 / 5) / 2)
     finally:
         evaluator.close()
 

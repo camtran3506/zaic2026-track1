@@ -164,6 +164,32 @@ cache is reused without reloading ASR; use a different cache per ASR variant, or
 detect ordinary replacement; they are not cryptographic hashes of all source audio
 and model weights. Keep the original data and frozen model revisions for reproduction.
 
+### Transcript text normalization
+
+ASR output and TRAIN `audio_text` use `lifemate.text.normalize_transcript` for
+LLM input: Unicode NFC, lowercase, normalize prose punctuation to spaces, collapse
+whitespace and strip the ends. Written numeric expressions retain internal
+separators: `08:30`, `8:05:09`, `29/10/2026`, `2026-10-29`, `3.14`, `1.234,56`,
+`1,234.56`, signed numbers (`-5`, `+2.5`) and percentages (`20%`). Trailing sentence
+punctuation is removed. Vietnamese accents and digits are preserved.
+
+For example, `BẬT đèn, lúc 08:30 ngày 29/10/2026!` becomes
+`bật đèn lúc 08:30 ngày 29/10/2026`. These rules preserve numeric structure;
+they do not validate dates/times, guess decimal locale, convert spoken numbers,
+or infer missing separators (`08 30` stays `08 30`). Punctuation in other text,
+including email addresses and identifiers, may still be removed.
+
+Normalization runs before transcript caching and before training/inference. It
+also applies to history transcribed from audio, explicit history `audio_text` or
+`transcript`, and user/human history text. Existing assistant/system `text` and
+`content`, tool results and tool arguments are preserved. Full history text is
+still saved before the existing prompt length limits are applied.
+
+Transcript manifests include `text_normalization`; older or incompatible caches
+are rejected, including in LLM-only mode. Rebuild them with `--refresh-transcripts`
+in the ASR/full stage, or choose a new cache path. Regenerate existing SFT datasets
+in a new output directory to use the same normalization for training and inference.
+
 With `--stage full`, the default cache is `<output-stem>.transcripts.jsonl`, and
 stdout/stderr for both stages is saved to `<cache-stem>.asr.log` and
 `<output-stem>.llm.log`. Diagnostics default to `<output-stem>.diagnostics.jsonl`.
@@ -300,13 +326,54 @@ By default `docker run ... lifemate:baseline` targets **private_test** at `/data
 
 - **Timing**: there is no per-sample timeout by default. A finite `--sample-seconds` applies only to the LLM stage and is cooperative, not a hard interrupt. Offline ASR-precomputation experiments do NOT establish compliance with a competition's end-to-end 30-second rule.
 - `env.validate` catches schema-invalid arguments before they become logged calls; valid but semantically wrong IDs may still be rejected by `env.call`.
-- The agent prompts the LLM to perform read calls before x-ref-dependent writes, but does not implement a full symbolic planner. Long/complex tasks will be imperfect.
+- A pre-execution guard blocks writes whose `x-ref` IDs have not appeared in successful reads from the same app/resource. It is not a full symbolic planner. Long/complex tasks will be imperfect.
 - The model's response is constrained by a JSON-only prompt and strict parser, not constrained decoder. Malformed generations consume retries.
 - No external API or online requests at inference. `state.json` is NEVER read directly.
 - Fine-tuning reads only `train/train.jsonl` labels. Public/private test labels are never used. See the training workflow below.
 - Random seeds and greedy decoding are set; deterministic GPU kernels may still depend on exact GPU, driver and library versions. Freeze versions and run repeatability checks before final Docker submission.
 - The `zaic_tools` API is integrated strictly according to the prompt-provided interface; if your package exposes different structures, adapt the catalog parsing only after inspecting its *public* API/documentation (never environment files).
 - For stronger models/ASR, replace local checkpoint paths but keep combined parameters <6B and LLM <5B.
+
+### Call guard and argument formats
+
+Before `env.call`, the agent checks tool availability, argument-object shape,
+`env.validate`, duplicate reads and ID provenance. Already-valid arguments are
+preserved. If validation fails, it tries one schema-directed repair and validates
+the entire repaired call again. No rejected proposal is sent to `env.call`.
+
+Repairs cover nested object/array values, numeric strings to finite numbers or
+integers without rounding, `true`/`false` strings to booleans, numeric values to
+strings, and uniquely matching case-insensitive string enums. Unknown fields are
+not removed, missing arguments are not invented, and composed schemas are not
+guessed. ToolEnv remains the authoritative validator for types, enum, required,
+patterns, bounds and other catalog constraints.
+
+Temporal repairs use declared `format`/`pattern`, not argument names: `9h30` or
+`9 giờ 30` can become `09:30` for an HH:MM pattern, or `09:30:00` for time;
+`31/10/2026` can become `2026-10-31` for date. Ambiguous day/month inputs are not
+changed. ISO datetimes with spaces can become ISO `T` form; naive datetimes gain
+an offset only from an explicit valid context timezone. Missing timezone and
+ambiguous/nonexistent DST times are not guessed. A format rejected by ToolEnv
+is returned to the LLM for correction rather than executed.
+
+ID evidence comes from the complete read result, not truncated prompt text or
+LLM-proposed arguments. Supported `x-ref` values are `app.collection`: the guard
+recognizes `id`/resource-specific ID fields under that collection (including
+nested wrappers), ID lists, and matching resource read tools returning unwrapped
+records. For schemas without `x-ref`, `id`/`*_id`/`*_ids` parameters use a scoped
+fallback. Unknown result layouts or unsupported references block the write;
+adapt the public result mapping for the organizer's schema if needed. IDs from
+other apps/resources, names, and explicitly failed reads do not authorize writes.
+This establishes prior-read provenance, not proof that an ID still exists or is
+the user's intended target.
+
+Duplicate reads compare complete JSON arguments with sorted keys and equivalent
+integral numbers, without truncation. Only successful writes clear the duplicate
+read set. Failed reads may be retried. SFT gold replay uses the same provenance
+and duplicate-read guard and stops with an explicit error on incompatible gold
+trajectories; gold arguments are not silently repaired. Regenerate SFT outputs
+after changing this policy. All reads use public ToolEnv results; no environment
+state files are opened.
 
 ## Fine-tune the LLM for next-tool calling with Unsloth (LoRA / QLoRA)
 

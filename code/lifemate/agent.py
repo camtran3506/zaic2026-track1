@@ -9,6 +9,8 @@ from pathlib import Path
 from typing import Any
 
 from .catalog import allowed_tools, prompt_catalog
+from .text import history_turn_text, normalize_transcript
+from .guard import CallGuard, GuardError, validated_arguments
 
 SYSTEM_PROMPT = """Bạn là AI Agent LifeMate. Chỉ xuất ĐÚNG MỘT JSON object, KHÔNG markdown hoặc diễn giải.
 Bạn có transcript yêu cầu nói tiếng Việt, context, history, các tool được cài và kết quả các calls trước.
@@ -113,19 +115,19 @@ def _train_transcript(item: dict) -> str | None:
     """Opt-in, TRAIN ONLY. Never read labels or transcripts from public/private test."""
     txt = item.get("audio_text")
     if isinstance(txt, str):
-        return txt
+        return normalize_transcript(txt)
     if isinstance(txt, dict):
         for key in ("latest", "current", "text", "transcript", "audio_text"):
             if isinstance(txt.get(key), str):
-                return txt[key]
+                return normalize_transcript(txt[key])
     if isinstance(txt, list):
         for entry in reversed(txt):
             if isinstance(entry, str):
-                return entry
+                return normalize_transcript(entry)
             if isinstance(entry, dict):
                 for k in ("audio_text", "text", "transcript", "content"):
                     if isinstance(entry.get(k), str):
-                        return entry[k]
+                        return normalize_transcript(entry[k])
     return None
 
 
@@ -144,12 +146,11 @@ def history_text(history: Any, split_dir: Path, asr: Any, start: float, time_lim
         if not isinstance(turn, dict):
             continue
         role = str(turn.get("role", turn.get("speaker", "user")))
-        text = next((turn[k] for k in ("audio_text", "text", "content", "transcript")
-                     if isinstance(turn.get(k), str) and turn[k].strip()), "")
-        if not text and role.lower() in ("user", "human"):
+        text = history_turn_text(turn)
+        if text is None and role.lower() in ("user", "human"):
             path = turn.get("audio", turn.get("audio_path"))
             if isinstance(path, str) and time.monotonic() - start < time_limit - 5:
-                text = asr.transcribe(audio_path(split_dir, path))
+                text = normalize_transcript(asr.transcribe(audio_path(split_dir, path)))
         if text:
             result.append({"role": role, "text": text[:1700]})
     return result
@@ -205,13 +206,13 @@ class LifeMateAgent:
         if prepared_transcript is not None:
             if prepared_transcript.get("id") != item["id"]:
                 raise ValueError("Prepared transcript ID does not match current sample")
-            transcript = prepared_transcript["transcript"]
+            transcript = normalize_transcript(prepared_transcript["transcript"])
             history = [{"role": turn["role"], "text": turn["text"][:1700]}
                        for turn in prepared_transcript["history"][-12:]]
         else:
             transcript = _train_transcript(item) if self.cfg.use_train_transcript and split == "train" else None
             if transcript is None:
-                transcript = self.asr.transcribe(audio_path(split_dir, item["audio"]))
+                transcript = normalize_transcript(self.asr.transcribe(audio_path(split_dir, item["audio"])))
             history = history_text(item.get("history", []), split_dir, self.asr, t0, self.cfg.sample_seconds)
         observations: list[dict] = []
         invalid = 0
@@ -219,8 +220,7 @@ class LifeMateAgent:
         last_tool: str | None = None
         inspected_tool = None
         inspections = 0
-        epoch = 0
-        recent_reads: set[tuple[int, str, str]] = set()
+        guard = CallGuard(enabled)
         while executed < self.cfg.max_calls and invalid < self.cfg.max_invalid:
             if time.monotonic() - t0 > self.cfg.sample_seconds - self.cfg.reserve_seconds:
                 break
@@ -261,17 +261,11 @@ class LifeMateAgent:
                     observations.append({"error": "Missing-info tool_name must be another available tool."})
                     continue
             try:
-                validation = env.validate(name, args)
-            except Exception as exc:
-                validation = {"ok": False, "error": repr(exc)}
-            if not isinstance(validation, dict) or not validation.get("ok", False):
+                args = validated_arguments(env, name, args, enabled[name].get("parameters", {}), context)
+                guard.check(name, args)
+            except (GuardError, ValueError, TypeError) as exc:
                 invalid += 1
-                observations.append({"error": "Schema invalid: " + short_json(validation, 1300), "name": name})
-                continue
-            read_key = (epoch, name, short_json(args))
-            if enabled[name].get("kind") == "read" and read_key in recent_reads:
-                invalid += 1
-                observations.append({"error": "Duplicate read without intervening state change", "name": name})
+                observations.append({"error": str(exc)[:1300], "name": name})
                 continue
             # This is the *only* place execution takes place. Calls that fail are logged by ToolEnv.
             try:
@@ -280,11 +274,7 @@ class LifeMateAgent:
                 result = {"ok": False, "error": repr(exc)}
             executed += 1
             last_tool = name
-            if enabled[name].get("kind") == "read":
-                recent_reads.add(read_key)
-            elif enabled[name].get("kind") == "write":
-                epoch += 1
-                recent_reads.clear()
+            guard.observe(name, args, result)
             observations.append({"name": name, "arguments": args, "result": short_json(result, 4500)})
             if name == "sys.ask_missing_info":
                 break

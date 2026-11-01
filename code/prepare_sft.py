@@ -9,6 +9,7 @@ from main import resolve_data_layout
 from lifemate.catalog import load_catalog
 from lifemate.sft import UnexposedToolError, file_sha256, prepare_train_transcript, replay_sample, split_records
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
+from lifemate.text import TEXT_NORMALIZATION_VERSION
 
 
 def main():
@@ -42,6 +43,7 @@ def main():
         from lifemate.models import LocalASR
         asr = LocalASR(args.asr_model, device=args.device, compute_type=args.asr_compute_type)
     metadata = dict(source=str(source), source_sha256=file_sha256(source),
+                    text_normalization=TEXT_NORMALIZATION_VERSION,
                     catalog_sha256=file_sha256(catalog_path), seed=args.seed,
                     max_tool_details=args.max_tool_details, missing_tool_policy=args.missing_tool_policy,
                     partitions={})

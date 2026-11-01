@@ -6,6 +6,7 @@ import logging
 from pathlib import Path
 
 from .context import DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_NEW_TOKENS, validate_inference_budget
+from .text import normalize_transcript
 
 
 class LocalASR:
@@ -31,7 +32,7 @@ class LocalASR:
             str(path), language="vi", task="transcribe", beam_size=self.beam_size,
             temperature=0, condition_on_previous_text=False, vad_filter=False,
         )
-        result = " ".join(seg.text.strip() for seg in segments).strip()
+        result = normalize_transcript(" ".join(seg.text for seg in segments))
         self.cache[key] = result
         if len(self.cache) > 512:
             self.cache.popitem(last=False)
