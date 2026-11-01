@@ -6,24 +6,30 @@ from pathlib import Path
 
 from .context import DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_NEW_TOKENS, validate_inference_budget
 from .asr import LocalASR
-from .llm import model_loader, configure_tokenizer
+from .llm import model_loader, configure_tokenizer, render_prompt
+from .runtime import (DEFAULT_LLM_DTYPE, DEFAULT_SEED, generation_policy,
+                      load_runtime_manifest, select_tokenizer_path, generation_context)
 
 
 class LocalLLM:
-    def __init__(self, model_path: Path, device: str = "cuda", dtype: str = "float16",
+    def __init__(self, model_path: Path, device: str = "cuda", dtype: str = DEFAULT_LLM_DTYPE,
                  max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS, max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
                  adapter_path: Path | None = None, device_map: str = "single",
-                 max_memory_gib: float = 6):
+                 max_memory_gib: float = 6, seed: int = DEFAULT_SEED):
         validate_inference_budget(max_input_tokens, max_new_tokens)
         import torch
-        from transformers import AutoModelForCausalLM, AutoTokenizer
+        from transformers import AutoTokenizer
         if not model_path.is_dir():
             raise FileNotFoundError(f"LLM model directory not found: {model_path}")
         self.torch = torch
-        tokenizer_path = adapter_path if adapter_path and (adapter_path / "tokenizer_config.json").is_file() else model_path
+        tokenizer_path = select_tokenizer_path(model_path, adapter_path)
         self.tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_path), local_files_only=True, trust_remote_code=False)
         configure_tokenizer(self.tokenizer, model_path)
-        self.tokenizer.truncation_side = "right"
+        self.runtime_manifest = load_runtime_manifest(model_path, self.tokenizer, adapter_path)
+        self.generation_policy = (dict(self.runtime_manifest["generation"]) if self.runtime_manifest
+                                  else generation_policy(self.tokenizer, model_path, seed))
+        self.generation_policy.update(seed=seed, max_input_tokens=max_input_tokens,
+                                      max_new_tokens=max_new_tokens)
         torch_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[dtype]
         sharding = {}
         if device_map == "balanced":
@@ -77,6 +83,9 @@ class LocalLLM:
         import torch
         obj = cls.__new__(cls)
         obj.torch, obj.model, obj.tokenizer = torch, model, tokenizer
+        obj.generation_policy = dict(getattr(model, "lifemate_generation_policy", None)
+                                     or generation_policy(tokenizer))
+        obj.generation_policy.update(max_input_tokens=max_input_tokens, max_new_tokens=max_new_tokens)
         obj.device = model.get_input_embeddings().weight.device
         obj.max_input_tokens, obj.max_new_tokens = max_input_tokens, max_new_tokens
         return obj
@@ -87,21 +96,17 @@ class LocalLLM:
         from .decoding import DecisionJsonStoppingCriteria
         tokenizer = self.tokenizer
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-        rendered = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
-                                                 **getattr(tokenizer, "lifemate_template_kwargs", {}))
-        encoded = tokenizer(rendered, add_special_tokens=False, return_tensors="pt",
-                            truncation=False, return_token_type_ids=False)
-        if encoded["input_ids"].shape[1] > self.max_input_tokens:
+        _, token_ids = render_prompt(tokenizer, messages)
+        if len(token_ids) > self.max_input_tokens:
             raise ValueError(f"Prompt exceeds --max-input-tokens={self.max_input_tokens}; "
                              "increase the input budget instead of silently truncating tool schemas")
-        encoded = {k: v.to(self.device) for k, v in encoded.items()}
+        input_ids = self.torch.tensor([token_ids], dtype=self.torch.long, device=self.device)
+        encoded = {"input_ids": input_ids, "attention_mask": self.torch.ones_like(input_ids)}
         stop = DecisionJsonStoppingCriteria(tokenizer, encoded["input_ids"].shape[1])
-        with self.torch.inference_mode():
+        with self.torch.inference_mode(), generation_context(
+                self.model, self.generation_policy, self.max_new_tokens) as config:
             ids = self.model.generate(
-                **encoded, max_new_tokens=self.max_new_tokens,
-                do_sample=False, num_beams=1,
-                pad_token_id=tokenizer.eos_token_id,
-                use_cache=True,
+                **encoded, generation_config=config,
                 stopping_criteria=StoppingCriteriaList([stop]),
             )
         if stop.completed_json is not None:

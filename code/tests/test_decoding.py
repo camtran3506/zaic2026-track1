@@ -67,9 +67,6 @@ def test_hf_generate_stops_before_trailing_tokens_and_ignores_prompt_json():
     # Exercise the production wrapper too, not just HF's stopping API in isolation.
     from types import SimpleNamespace
     from lifemate.models import LocalLLM
-    llm = LocalLLM.__new__(LocalLLM)
-    llm.torch, llm.tokenizer, llm.device = torch, tokenizer, 'cpu'
-    llm.max_input_tokens, llm.max_new_tokens = 6000, 8
     tokenizer.chat_template = "{{ messages[0]['content'] }} {{ messages[1]['content'] }}"
     produced = []
     def actual_generate(**kwargs):
@@ -77,6 +74,8 @@ def test_hf_generate_stops_before_trailing_tokens_and_ignores_prompt_json():
         result = model.generate(**kwargs, logits_processor=LogitsProcessorList([ScriptedTokens(length)]))
         produced.append(result.shape[1] - length)
         return result
-    llm.model = SimpleNamespace(generate=actual_generate)
+    llm = LocalLLM.from_loaded_model(SimpleNamespace(generate=actual_generate,
+        get_input_embeddings=lambda: SimpleNamespace(weight=torch.zeros(1))), tokenizer,
+        max_input_tokens=6000, max_new_tokens=8)
     assert json.loads(llm.generate('system', 'user')) == {'action': 'done'}
     assert produced == [3]

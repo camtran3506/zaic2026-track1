@@ -96,6 +96,11 @@ def test_train_adapter_reload_and_merge(tmp_path, architecture):
     assert config['eval_strategy'] == 'epoch'
     adapter = run / 'training' / 'adapter'
     assert (adapter / 'adapter_model.safetensors').is_file()
+    runtime = json.loads((adapter / 'lifemate_runtime.json').read_text())
+    assert runtime['inference_dtype'] == 'bfloat16'
+    assert runtime['generation']['temperature'] == 0
+    assert runtime['generation']['max_new_tokens'] == 384
+    assert (run / 'training/checkpoint-2/lifemate_runtime.json').is_file()
     from safetensors.torch import load_file
     weights = load_file(str(adapter / 'adapter_model.safetensors'))
     if architecture == 'qwen3_5':
@@ -116,8 +121,12 @@ def test_train_adapter_reload_and_merge(tmp_path, architecture):
     assert config['best_state_tool_score'] == trainer_state['best_metric']
     assert (run / 'training/validation_scores.jsonl').is_file()
     llm = LocalLLM(base, device='cpu', dtype='float32', adapter_path=adapter, max_new_tokens=2)
-    from lifemate.llm import model_loader
-    merged = model_loader(run / "merged").from_pretrained(run / 'merged', local_files_only=True, torch_dtype=torch.float32)
+    merged_runtime = json.loads((run / 'merged/lifemate_runtime.json').read_text())
+    assert merged_runtime['generation'] == runtime['generation']
+    assert merged_runtime['chat_template_kwargs'] == runtime['chat_template_kwargs']
+    merged_weights = load_file(str(run / 'merged/model.safetensors'))
+    assert merged_weights['lm_head.weight'].dtype == torch.bfloat16
+    merged = LocalLLM(run / 'merged', device='cpu', dtype='float32').model
     llm.model.eval()
     merged.eval()
     with torch.no_grad():

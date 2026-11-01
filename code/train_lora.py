@@ -10,6 +10,8 @@ from lifemate.sft import AssistantCollator, SupervisedDataset, file_sha256
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
 from lifemate.context import MAX_CONTEXT_TOKENS, validate_training_length
 from lifemate.llm import is_qwen35, model_loader, lora_targets, configure_tokenizer
+from lifemate.runtime import (make_runtime_manifest, runtime_save_callback,
+                              save_runtime_manifest, training_dtype)
 
 
 def main():
@@ -48,7 +50,7 @@ def main():
             raise RuntimeError("Install requirements.txt in a supported CUDA environment for Unsloth") from exc
     import torch
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
-    from transformers import (AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig,
+    from transformers import (AutoTokenizer, BitsAndBytesConfig,
                               Trainer, TrainingArguments, set_seed)
     if not args.base_model.is_dir():
         raise FileNotFoundError(args.base_model)
@@ -65,8 +67,8 @@ def main():
         raise RuntimeError("Unsloth backend requires CUDA; CPU tests must explicitly use --backend transformers --quantization none")
     if args.quantization == "4bit" and not cuda:
         raise RuntimeError("QLoRA requires CUDA; use --quantization none for a CPU smoke test")
-    bf16 = cuda and torch.cuda.is_bf16_supported()
-    dtype = torch.bfloat16 if bf16 else (torch.float16 if cuda else torch.float32)
+    dtype = training_dtype(torch)
+    bf16 = cuda and dtype == torch.bfloat16
     if args.backend == "unsloth":
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=str(args.base_model.resolve()), max_seq_length=args.max_length,
@@ -81,9 +83,6 @@ def main():
     if is_qwen35(args.base_model):
         tokenizer = AutoTokenizer.from_pretrained(str(args.base_model), local_files_only=True, trust_remote_code=False)
     configure_tokenizer(tokenizer, args.base_model)
-    if tokenizer.pad_token_id is None:
-        tokenizer.pad_token = tokenizer.eos_token
-    tokenizer.padding_side = "right"
     if tokenizer.pad_token_id is None:
         raise ValueError("Tokenizer needs an existing pad/eos token")
     manifest = json.loads((args.sft_dir / "manifest.json").read_text())
@@ -102,11 +101,14 @@ def main():
         raise ValueError("Train/validation sample leakage")
     from lifemate.evaluation import StateToolEvaluator, score_callback
     evaluator = StateToolEvaluator(args.sft_dir, manifest)
+    runtime = make_runtime_manifest(args.base_model, tokenizer, seed=args.seed)
     run_config = {
         **{k: str(v.resolve()) if isinstance(v, Path) else v for k, v in vars(args).items()},
         "torch": torch.__version__, "train_steps": len(data["train"]),
         "validation_steps": len(data["validation"]), "data_manifest": manifest,
         "selection_metric": "eval_state_tool_score",
+        "runtime": runtime,
+        "training_dtype": str(dtype),
     }
     if args.resume_from_checkpoint:
         original_path = args.resume_from_checkpoint.parent / "training_config.json"
@@ -115,7 +117,7 @@ def main():
         original = json.loads(original_path.read_text(encoding="utf-8"))
         for key in ("backend", "base_model", "data_manifest", "quantization", "max_length",
                     "batch_size", "gradient_accumulation", "learning_rate", "lora_r",
-                    "lora_alpha", "lora_dropout", "seed", "eval_strategy"):
+                    "lora_alpha", "lora_dropout", "seed", "eval_strategy", "runtime"):
             if original.get(key) != run_config[key]:
                 raise ValueError(f"Resume configuration mismatch: {key}")
     # Save before training so interrupted runs can still be resumed safely.
@@ -142,6 +144,7 @@ def main():
             lora_dropout=args.lora_dropout, bias="none", task_type="CAUSAL_LM", target_modules=targets)
         model = get_peft_model(model, config)
     model.config.use_cache = False
+    model.lifemate_generation_policy = runtime["generation"]
     if hasattr(model.config, "text_config"):
         model.config.text_config.use_cache = False
     model.print_trainable_parameters()
@@ -151,7 +154,7 @@ def main():
         gradient_accumulation_steps=args.gradient_accumulation,
         learning_rate=args.learning_rate, lr_scheduler_type="cosine", warmup_ratio=0.03,
         weight_decay=0.01, max_grad_norm=1.0, optim="adamw_torch",
-        bf16=bf16, fp16=cuda and not bf16, use_cpu=not cuda,
+        bf16=bf16, fp16=False, use_cpu=not cuda,
         gradient_checkpointing=args.backend != "unsloth", gradient_checkpointing_kwargs={"use_reentrant": False},
         logging_steps=1, eval_strategy=args.eval_strategy, eval_steps=args.save_steps,
         save_strategy=args.eval_strategy, save_steps=args.save_steps, save_total_limit=2,
@@ -161,7 +164,8 @@ def main():
     trainer = Trainer(model=model, args=training_args, processing_class=tokenizer,
         train_dataset=data["train"], eval_dataset=data["validation"],
         data_collator=AssistantCollator(tokenizer.pad_token_id),
-        callbacks=[score_callback(evaluator, tokenizer, args.output_dir, FastLanguageModel)])
+        callbacks=[score_callback(evaluator, tokenizer, args.output_dir, FastLanguageModel),
+                   runtime_save_callback(runtime)])
     try:
         train_result = trainer.train(resume_from_checkpoint=str(args.resume_from_checkpoint) if args.resume_from_checkpoint else None)
         trainer.save_metrics("train", train_result.metrics)
@@ -171,6 +175,7 @@ def main():
         adapter = args.output_dir / "adapter"
         trainer.save_model(str(adapter))
         tokenizer.save_pretrained(str(adapter))
+        save_runtime_manifest(adapter, runtime)
     finally:
         evaluator.close()
     run_config["best_checkpoint"] = trainer.state.best_model_checkpoint

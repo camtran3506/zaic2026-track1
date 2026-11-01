@@ -25,6 +25,7 @@ from lifemate.catalog import load_catalog
 from lifemate.agent import AgentConfig, LifeMateAgent
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
 from lifemate.context import DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_NEW_TOKENS, validate_inference_budget
+from lifemate.runtime import DEFAULT_LLM_DTYPE
 
 LOG = logging.getLogger("lifemate")
 
@@ -50,7 +51,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
     p.add_argument("--asr-precision", default="int8", choices=["int8", "fp32"])
     p.add_argument("--asr-threads", type=int, default=4, help="GIPformer CPU threads; independent of LLM device")
-    p.add_argument("--llm-dtype", default="bfloat16", choices=["float16", "bfloat16", "float32"])
+    p.add_argument("--llm-dtype", default=DEFAULT_LLM_DTYPE, choices=["float16", "bfloat16", "float32"])
     p.add_argument("--max-input-tokens", type=int, default=DEFAULT_MAX_INPUT_TOKENS)
     p.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     p.add_argument("--max-calls", type=int, default=8)
@@ -143,7 +144,7 @@ def run_llm_stage(args, items, transcript_rows, split_dir, env_root):
     llm = LocalLLM(args.llm_model, device=args.device, dtype=args.llm_dtype,
                    max_input_tokens=args.max_input_tokens, max_new_tokens=args.max_new_tokens,
                    adapter_path=args.llm_adapter, device_map=args.llm_device_map,
-                   max_memory_gib=args.llm_max_memory_gib)
+                   max_memory_gib=args.llm_max_memory_gib, seed=args.seed)
     cfg = AgentConfig(max_calls=args.max_calls, max_invalid=args.max_invalid,
                       max_tool_details=args.max_tool_details, sample_seconds=args.sample_seconds,
                       use_train_transcript=args.use_train_transcript)

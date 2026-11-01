@@ -23,6 +23,42 @@ within the existing token budget. Unsloth uses
 Qwen3.5 weights in a fresh directory and train a new adapter; Qwen3 adapters
 are incompatible. Other inference and training budgets are unchanged.
 
+### Shared inference settings and artifact identity
+
+Inference and merge default to **BF16** (`bfloat16`), including `--export-merged`.
+GPU training and the notebook require BF16-capable hardware; unsupported GPUs
+raise an explicit error. CPU smoke tests use FP32. Explicit inference/merge dtype
+overrides remain available for controlled comparisons.
+
+`lifemate.llm` supplies the shared chat-template kwargs, SFT tokenization and
+portable `render_prompt(tokenizer, messages)` (rendered text plus exact input IDs).
+`lifemate.runtime` defines neutral greedy decoding: temperature 0, repetition
+penalty 1, zero presence/frequency penalties, explicit EOS/pad IDs, seed and the
+existing 16000/384/16384 token budgets. Transformers uses a fresh GenerationConfig
+with `do_sample=False`; sampling defaults from the model repository are not
+inherited. Request budget/seed overrides remain supported.
+
+New adapters, Trainer checkpoints and merged models include
+`lifemate_runtime.json` plus a neutral Transformers `generation_config.json`.
+The JSON sidecar records BF16 defaults, `enable_thinking=False` for Qwen3.5,
+prompt settings, decoding policy and SHA-256 fingerprints of the checkpoint
+(adapter base or exported merged model), tokenizer rules/vocabulary, special
+tokens and chat template. Inference
+and merge check these identities before loading model weights. Paths may change
+without invalidating the identity. Verification reads weight files once at
+startup/export; it does not run per token.
+
+An adapter must include its saved tokenizer: missing tokenizer files no longer
+fall back to the base tokenizer. Legacy adapters without the sidecar can still
+run, but emit a warning that identity is unverified. Old checkpoints without the
+recorded runtime identity cannot be resumed as verified runs; start a new run.
+
+The runtime remains Transformers/PyTorch. A future engine adapter must explicitly
+consume this sidecar, matching prompt IDs and sampling settings; placing the
+file beside a model does not automatically configure another engine. JSON
+stopping callbacks, LoRA registration and native tool-call protocol mapping
+remain work for that migration.
+
 ## 1. Install dependencies on the server
 
 `requirements.txt` is the shared dependency list for inference and fine-tuning.
@@ -186,7 +222,7 @@ python main.py --stage asr --data-root /path/to/data --split public_test \
 python main.py --stage llm --data-root /path/to/data --split public_test \
     --transcript-cache result/medium_transcripts.jsonl \
     --llm-model /path/to/qwen --output result/submission.jsonl \
-    --log-path result/diagnostics.jsonl --device cuda --llm-dtype float16
+    --log-path result/diagnostics.jsonl --device cuda --llm-dtype bfloat16
 ```
 
 The cache has one row per selected sample: `id`, full current `transcript`, full
@@ -442,7 +478,8 @@ python finetune.py \
 ```
 
 LoRA updates attention/MLP projections, with gradient checkpointing and BF16 on
-supporting GPUs (FP16 otherwise on CUDA). No 4-bit/8-bit weight quantization is
+supporting GPUs. GPU training requires BF16 support and does not silently fall
+back to FP16; the explicit CPU test backend uses FP32. No 4-bit/8-bit weight quantization is
 enabled by default. `--quantization 4bit` remains an explicit QLoRA option.
 An unquantized batch of 1 at up to 16,384 tokens requires substantial VRAM; this
 configuration has not been validated to fit an RTX A5000/T4 or this CPU environment.
@@ -550,7 +587,7 @@ python main.py \
   --asr-model /path/to/asr \
   --llm-model /path/to/exact-base-model \
   --llm-adapter /path/to/runs/toolcalling_v1/training/adapter \
-  --llm-dtype float16 --device cuda \
+  --llm-dtype bfloat16 --device cuda \
   --output result/submission.jsonl --log-path result/diagnostics.jsonl \
   > result/inference.log 2>&1
 ```
@@ -566,7 +603,7 @@ change the inference settings.
 # the full base model; run it separately if training GPU memory is tight.
 python merge_lora.py --base-model /path/to/exact-base-model \
   --adapter /path/to/runs/toolcalling_v1/training/adapter \
-  --output-dir /path/to/runs/toolcalling_v1/merged --dtype float16
+  --output-dir /path/to/runs/toolcalling_v1/merged --dtype bfloat16
 
 # Standalone inference: use merged as --llm-model and omit --llm-adapter.
 python train_lora.py --base-model /path/to/exact-base-model \
