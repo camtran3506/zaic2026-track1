@@ -89,7 +89,8 @@ class LocalLLM:
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         rendered = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
                                                  **getattr(tokenizer, "lifemate_template_kwargs", {}))
-        encoded = tokenizer(rendered, return_tensors="pt", truncation=False, return_token_type_ids=False)
+        encoded = tokenizer(rendered, add_special_tokens=False, return_tensors="pt",
+                            truncation=False, return_token_type_ids=False)
         if encoded["input_ids"].shape[1] > self.max_input_tokens:
             raise ValueError(f"Prompt exceeds --max-input-tokens={self.max_input_tokens}; "
                              "increase the input budget instead of silently truncating tool schemas")

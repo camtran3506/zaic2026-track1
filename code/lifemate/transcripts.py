@@ -8,7 +8,8 @@ import logging
 from pathlib import Path
 import time
 
-from .agent import _train_transcript, audio_path, history_turn_text
+from .agent import _train_transcript, audio_path
+from .history import history_entries as iter_history_entries, resolve_history
 
 LOG = logging.getLogger("lifemate.asr")
 # Version 2 stores source text verbatim. Rebuild version 1 caches so transformed
@@ -36,16 +37,7 @@ def read_jsonl(path):
 
 def history_entries(item):
     """Keep full history transcripts on disk; agent applies prompt history limits later."""
-    history = item.get("history", [])
-    if not isinstance(history, list):
-        return
-    for turn in history:
-        if not isinstance(turn, dict):
-            continue
-        role = str(turn.get("role", turn.get("speaker", "user")))
-        text = history_turn_text(turn)
-        audio = turn.get("audio", turn.get("audio_path"))
-        yield role, text, audio if isinstance(audio, str) else None
+    yield from iter_history_entries(item.get("history", []))
 
 
 def dataset_identity(items, split_dir, split, use_train_transcript=False):
@@ -157,12 +149,7 @@ def prepare_transcripts(items, split_dir, cache_path, identity, asr_settings, as
                 transcript = _train_transcript(item) if identity["use_train_transcript"] else None
                 if transcript is None:
                     transcript = transcribe(item["audio"])
-                history = []
-                for role, text, audio in history_entries(item):
-                    if text is None and audio:
-                        text = transcribe(audio)
-                    if text:
-                        history.append({"role": role, "text": text})
+                history = resolve_history(item.get("history", []), transcribe)
                 row = {"id": item["id"], "transcript": transcript, "history": history,
                        "asr_seconds": round(time.monotonic() - start, 6)}
                 validate_rows([row], {"sample_ids": [item["id"]]})

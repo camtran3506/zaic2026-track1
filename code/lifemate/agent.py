@@ -10,6 +10,7 @@ from typing import Any
 
 from .catalog import allowed_tools, prompt_catalog
 from .guard import CallGuard, GuardError, validated_arguments
+from .history import prompt_history, resolve_history
 
 SYSTEM_PROMPT = """Bạn là AI Agent LifeMate. Chỉ xuất ĐÚNG MỘT JSON object, KHÔNG markdown hoặc diễn giải.
 Bạn có transcript yêu cầu nói tiếng Việt, context, history, các tool được cài và kết quả các calls trước.
@@ -130,15 +131,6 @@ def _train_transcript(item: dict) -> str | None:
     return None
 
 
-def history_turn_text(turn: dict) -> str | None:
-    """Select available history text without modifying its contents."""
-    for key in ("audio_text", "text", "content", "transcript"):
-        text = turn.get(key)
-        if isinstance(text, str) and text.strip():
-            return text
-    return None
-
-
 def audio_path(split_dir: Path, relative: str) -> Path:
     path = (split_dir / relative).resolve()
     if not path.is_relative_to(split_dir.resolve()):
@@ -147,21 +139,12 @@ def audio_path(split_dir: Path, relative: str) -> Path:
 
 
 def history_text(history: Any, split_dir: Path, asr: Any, start: float, time_limit: float) -> list[dict]:
-    result = []
-    if not isinstance(history, list):
-        return result
-    for turn in history[-12:]:
-        if not isinstance(turn, dict):
-            continue
-        role = str(turn.get("role", turn.get("speaker", "user")))
-        text = history_turn_text(turn)
-        if text is None and role.lower() in ("user", "human"):
-            path = turn.get("audio", turn.get("audio_path"))
-            if isinstance(path, str) and time.monotonic() - start < time_limit - 5:
-                text = asr.transcribe(audio_path(split_dir, path))
-        if text:
-            result.append({"role": role, "text": text[:1700]})
-    return result
+    def transcribe(relative):
+        if time.monotonic() - start < time_limit - 5:
+            return asr.transcribe(audio_path(split_dir, relative))
+        return None
+
+    return prompt_history(resolve_history(history, transcribe))
 
 
 @dataclass
@@ -215,8 +198,7 @@ class LifeMateAgent:
             if prepared_transcript.get("id") != item["id"]:
                 raise ValueError("Prepared transcript ID does not match current sample")
             transcript = prepared_transcript["transcript"]
-            history = [{"role": turn["role"], "text": turn["text"][:1700]}
-                       for turn in prepared_transcript["history"][-12:]]
+            history = prompt_history(prepared_transcript["history"])
         else:
             transcript = _train_transcript(item) if self.cfg.use_train_transcript and split == "train" else None
             if transcript is None:

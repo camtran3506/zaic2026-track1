@@ -192,6 +192,11 @@ python main.py --stage llm --data-root /path/to/data --split public_test \
 The cache has one row per selected sample: `id`, full current `transcript`, full
 text `history`, and `asr_seconds`. All history audio is processed in advance;
 the agent retains the existing last-12-turn/1700-character prompt history limits.
+SFT and inference share the same history resolver: audio-only turns are
+transcribed for every role, empty turns are filtered first, and then the last
+12 usable turns are selected and clipped to 1700 characters each for the prompt.
+The on-disk cache still retains full history text. Regenerate older SFT datasets
+to include audio-only assistant/system history and apply the same selection order.
 `--use-train-transcript` still requires `split=train`; test request audio is always
 transcribed rather than read from a possible `audio_text` field.
 
@@ -211,6 +216,9 @@ ASR output, TRAIN `audio_text` and history text are passed through as provided.
 The pipeline does not lowercase, convert Unicode forms, remove punctuation or
 collapse whitespace. For example, ` BẬT đèn, lúc 08:30! ` stays unchanged in the
 cache, LLM prompt and SFT input. Existing history length/token limits still apply.
+After rendering the chat template, inference tokenizes with
+`add_special_tokens=False` so BOS/EOS tokens already inserted by the template
+are not added a second time. This matches the SFT prefix tokenization.
 
 Transcript caches now use manifest version 2. Rebuild older caches with
 `--refresh-transcripts` in ASR/full mode, or choose a new path. A completed cache
