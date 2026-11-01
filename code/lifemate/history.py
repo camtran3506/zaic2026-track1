@@ -1,4 +1,17 @@
 """Shared verbatim history handling for ASR caches, SFT and inference."""
+from copy import deepcopy
+
+
+def history_tool_pairs(turn):
+    """Only paired structured assistant tool results are provenance evidence."""
+    if turn.get("role", turn.get("speaker")) != "assistant":
+        return []
+    calls, results = turn.get("tool_calls"), turn.get("tool_results")
+    if not isinstance(calls, list) or not isinstance(results, list) or len(calls) != len(results):
+        return []
+    return [(call, result) for call, result in zip(calls, results)
+            if isinstance(call, dict) and isinstance(call.get("name"), str)
+            and isinstance(call.get("arguments"), dict)]
 
 
 def history_turn_text(turn):
@@ -24,15 +37,31 @@ def history_entries(history):
 def resolve_history(history, transcribe):
     """Resolve audio-only turns for all roles and retain full, nonempty text."""
     result = []
-    for role, text, audio in history_entries(history):
+    for turn in history if isinstance(history, list) else []:
+        if not isinstance(turn, dict):
+            continue
+        role, text, audio = next(history_entries([turn]))
         if text is None and audio:
             text = transcribe(audio)
-        if text:
-            result.append({"role": role, "text": text})
+        pairs = history_tool_pairs(turn)
+        if text or pairs:
+            resolved = {"role": role, "text": text or ""}
+            if pairs:
+                resolved["tool_calls"] = deepcopy([call for call, _ in pairs])
+                resolved["tool_results"] = deepcopy([value for _, value in pairs])
+            result.append(resolved)
     return result
 
 
 def prompt_history(history):
     """Filter first, then select twelve turns and apply the existing text limit."""
-    turns = [turn for turn in history if turn["text"]]
-    return [{"role": turn["role"], "text": turn["text"][:1700]} for turn in turns[-12:]]
+    turns = [turn for turn in history if turn["text"] or history_tool_pairs(turn)]
+    result = []
+    for turn in turns[-12:]:
+        row = {"role": turn["role"], "text": turn["text"][:1700]}
+        pairs = history_tool_pairs(turn)
+        if pairs:
+            row["tool_calls"] = deepcopy([call for call, _ in pairs])
+            row["tool_results"] = deepcopy([value for _, value in pairs])
+        result.append(row)
+    return result

@@ -230,9 +230,11 @@ text `history`, and `asr_seconds`. All history audio is processed in advance;
 the agent retains the existing last-12-turn/1700-character prompt history limits.
 SFT and inference share the same history resolver: audio-only turns are
 transcribed for every role, empty turns are filtered first, and then the last
-12 usable turns are selected and clipped to 1700 characters each for the prompt.
-The on-disk cache still retains full history text. Regenerate older SFT datasets
-to include audio-only assistant/system history and apply the same selection order.
+12 usable turns are selected and their text clipped to 1700 characters each for
+the prompt. Paired assistant `tool_calls`/`tool_results` are preserved as structured
+history, including tool-only turns; tool results are not clipped to the text limit.
+The on-disk cache retains full history text and these tool results. Regenerate
+older SFT datasets to include the same history evidence used at inference.
 `--use-train-transcript` still requires `split=train`; test request audio is always
 transcribed rather than read from a possible `audio_text` field.
 
@@ -256,11 +258,11 @@ After rendering the chat template, inference tokenizes with
 `add_special_tokens=False` so BOS/EOS tokens already inserted by the template
 are not added a second time. This matches the SFT prefix tokenization.
 
-Transcript caches now use manifest version 2. Rebuild older caches with
+Transcript caches now use manifest version 3. Rebuild older caches with
 `--refresh-transcripts` in ASR/full mode, or choose a new path. A completed cache
 from the previous text-processing pipeline is rejected, including in LLM-only
 mode; old partial prefixes cannot be mixed into new runs. Regenerate existing
-SFT datasets in a new output directory to train on the original text.
+SFT datasets in a new output directory to retain original text and history tool evidence.
 
 With `--stage full`, the default cache is `<output-stem>.transcripts.jsonl`, and
 stdout/stderr for both stages is saved to `<cache-stem>.asr.log` and
@@ -436,6 +438,10 @@ records. For schemas without `x-ref`, `id`/`*_id`/`*_ids` parameters use a scope
 fallback. Unknown result layouts or unsupported references block the write;
 adapt the public result mapping for the organizer's schema if needed. IDs from
 other apps/resources, names, and explicitly failed reads do not authorize writes.
+Both inference and SFT initialize ID provenance from successful, enabled read
+tools in the retained assistant history. Historical calls are never executed again,
+and historical reads do not prevent a fresh read in the current turn. Only paired
+structured calls/results are accepted; user text and gold labels do not seed IDs.
 This establishes prior-read provenance, not proof that an ID still exists or is
 the user's intended target.
 

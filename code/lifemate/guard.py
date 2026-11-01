@@ -9,6 +9,8 @@ import math
 import re
 from zoneinfo import ZoneInfo
 
+from .history import history_tool_pairs
+
 
 class GuardError(ValueError):
     pass
@@ -184,10 +186,16 @@ def _id_key(value):
 
 
 class CallGuard:
-    def __init__(self, catalog):
+    def __init__(self, catalog, history=()):
         self.catalog = catalog
         self.reads = set()
         self.known = {}
+        for turn in history:
+            for call, result in history_tool_pairs(turn):
+                if call["name"] in catalog:
+                    self.observe(call["name"], call["arguments"], result)
+        # Historical reads establish ID provenance, but may be refreshed this turn.
+        self.reads.clear()
 
     def check(self, name, args):
         spec = self.catalog[name]

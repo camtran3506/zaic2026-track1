@@ -57,7 +57,7 @@ def replay_sample(item, catalog, env, split_dir, asr=None, max_tool_details=35,
     observations, examples = [], []
     last_tool = None
     inspected_tool = None
-    guard = CallGuard(enabled)
+    guard = CallGuard(enabled, history)
 
     def example(target, step):
         tools, prompt = build_step_prompt(transcript, context, history, enabled, observations,

@@ -45,7 +45,7 @@ def test_cache_direct_inference_and_sft_preserve_original_text(tmp_path, use_tra
         {'role': 'assistant', 'text': 'ID: light_living; 08:30'},
         {'role': 'user', 'text': RAW},
     ]
-    assert manifest['version'] == 2
+    assert manifest['version'] == 3
     assert 'text_normalization' not in manifest
     # Include both provided train text and missing-text fallback to actual ASR output.
     train_entry = entry if use_train else {k: v for k, v in entry.items() if k != 'audio_text'}
@@ -70,7 +70,8 @@ def test_cache_direct_inference_and_sft_preserve_original_text(tmp_path, use_tra
                         tmp_path, None, 0, float('inf')) == [{'role': 'assistant', 'text': RAW}]
 
 
-def test_old_complete_cache_requires_refresh(tmp_path):
+@pytest.mark.parametrize('old_version', [1, 2])
+def test_old_complete_cache_requires_refresh(tmp_path, old_version):
     (tmp_path / 'current.wav').write_bytes(b'fixture')
     entries = [dict(item(), audio='current.wav')]
     identity = dataset_identity(entries, tmp_path, 'public_test')
@@ -78,7 +79,7 @@ def test_old_complete_cache_requires_refresh(tmp_path):
     prepare_transcripts(entries, tmp_path, cache, identity, {}, RawASR)
     manifest_path = cache_paths(cache)[0]
     manifest = json.loads(manifest_path.read_text())
-    manifest['version'] = 1
+    manifest['version'] = old_version
     manifest_path.write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match='cache format changed'):
         load_transcripts(cache, identity)

@@ -12,9 +12,9 @@ from .agent import _train_transcript, audio_path
 from .history import history_entries as iter_history_entries, resolve_history
 
 LOG = logging.getLogger("lifemate.asr")
-# Version 2 stores source text verbatim. Rebuild version 1 caches so transformed
-# transcripts cannot be reused or mixed into a raw-text run.
-TRANSCRIPT_CACHE_VERSION = 2
+# Version 3 also preserves structured historical tool results for ID provenance.
+# Older caches discarded this evidence and must be rebuilt.
+TRANSCRIPT_CACHE_VERSION = 3
 
 
 def sha256_file(path):

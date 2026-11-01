@@ -28,7 +28,8 @@ QUY TẮC BẮT BUỘC:
   nhưng chưa có schema, xuất {"action":"inspect","name":"app.tool"} để xem schema.
   inspect là thao tác nội bộ, không thực thi tool và không thay đổi trạng thái ứng dụng.
   Sau khi xem schema, dùng action call với arguments đúng schema; không đoán tham số.
-- Với x-ref, trước tiên dùng read tool tương ứng để tìm ID thực; KHÔNG bịa ID.
+- Với x-ref, dùng ID từ kết quả read tool thành công trong history hoặc lượt hiện tại;
+  nếu chưa có thì gọi read tool tương ứng để tìm ID thực; KHÔNG bịa ID.
 - Nếu cần kết hợp nhiều hành động, hoàn tất từng hành động theo thứ tự phụ thuộc.
 - Dùng user context (current_time/timezone/location/profile) và lịch sử để giải quyết tham chiếu.
 - Đừng thay đổi trạng thái ngoài mục tiêu của người dùng; đừng gọi read tools lặp vô ích.
@@ -210,7 +211,7 @@ class LifeMateAgent:
         last_tool: str | None = None
         inspected_tool = None
         inspections = 0
-        guard = CallGuard(enabled)
+        guard = CallGuard(enabled, history)
         while executed < self.cfg.max_calls and invalid < self.cfg.max_invalid:
             if time.monotonic() - t0 > self.cfg.sample_seconds - self.cfg.reserve_seconds:
                 break
