@@ -12,7 +12,7 @@ from .agent import _train_transcript, audio_path
 from .history import history_entries as iter_history_entries, resolve_history
 
 LOG = logging.getLogger("lifemate.asr")
-# Version 3 also preserves structured historical tool results for ID provenance.
+# Version 3 also preserves structured historical tool results for the planner.
 # Older caches discarded this evidence and must be rebuilt.
 TRANSCRIPT_CACHE_VERSION = 3
 

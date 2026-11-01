@@ -9,7 +9,6 @@ import time
 from .agent import (SYSTEM_PROMPT, _train_transcript, audio_path, build_step_prompt,
                     history_text, short_json)
 from .catalog import allowed_tools
-from .guard import CallGuard, GuardError
 from .llm import chat_token_ids
 
 
@@ -57,7 +56,6 @@ def replay_sample(item, catalog, env, split_dir, asr=None, max_tool_details=35,
     observations, examples = [], []
     last_tool = None
     inspected_tool = None
-    guard = CallGuard(enabled, history)
 
     def example(target, step):
         tools, prompt = build_step_prompt(transcript, context, history, enabled, observations,
@@ -83,10 +81,6 @@ def replay_sample(item, catalog, env, split_dir, asr=None, max_tool_details=35,
         validation = env.validate(name, args)
         if not isinstance(validation, dict) or not validation.get("ok"):
             raise ValueError(f"{item['id']} step {step}: gold schema invalid: {validation}")
-        try:
-            guard.check(name, args)
-        except GuardError as exc:
-            raise ValueError(f"{item['id']} step {step}: gold rejected by inference guard: {exc}") from exc
         _, prompt = build_step_prompt(transcript, context, history, enabled, observations,
                                        last_tool, max_tool_details, inspected_tool)
         exposed = {spec["name"] for spec in json.loads(prompt)["available_tools"]["tool_schemas"]}
@@ -103,7 +97,6 @@ def replay_sample(item, catalog, env, split_dir, asr=None, max_tool_details=35,
             result = {"ok": False, "error": repr(exc)}
         observations.append({"name": name, "arguments": args, "result": short_json(result, 4500)})
         last_tool = name
-        guard.observe(name, args, result)
     if not calls or calls[-1]["name"] != "sys.ask_missing_info":
         examples.append(example({"action": "done"}, len(examples)))
     return examples

@@ -1,11 +1,10 @@
-"""History read results must reach both the planner and the execution guard."""
+"""Historical tool results reach the planner in SFT, direct and cached inference."""
 from copy import deepcopy
 import json
 
 import pytest
 
 from lifemate.agent import AgentConfig, LifeMateAgent
-from lifemate.guard import CallGuard, GuardError
 from lifemate.history import prompt_history, resolve_history
 from lifemate.sft import prepare_train_transcript, replay_sample
 from lifemate.transcripts import dataset_identity, load_transcripts, prepare_transcripts
@@ -82,38 +81,27 @@ def test_sft_direct_and_cached_inference_share_history_evidence_without_replayin
         assert inference_env.calls == entry['label']['tool_calls']
 
 
-@pytest.mark.parametrize('mutation', ['failed', 'user', 'mismatch', 'write', 'unknown', 'unrelated'])
-def test_untrusted_or_unrelated_history_cannot_authorize_writes(mutation):
+@pytest.mark.parametrize('mutation', ['user', 'mismatch'])
+def test_unpaired_or_user_tool_metadata_is_not_exposed_as_assistant_results(mutation):
     history = deepcopy(HISTORY)
-    turn = history[0]
-    if mutation == 'failed': turn['tool_results'][0]['ok'] = False
-    elif mutation == 'user': turn['role'] = 'user'
-    elif mutation == 'mismatch': turn['tool_results'].pop()
-    elif mutation == 'write': turn['tool_calls'][0]['name'] = 'chat_ott.send_message'
-    elif mutation == 'unknown': turn['tool_calls'][0]['name'] = 'other.list_chats'
-    else: turn['tool_results'][0] = {'contacts': [{'id': 'chat_918'}]}
-    guard = CallGuard(CATALOG, prompt_history(resolve_history(history, None)))
-    with pytest.raises(GuardError, match='Unread ID'):
-        guard.check('chat_ott.send_message', {'chat_id': 'chat_918'})
+    if mutation == 'user':
+        history[0]['role'] = 'user'
+    else:
+        history[0]['tool_results'].pop()
+    resolved = prompt_history(resolve_history(history, None))
+    assert 'tool_results' not in resolved[0]
 
 
-def test_tool_only_history_survives_and_historical_reads_can_be_refreshed():
+def test_tool_only_history_survives():
     history = deepcopy(HISTORY)
     history[0].pop('text')
     resolved = prompt_history(resolve_history(history, None))
     assert resolved[0]['text'] == ''
-    guard = CallGuard(CATALOG, resolved)
-    guard.check('chat_ott.send_message', {'chat_id': 'chat_918'})
-    guard.check('chat_ott.list_chats', {})
-    guard.observe('chat_ott.list_chats', {}, {'ok': True})
-    with pytest.raises(GuardError, match='Duplicate read'):
-        guard.check('chat_ott.list_chats', {})
-    with pytest.raises(GuardError, match='Unread ID'):
-        guard.check('chat_ott.send_message', {'chat_id': 'invented'})
+    assert resolved[0]['tool_results'] == HISTORY[0]['tool_results']
 
 
-def test_history_outside_prompt_window_does_not_authorize():
+def test_history_prompt_window():
     history = HISTORY + [{'role': 'user', 'text': str(i)} for i in range(12)]
-    guard = CallGuard(CATALOG, prompt_history(resolve_history(history, None)))
-    with pytest.raises(GuardError, match='Unread ID'):
-        guard.check('chat_ott.send_message', {'chat_id': 'chat_918'})
+    resolved = prompt_history(resolve_history(history, None))
+    assert len(resolved) == 12
+    assert all('tool_results' not in turn for turn in resolved)

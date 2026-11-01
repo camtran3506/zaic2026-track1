@@ -3,7 +3,7 @@ from copy import deepcopy
 
 
 def history_tool_pairs(turn):
-    """Only paired structured assistant tool results are provenance evidence."""
+    """Preserve paired structured assistant calls/results for the planner."""
     if turn.get("role", turn.get("speaker")) != "assistant":
         return []
     calls, results = turn.get("tool_calls"), turn.get("tool_results")

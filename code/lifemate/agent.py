@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 from .catalog import allowed_tools, prompt_catalog
-from .guard import CallGuard, GuardError, validated_arguments
 from .history import prompt_history, resolve_history
 
 SYSTEM_PROMPT = """Bạn là AI Agent LifeMate. Chỉ xuất ĐÚNG MỘT JSON object, KHÔNG markdown hoặc diễn giải.
@@ -211,7 +210,6 @@ class LifeMateAgent:
         last_tool: str | None = None
         inspected_tool = None
         inspections = 0
-        guard = CallGuard(enabled, history)
         while executed < self.cfg.max_calls and invalid < self.cfg.max_invalid:
             if time.monotonic() - t0 > self.cfg.sample_seconds - self.cfg.reserve_seconds:
                 break
@@ -252,9 +250,10 @@ class LifeMateAgent:
                     observations.append({"error": "Missing-info tool_name must be another available tool."})
                     continue
             try:
-                args = validated_arguments(env, name, args, enabled[name].get("parameters", {}), context)
-                guard.check(name, args)
-            except (GuardError, ValueError, TypeError) as exc:
+                validation = env.validate(name, args)
+                if not isinstance(validation, dict) or not validation.get("ok"):
+                    raise ValueError(f"Schema invalid: {validation!r}")
+            except Exception as exc:
                 invalid += 1
                 observations.append({"error": str(exc)[:1300], "name": name})
                 continue
@@ -265,7 +264,6 @@ class LifeMateAgent:
                 result = {"ok": False, "error": repr(exc)}
             executed += 1
             last_tool = name
-            guard.observe(name, args, result)
             observations.append({"name": name, "arguments": args, "result": short_json(result, 4500)})
             if name == "sys.ask_missing_info":
                 break

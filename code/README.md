@@ -400,7 +400,6 @@ By default `docker run ... lifemate:baseline` targets **private_test** at `/data
 
 - **Timing**: there is no per-sample timeout by default. A finite `--sample-seconds` applies only to the LLM stage and is cooperative, not a hard interrupt. Offline ASR-precomputation experiments do NOT establish compliance with a competition's end-to-end 30-second rule.
 - `env.validate` catches schema-invalid arguments before they become logged calls; valid but semantically wrong IDs may still be rejected by `env.call`.
-- A pre-execution guard blocks writes whose `x-ref` IDs have not appeared in successful reads from the same app/resource. It is not a full symbolic planner. Long/complex tasks will be imperfect.
 - The model's response is constrained by a JSON-only prompt and strict parser, not constrained decoder. Malformed generations consume retries.
 - No external API or online requests at inference. `state.json` is NEVER read directly.
 - Fine-tuning reads only `train/train.jsonl` labels. Public/private test labels are never used. See the training workflow below.
@@ -408,50 +407,21 @@ By default `docker run ... lifemate:baseline` targets **private_test** at `/data
 - The `zaic_tools` API is integrated strictly according to the prompt-provided interface; if your package exposes different structures, adapt the catalog parsing only after inspecting its *public* API/documentation (never environment files).
 - For stronger models/ASR, replace local checkpoint paths but keep combined parameters <6B and LLM <5B.
 
-### Call guard and argument formats
+### ToolEnv argument validation
 
-Before `env.call`, the agent checks tool availability, argument-object shape,
-`env.validate`, duplicate reads and ID provenance. Already-valid arguments are
-preserved. If validation fails, it tries one schema-directed repair and validates
-the entire repaired call again. No rejected proposal is sent to `env.call`.
+Before `env.call`, the agent checks tool availability and argument-object shape,
+then passes the original arguments directly to `env.validate`. Only a dictionary
+response with `ok` set to true permits execution. Invalid arguments or validation
+exceptions are returned to the model as observations so it can correct its proposal.
+No local type coercion, temporal repair, ID provenance inference, collection alias
+mapping or duplicate-read blocking is applied. ToolEnv decides argument validity;
+`env.call` may still report execution errors, which are also returned to the model.
+Repeated reads remain subject to the existing call/time limits.
 
-Repairs cover nested object/array values, numeric strings to finite numbers or
-integers without rounding, `true`/`false` strings to booleans, numeric values to
-strings, and uniquely matching case-insensitive string enums. Unknown fields are
-not removed, missing arguments are not invented, and composed schemas are not
-guessed. ToolEnv remains the authoritative validator for types, enum, required,
-patterns, bounds and other catalog constraints.
-
-Temporal repairs use declared `format`/`pattern`, not argument names: `9h30` or
-`9 giờ 30` can become `09:30` for an HH:MM pattern, or `09:30:00` for time;
-`31/10/2026` can become `2026-10-31` for date. Ambiguous day/month inputs are not
-changed. ISO datetimes with spaces can become ISO `T` form; naive datetimes gain
-an offset only from an explicit valid context timezone. Missing timezone and
-ambiguous/nonexistent DST times are not guessed. A format rejected by ToolEnv
-is returned to the LLM for correction rather than executed.
-
-ID evidence comes from the complete read result, not truncated prompt text or
-LLM-proposed arguments. Supported `x-ref` values are `app.collection`: the guard
-recognizes `id`/resource-specific ID fields under that collection (including
-nested wrappers), ID lists, and matching resource read tools returning unwrapped
-records. For schemas without `x-ref`, `id`/`*_id`/`*_ids` parameters use a scoped
-fallback. Unknown result layouts or unsupported references block the write;
-adapt the public result mapping for the organizer's schema if needed. IDs from
-other apps/resources, names, and explicitly failed reads do not authorize writes.
-Both inference and SFT initialize ID provenance from successful, enabled read
-tools in the retained assistant history. Historical calls are never executed again,
-and historical reads do not prevent a fresh read in the current turn. Only paired
-structured calls/results are accepted; user text and gold labels do not seed IDs.
-This establishes prior-read provenance, not proof that an ID still exists or is
-the user's intended target.
-
-Duplicate reads compare complete JSON arguments with sorted keys and equivalent
-integral numbers, without truncation. Only successful writes clear the duplicate
-read set. Failed reads may be retried. SFT gold replay uses the same provenance
-and duplicate-read guard and stops with an explicit error on incompatible gold
-trajectories; gold arguments are not silently repaired. Regenerate SFT outputs
-after changing this policy. All reads use public ToolEnv results; no environment
-state files are opened.
+SFT gold replay uses the same `env.validate` acceptance rule and preserves gold
+arguments verbatim. Gold rejected by ToolEnv stops preparation with a schema error.
+Structured historical tool results remain available to the planner in SFT and
+inference; historical calls are not re-executed. No environment state files are read.
 
 ## Fine-tune the LLM for next-tool calling with Unsloth (LoRA / QLoRA)
 
