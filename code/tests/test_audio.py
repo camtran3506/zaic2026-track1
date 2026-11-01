@@ -38,7 +38,7 @@ def test_empty_nonfinite_or_out_of_range_audio_fails(tmp_path, samples):
 
 
 @pytest.mark.parametrize('precision,suffix', [('int8', '.int8.onnx'), ('fp32', '.onnx')])
-def test_onnx_cpu_recognizer_receives_model_files_and_normalizes_cached_text(tmp_path, monkeypatch, precision, suffix):
+def test_onnx_cpu_recognizer_receives_model_files_and_preserves_cached_text(tmp_path, monkeypatch, precision, suffix):
     import sherpa_onnx
     write_models(tmp_path, precision)
     audio = tmp_path / 'speech.wav'
@@ -53,8 +53,8 @@ def test_onnx_cpu_recognizer_receives_model_files_and_normalizes_cached_text(tmp
         return recognizer
     monkeypatch.setattr(sherpa_onnx.OfflineRecognizer, 'from_transducer', create)
     asr = LocalASR(tmp_path, precision=precision, num_threads=2)
-    assert asr.transcribe(audio) == 'bật đèn lúc 08:30'
-    assert asr.transcribe(audio) == 'bật đèn lúc 08:30'
+    assert asr.transcribe(audio) == ' BẬT đèn, lúc 08:30! '
+    assert asr.transcribe(audio) == ' BẬT đèn, lúc 08:30! '
     assert len(accepted) == len(decoded) == 1
     assert accepted[0][0] == 8000 and accepted[0][1].dtype == np.float32
     assert options['provider'] == 'cpu' and options['num_threads'] == 2
@@ -127,7 +127,7 @@ runpy.run_path('main.py', run_name='__main__')
                             env={**os.environ, 'PYTHONDONTWRITEBYTECODE': '1', 'CUDA_VISIBLE_DEVICES': '2'},
                             capture_output=True, text=True, timeout=30)
     assert result.returncode == 0, result.stdout + result.stderr
-    assert json.loads(cache.read_text())['transcript'] == 'bật đèn lúc 08:30'
+    assert json.loads(cache.read_text())['transcript'] == 'BẬT đèn, lúc 08:30!'
     metadata = json.loads(cache.with_suffix('.manifest.json').read_text())['asr']
     assert metadata['repo_id'] == ASR_REPO_ID and metadata['device'] == 'cpu'
     assert metadata['num_threads'] == 2

@@ -8,10 +8,12 @@ import logging
 from pathlib import Path
 import time
 
-from .agent import _train_transcript, audio_path
-from .text import TEXT_NORMALIZATION_VERSION, history_turn_text, normalize_transcript
+from .agent import _train_transcript, audio_path, history_turn_text
 
 LOG = logging.getLogger("lifemate.asr")
+# Version 2 stores source text verbatim. Rebuild version 1 caches so transformed
+# transcripts cannot be reused or mixed into a raw-text run.
+TRANSCRIPT_CACHE_VERSION = 2
 
 
 def sha256_file(path):
@@ -103,10 +105,10 @@ def load_transcripts(path, identity, expected_asr=None):
     path = Path(path)
     manifest_path, _, _ = cache_paths(path)
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
-    if manifest.get("version") != 1 or manifest.get("status") != "complete":
+    if manifest.get("version") != TRANSCRIPT_CACHE_VERSION:
+        raise ValueError("Transcript cache format changed; rebuild with --refresh-transcripts")
+    if manifest.get("status") != "complete":
         raise ValueError("Transcript cache is incomplete; finish the ASR stage first")
-    if manifest.get("text_normalization") != TEXT_NORMALIZATION_VERSION:
-        raise ValueError("Transcript normalization changed; use a new cache or --refresh-transcripts")
     if manifest.get("dataset") != identity:
         raise ValueError("Transcript dataset/audio/selection changed; use a new cache or --refresh-transcripts")
     if expected_asr is not None and manifest.get("asr") != expected_asr:
@@ -127,8 +129,7 @@ def prepare_transcripts(items, split_dir, cache_path, identity, asr_settings, as
         LOG.info("Reusing completed ASR cache: %s (%d samples)", cache_path, len(rows))
         return
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    header = {"version": 1, "dataset": identity, "asr": asr_settings,
-              "text_normalization": TEXT_NORMALIZATION_VERSION}
+    header = {"version": TRANSCRIPT_CACHE_VERSION, "dataset": identity, "asr": asr_settings}
     rows = []
     if partial.exists():
         previous = json.loads(partial_manifest.read_text(encoding="utf-8")) if partial_manifest.exists() else None
@@ -147,7 +148,7 @@ def prepare_transcripts(items, split_dir, cache_path, identity, asr_settings, as
         nonlocal asr
         if asr is None:
             asr = asr_factory()
-        return normalize_transcript(asr.transcribe(audio_path(split_dir, relative)))
+        return asr.transcribe(audio_path(split_dir, relative))
     with partial.open("a", encoding="utf-8") as f:
         for index in range(len(rows), len(items)):
             item = items[index]
@@ -156,7 +157,6 @@ def prepare_transcripts(items, split_dir, cache_path, identity, asr_settings, as
                 transcript = _train_transcript(item) if identity["use_train_transcript"] else None
                 if transcript is None:
                     transcript = transcribe(item["audio"])
-                transcript = normalize_transcript(transcript)
                 history = []
                 for role, text, audio in history_entries(item):
                     if text is None and audio:

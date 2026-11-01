@@ -9,7 +9,6 @@ from pathlib import Path
 from typing import Any
 
 from .catalog import allowed_tools, prompt_catalog
-from .text import history_turn_text, normalize_transcript
 from .guard import CallGuard, GuardError, validated_arguments
 
 SYSTEM_PROMPT = """Bạn là AI Agent LifeMate. Chỉ xuất ĐÚNG MỘT JSON object, KHÔNG markdown hoặc diễn giải.
@@ -115,19 +114,28 @@ def _train_transcript(item: dict) -> str | None:
     """Opt-in, TRAIN ONLY. Never read labels or transcripts from public/private test."""
     txt = item.get("audio_text")
     if isinstance(txt, str):
-        return normalize_transcript(txt)
+        return txt
     if isinstance(txt, dict):
         for key in ("latest", "current", "text", "transcript", "audio_text"):
             if isinstance(txt.get(key), str):
-                return normalize_transcript(txt[key])
+                return txt[key]
     if isinstance(txt, list):
         for entry in reversed(txt):
             if isinstance(entry, str):
-                return normalize_transcript(entry)
+                return entry
             if isinstance(entry, dict):
                 for k in ("audio_text", "text", "transcript", "content"):
                     if isinstance(entry.get(k), str):
-                        return normalize_transcript(entry[k])
+                        return entry[k]
+    return None
+
+
+def history_turn_text(turn: dict) -> str | None:
+    """Select available history text without modifying its contents."""
+    for key in ("audio_text", "text", "content", "transcript"):
+        text = turn.get(key)
+        if isinstance(text, str) and text.strip():
+            return text
     return None
 
 
@@ -150,7 +158,7 @@ def history_text(history: Any, split_dir: Path, asr: Any, start: float, time_lim
         if text is None and role.lower() in ("user", "human"):
             path = turn.get("audio", turn.get("audio_path"))
             if isinstance(path, str) and time.monotonic() - start < time_limit - 5:
-                text = normalize_transcript(asr.transcribe(audio_path(split_dir, path)))
+                text = asr.transcribe(audio_path(split_dir, path))
         if text:
             result.append({"role": role, "text": text[:1700]})
     return result
@@ -206,13 +214,13 @@ class LifeMateAgent:
         if prepared_transcript is not None:
             if prepared_transcript.get("id") != item["id"]:
                 raise ValueError("Prepared transcript ID does not match current sample")
-            transcript = normalize_transcript(prepared_transcript["transcript"])
+            transcript = prepared_transcript["transcript"]
             history = [{"role": turn["role"], "text": turn["text"][:1700]}
                        for turn in prepared_transcript["history"][-12:]]
         else:
             transcript = _train_transcript(item) if self.cfg.use_train_transcript and split == "train" else None
             if transcript is None:
-                transcript = normalize_transcript(self.asr.transcribe(audio_path(split_dir, item["audio"])))
+                transcript = self.asr.transcribe(audio_path(split_dir, item["audio"]))
             history = history_text(item.get("history", []), split_dir, self.asr, t0, self.cfg.sample_seconds)
         observations: list[dict] = []
         invalid = 0

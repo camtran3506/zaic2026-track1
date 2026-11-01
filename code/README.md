@@ -69,8 +69,8 @@ The CPU recognizer uses `OfflineRecognizer.from_transducer`, 16 kHz features,
 80 feature dimensions and greedy decoding. SoundFile decodes PCM to float32,
 channels are averaged to mono, and `accept_waveform` receives the original
 sample rate so sherpa-onnx resamples internally if needed. Empty, nonfinite and
-out-of-range audio is rejected. The resulting text uses the shared transcript
-normalizer before caching. `--asr-threads 4` controls CPU concurrency independently
+out-of-range audio is rejected. The recognizer output is cached verbatim, preserving case, punctuation,
+Unicode representation and whitespace. `--asr-threads 4` controls CPU concurrency independently
 of `--device` / CUDA GPU selection for the LLM.
 
 Example ASR-only run (no LLM weights or Torch/CUDA needed for this stage):
@@ -196,31 +196,18 @@ cache is reused without reloading ASR; use a different cache per ASR variant, or
 detect ordinary replacement; they are not cryptographic hashes of all source audio
 and model weights. Keep the original data and frozen model revisions for reproduction.
 
-### Transcript text normalization
+### Verbatim transcript text
 
-ASR output and TRAIN `audio_text` use `lifemate.text.normalize_transcript` for
-LLM input: Unicode NFC, lowercase, normalize prose punctuation to spaces, collapse
-whitespace and strip the ends. Written numeric expressions retain internal
-separators: `08:30`, `8:05:09`, `29/10/2026`, `2026-10-29`, `3.14`, `1.234,56`,
-`1,234.56`, signed numbers (`-5`, `+2.5`) and percentages (`20%`). Trailing sentence
-punctuation is removed. Vietnamese accents and digits are preserved.
+ASR output, TRAIN `audio_text` and history text are passed through as provided.
+The pipeline does not lowercase, convert Unicode forms, remove punctuation or
+collapse whitespace. For example, ` BẬT đèn, lúc 08:30! ` stays unchanged in the
+cache, LLM prompt and SFT input. Existing history length/token limits still apply.
 
-For example, `BẬT đèn, lúc 08:30 ngày 29/10/2026!` becomes
-`bật đèn lúc 08:30 ngày 29/10/2026`. These rules preserve numeric structure;
-they do not validate dates/times, guess decimal locale, convert spoken numbers,
-or infer missing separators (`08 30` stays `08 30`). Punctuation in other text,
-including email addresses and identifiers, may still be removed.
-
-Normalization runs before transcript caching and before training/inference. It
-also applies to history transcribed from audio, explicit history `audio_text` or
-`transcript`, and user/human history text. Existing assistant/system `text` and
-`content`, tool results and tool arguments are preserved. Full history text is
-still saved before the existing prompt length limits are applied.
-
-Transcript manifests include `text_normalization`; older or incompatible caches
-are rejected, including in LLM-only mode. Rebuild them with `--refresh-transcripts`
-in the ASR/full stage, or choose a new cache path. Regenerate existing SFT datasets
-in a new output directory to use the same normalization for training and inference.
+Transcript caches now use manifest version 2. Rebuild older caches with
+`--refresh-transcripts` in ASR/full mode, or choose a new path. A completed cache
+from the previous text-processing pipeline is rejected, including in LLM-only
+mode; old partial prefixes cannot be mixed into new runs. Regenerate existing
+SFT datasets in a new output directory to train on the original text.
 
 With `--stage full`, the default cache is `<output-stem>.transcripts.jsonl`, and
 stdout/stderr for both stages is saved to `<cache-stem>.asr.log` and

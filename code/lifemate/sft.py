@@ -9,7 +9,6 @@ import time
 from .agent import (SYSTEM_PROMPT, _train_transcript, audio_path, build_step_prompt,
                     history_text, short_json)
 from .catalog import allowed_tools
-from .text import normalize_transcript
 from .guard import CallGuard, GuardError
 
 
@@ -36,7 +35,7 @@ def prepare_train_transcript(item, split_dir, asr=None):
     if transcript is None:
         if asr is None:
             raise ValueError(f"{item['id']}: audio_text missing; pass --asr-model to transcribe train audio")
-        transcript = normalize_transcript(asr.transcribe(audio_path(split_dir, item["audio"])))
+        transcript = asr.transcribe(audio_path(split_dir, item["audio"]))
     class MissingASR:
         def transcribe(self, path):
             raise ValueError("History audio needs --asr-model or a train history transcript")
