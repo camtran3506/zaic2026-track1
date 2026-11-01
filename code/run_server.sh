@@ -15,7 +15,7 @@ SPLIT="${SPLIT:-public_test}"
 # ASR must be a local GIPformer ONNX transducer (encoder/decoder/joiner + tokens.txt).
 ASR_MODEL="${SCRIPT_DIR}/models/asr"
 
-# LLM - Qwen3-4B-Instruct-2507
+# LLM - Qwen3.5-4B
 LLM_MODEL="${SCRIPT_DIR}/models/llm"
 
 # Output

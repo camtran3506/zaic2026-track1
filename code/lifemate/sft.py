@@ -112,8 +112,15 @@ def encode_example(example, tokenizer, max_length):
     messages = example["messages"]
     if [m["role"] for m in messages] != ["system", "user", "assistant"]:
         raise ValueError("SFT expects system/user/assistant messages")
-    prefix = tokenizer.apply_chat_template(messages[:-1], tokenize=True, add_generation_prompt=True)
-    full = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False)
+    prefix = tokenizer.apply_chat_template(messages[:-1], tokenize=True, add_generation_prompt=True,
+                                           **getattr(tokenizer, "lifemate_template_kwargs", {}))
+    full = tokenizer.apply_chat_template(messages, tokenize=True, add_generation_prompt=False,
+                                         **getattr(tokenizer, "lifemate_template_kwargs", {}))
+    # Transformers 5 returns BatchEncoding by default; preserve the token-level mask.
+    if hasattr(prefix, "keys"):
+        prefix = prefix["input_ids"]
+    if hasattr(full, "keys"):
+        full = full["input_ids"]
     if full[:len(prefix)] != prefix or len(full) <= len(prefix):
         raise ValueError("Chat template cannot isolate assistant tokens safely")
     if len(full) > max_length:

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .context import DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_NEW_TOKENS, validate_inference_budget
 from .asr import LocalASR
+from .llm import model_loader, configure_tokenizer
 
 
 class LocalLLM:
@@ -21,6 +22,7 @@ class LocalLLM:
         self.torch = torch
         tokenizer_path = adapter_path if adapter_path and (adapter_path / "tokenizer_config.json").is_file() else model_path
         self.tokenizer = AutoTokenizer.from_pretrained(str(tokenizer_path), local_files_only=True, trust_remote_code=False)
+        configure_tokenizer(self.tokenizer, model_path)
         self.tokenizer.truncation_side = "right"
         torch_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[dtype]
         sharding = {}
@@ -40,7 +42,7 @@ class LocalLLM:
             sharding = {"device_map": "balanced", "max_memory": budgets}
         elif device_map != "single":
             raise ValueError(f"Unknown LLM device map: {device_map}")
-        self.model = AutoModelForCausalLM.from_pretrained(
+        self.model = model_loader(model_path).from_pretrained(
             str(model_path), torch_dtype=torch_dtype,
             local_files_only=True, trust_remote_code=False,
             low_cpu_mem_usage=True,
@@ -85,7 +87,8 @@ class LocalLLM:
         from .decoding import DecisionJsonStoppingCriteria
         tokenizer = self.tokenizer
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-        rendered = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True)
+        rendered = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True,
+                                                 **getattr(tokenizer, "lifemate_template_kwargs", {}))
         encoded = tokenizer(rendered, return_tensors="pt", truncation=False, return_token_type_ids=False)
         if encoded["input_ids"].shape[1] > self.max_input_tokens:
             raise ValueError(f"Prompt exceeds --max-input-tokens={self.max_input_tokens}; "

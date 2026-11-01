@@ -12,12 +12,21 @@ before launching the LLM subprocess. The notebook runs these two stages in separ
 cells/subprocesses. Per-sample time is unlimited by default (`--sample-seconds inf`);
 `max_calls`, `max_invalid`, schema-inspection and token/context limits still apply.
 
-Defaults: `Qwen/Qwen3-4B-Instruct-2507` (~4.0B, Apache-2.0) and `g-group-ai-lab/gipformer1.5-68M-rnnt` (~68M). Total model parameters ~4.07B; LLM <5B. Training and inference share a 16,384-token context limit. Inference defaults to 16,000 prompt tokens + up to 384 generated tokens per decision. Check all model/dependency licenses and freeze revisions before submission. Neither model is fetched at runtime.
+Defaults: `Qwen/Qwen3.5-4B` (~4.0B, Apache-2.0) and `g-group-ai-lab/gipformer1.5-68M-rnnt` (~68M). Total model parameters ~4.07B; LLM <5B. Training and inference share a 16,384-token context limit. Inference defaults to 16,000 prompt tokens + up to 384 generated tokens per decision. Check all model/dependency licenses and freeze revisions before submission. Neither model is fetched at runtime.
+
+Qwen3.5 uses its native conditional-generation checkpoint through
+`AutoModelForImageTextToText`, with text-only prompts. The same loader is used for
+inference, Transformers fine-tuning and adapter merge. The chat template uses
+`enable_thinking=False` consistently in inference and SFT for direct JSON output
+within the existing token budget. Unsloth uses
+`FastVisionModel`; LoRA targets only language attention/MLP projections. Stage
+Qwen3.5 weights in a fresh directory and train a new adapter; Qwen3 adapters
+are incompatible. Other inference and training budgets are unchanged.
 
 ## 1. Install dependencies on the server
 
 `requirements.txt` is the shared dependency list for inference and fine-tuning.
-It includes Unsloth/PEFT and pins Transformers 4.57.3 for the Unsloth stack;
+It includes Unsloth/PEFT and pins Transformers 5.4.0 for the Unsloth stack;
 GIPformer uses `sherpa-onnx` (ONNX Runtime CPU) and `soundfile` for audio decoding.
 Install a compatible PyTorch/CUDA stack for the LLM first; Unsloth training requires a supported GPU. ASR itself runs on CPU and does not import PyTorch.
 
@@ -133,7 +142,7 @@ python main.py \
     --data-root /your/storage/lifemate_data \
     --split public_test \
     --asr-model /your/weights/gipformer1.5-68M-rnnt \
-    --llm-model /your/weights/Qwen3-4B-Instruct-2507 \
+    --llm-model /your/weights/Qwen3.5-4B \
     --output /your/outputs/submission.jsonl \
     --log-path /your/outputs/diagnostics.jsonl \
     --device cuda \
@@ -401,7 +410,8 @@ The training schema is the same as inference: `audio_text`, `context`, `history`
 `done` target; missing labels are errors. Only TRAIN data is accepted by the preparation
 entrypoint. Keep the organizer's train-specific `zaic_tools` next to `train.jsonl`.
 
-The default training backend is **Unsloth** (`FastLanguageModel`), imported before
+The default training backend is **Unsloth** (`FastVisionModel` for Qwen3.5 with
+vision layers frozen and text-only LoRA), imported before
 Transformers/PEFT in the training process. It uses Unsloth gradient checkpointing,
 unquantized LoRA and optimized LoRA kernels (dropout=0). The defaults are
 `--quantization none --max-length 16384 --batch-size 1`.
@@ -417,7 +427,7 @@ python -m pip install -r requirements.txt
 # A local model path works fully offline. A HF ID downloads the resolved revision first.
 python finetune.py \
   --data-root /path/to/lifemate_data \
-  --base-model Qwen/Qwen3-4B-Instruct-2507 \
+  --base-model Qwen/Qwen3.5-4B \
   --output-dir /path/to/runs/toolcalling_v1 \
   --backend unsloth --epochs 3 --quantization none --max-length 16384 \
   --batch-size 1 --gradient-accumulation 8 --learning-rate 2e-4
@@ -567,7 +577,7 @@ later inference; keep both merged LLM and ASR inside the final offline image.
 The standalone Kaggle notebook in `../notebooks/LifeMate_Kaggle.ipynb` includes
 these training scripts and can train first, then pass the saved adapter into inference.
 `TRAIN_LLM=True` and `TRAIN_BACKEND="unsloth"` are the notebook defaults. Dependencies
-pin Unsloth 2025.12.10, unsloth-zoo 2025.12.8 and compatible Transformers 4.57.3;
+pin Unsloth 2026.10.11, unsloth-zoo 2026.10.11 and compatible Transformers 5.4.0;
 the notebook constrains Kaggle's existing Torch/Torchvision/Triton stack during pip
 resolution. If that stack is incompatible, installation stops with the resolver's
 error rather than replacing CUDA packages silently. Full Unsloth GPU training still

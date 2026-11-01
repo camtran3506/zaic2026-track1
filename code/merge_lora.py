@@ -2,6 +2,7 @@
 """Export a local LoRA adapter as a standalone offline model (no bitsandbytes)."""
 import argparse
 from pathlib import Path
+from lifemate.llm import model_loader
 
 
 def main():
@@ -18,7 +19,7 @@ def main():
     import torch
     from transformers import AutoModelForCausalLM, AutoTokenizer
     from peft import PeftModel
-    model = AutoModelForCausalLM.from_pretrained(str(args.base_model),
+    model = model_loader(args.base_model).from_pretrained(str(args.base_model),
         torch_dtype=getattr(torch, args.dtype), device_map="cpu", local_files_only=True,
         trust_remote_code=False, low_cpu_mem_usage=True)
     model = PeftModel.from_pretrained(model, str(args.adapter), local_files_only=True)

@@ -5,7 +5,7 @@ from pathlib import Path
 from huggingface_hub import snapshot_download
 
 MODELS = {
-    "llm": "Qwen/Qwen3-4B-Instruct-2507",
+    "llm": "Qwen/Qwen3.5-4B",
     "asr": "g-group-ai-lab/gipformer1.5-68M-rnnt",
 }
 

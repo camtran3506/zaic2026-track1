@@ -9,6 +9,7 @@ from pathlib import Path
 from lifemate.sft import AssistantCollator, SupervisedDataset, file_sha256
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
 from lifemate.context import MAX_CONTEXT_TOKENS, validate_training_length
+from lifemate.llm import is_qwen35, model_loader, lora_targets, configure_tokenizer
 
 
 def main():
@@ -40,7 +41,9 @@ def main():
     FastLanguageModel = None
     if args.backend == "unsloth":
         try:
-            from unsloth import FastLanguageModel
+            from unsloth import FastLanguageModel, FastVisionModel
+            if is_qwen35(args.base_model):
+                FastLanguageModel = FastVisionModel
         except ImportError as exc:
             raise RuntimeError("Install requirements.txt in a supported CUDA environment for Unsloth") from exc
     import torch
@@ -69,10 +72,15 @@ def main():
             model_name=str(args.base_model.resolve()), max_seq_length=args.max_length,
             dtype=dtype, load_in_4bit=args.quantization == "4bit",
             local_files_only=True, trust_remote_code=False,
-            use_exact_model_name=True, fast_inference=False,
+            fast_inference=False,
+            **({"auto_model": model_loader(args.base_model)} if is_qwen35(args.base_model)
+               else {"use_exact_model_name": True}),
         )
     else:
         tokenizer = AutoTokenizer.from_pretrained(str(args.base_model), local_files_only=True, trust_remote_code=False)
+    if is_qwen35(args.base_model):
+        tokenizer = AutoTokenizer.from_pretrained(str(args.base_model), local_files_only=True, trust_remote_code=False)
+    configure_tokenizer(tokenizer, args.base_model)
     if tokenizer.pad_token_id is None:
         tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
@@ -113,12 +121,13 @@ def main():
     # Save before training so interrupted runs can still be resumed safely.
     config_path = args.output_dir / "training_config.json"
     config_path.write_text(json.dumps(run_config, ensure_ascii=False, indent=2), encoding="utf-8")
-    targets = ["q_proj", "k_proj", "v_proj", "o_proj", "gate_proj", "up_proj", "down_proj"]
+    targets = lora_targets(args.base_model)
     if args.backend == "unsloth":
         model = FastLanguageModel.get_peft_model(model, r=args.lora_r, lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout, bias="none", target_modules=targets,
             use_gradient_checkpointing="unsloth", random_state=args.seed,
-            use_rslora=False, loftq_config=None)
+            use_rslora=False, loftq_config=None,
+            **({"finetune_vision_layers": False} if is_qwen35(args.base_model) else {}))
     else:
         kwargs = dict(local_files_only=True, trust_remote_code=False, torch_dtype=dtype,
                       attn_implementation="sdpa")
@@ -126,13 +135,15 @@ def main():
             kwargs.update(quantization_config=BitsAndBytesConfig(load_in_4bit=True,
                 bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
                 bnb_4bit_compute_dtype=dtype), device_map={"": int(os.environ.get("LOCAL_RANK", 0))})
-        model = AutoModelForCausalLM.from_pretrained(str(args.base_model), **kwargs)
+        model = model_loader(args.base_model).from_pretrained(str(args.base_model), **kwargs)
         if args.quantization == "4bit":
             model = prepare_model_for_kbit_training(model, gradient_checkpointing_kwargs={"use_reentrant": False})
         config = LoraConfig(r=args.lora_r, lora_alpha=args.lora_alpha,
             lora_dropout=args.lora_dropout, bias="none", task_type="CAUSAL_LM", target_modules=targets)
         model = get_peft_model(model, config)
     model.config.use_cache = False
+    if hasattr(model.config, "text_config"):
+        model.config.text_config.use_cache = False
     model.print_trainable_parameters()
     training_args = TrainingArguments(output_dir=str(args.output_dir),
         num_train_epochs=args.epochs, max_steps=args.max_steps,

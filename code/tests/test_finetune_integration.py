@@ -26,7 +26,8 @@ def test_lora_accepts_modern_torchao_api(monkeypatch):
     assert any('lora_B' in name for name, _ in model.named_parameters())
 
 
-def test_train_adapter_reload_and_merge(tmp_path):
+@pytest.mark.parametrize('architecture', ['qwen3', 'qwen3_5'])
+def test_train_adapter_reload_and_merge(tmp_path, architecture):
     torch = pytest.importorskip('torch')
     pytest.importorskip('peft')
     from transformers import Qwen3Config, Qwen3ForCausalLM, PreTrainedTokenizerFast, AutoModelForCausalLM
@@ -46,6 +47,17 @@ def test_train_adapter_reload_and_merge(tmp_path):
     model = Qwen3ForCausalLM(Qwen3Config(vocab_size=len(tokenizer), hidden_size=16,
         intermediate_size=32, num_hidden_layers=1, num_attention_heads=2, num_key_value_heads=1,
         head_dim=8, max_position_embeddings=4096, eos_token_id=2, pad_token_id=1))
+    if architecture == 'qwen3_5':
+        from transformers import Qwen3_5Config, Qwen3_5ForConditionalGeneration
+        model = Qwen3_5ForConditionalGeneration(Qwen3_5Config(
+            text_config=dict(vocab_size=len(tokenizer), hidden_size=16, intermediate_size=32,
+                num_hidden_layers=2, num_attention_heads=2, num_key_value_heads=1, head_dim=8,
+                layer_types=['linear_attention', 'full_attention'], linear_num_key_heads=1,
+                linear_num_value_heads=2, linear_key_head_dim=8, linear_value_head_dim=8, max_position_embeddings=4096, eos_token_id=2, pad_token_id=1),
+            vision_config=dict(depth=1, hidden_size=16, intermediate_size=32, num_heads=2,
+                out_hidden_size=16, patch_size=2, spatial_merge_size=1, temporal_patch_size=1,
+                num_position_embeddings=16),
+            image_token_id=100, video_token_id=101, vision_start_token_id=102, vision_end_token_id=103))
     model.save_pretrained(base)
     data = tmp_path / 'data' / 'train'
     data.mkdir(parents=True)
@@ -86,6 +98,8 @@ def test_train_adapter_reload_and_merge(tmp_path):
     assert (adapter / 'adapter_model.safetensors').is_file()
     from safetensors.torch import load_file
     weights = load_file(str(adapter / 'adapter_model.safetensors'))
+    if architecture == 'qwen3_5':
+        assert all('visual' not in name and 'language_model' in name for name in weights)
     # The selected first checkpoint may precede nonzero LR during warmup when
     # all rollout scores tie at zero. Training must still have updated LoRA.
     latest_weights = load_file(str(run / 'training/checkpoint-2/adapter_model.safetensors'))
@@ -102,7 +116,8 @@ def test_train_adapter_reload_and_merge(tmp_path):
     assert config['best_state_tool_score'] == trainer_state['best_metric']
     assert (run / 'training/validation_scores.jsonl').is_file()
     llm = LocalLLM(base, device='cpu', dtype='float32', adapter_path=adapter, max_new_tokens=2)
-    merged = AutoModelForCausalLM.from_pretrained(run / 'merged', local_files_only=True, torch_dtype=torch.float32)
+    from lifemate.llm import model_loader
+    merged = model_loader(run / "merged").from_pretrained(run / 'merged', local_files_only=True, torch_dtype=torch.float32)
     llm.model.eval()
     merged.eval()
     with torch.no_grad():
