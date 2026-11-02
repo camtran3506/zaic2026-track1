@@ -265,11 +265,24 @@ def test_eval_writes_sample_diagnostics_summary_and_metrics_without_extra_calls(
     assert len(instances) == before + 1
     assert len(instances[-1].calls) == sum(isinstance(d, dict) and d['action'] == 'call' for d in outputs)
     report = json.loads(report_path.read_text())
+    trace_path = report_path.with_suffix('.trace.jsonl')
+    assert report['trace_file'] == trace_path.name
+    assert not report_path.with_suffix('.trace.partial.jsonl').exists()
+    events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+    assert [e['event_index'] for e in events] == list(range(1, len(events) + 1))
+    assert {e['sample_id'] for e in events} == {report['id']}
+    assert events[0]['event'] == 'sample_start' and events[-1]['event'] == 'sample_end'
+    assert events[-1]['tool_calls'] == report['tool_calls']
+    assert len([e for e in events if e['event'] == 'llm_start']) == llm.count
+    assert len([e for e in events if e['event'] == 'llm_output']) == llm.count
+    assert len([e for e in events if e['event'] == 'call_result']) == len(instances[-1].calls)
+    assert len([e for e in events if e['event'] == 'validate_result']) == len(instances[-1].calls)
     diagnostic = report['diagnostics']
     assert set(diagnostic['error_types']) == expected_errors
     assert diagnostic['stop_reason'] == report['agent_stats']['stop_reason'] == stop_reason
     assert report['gold_tool_calls'] == evaluator.rows[0]['gold_tool_calls']
     summary = json.loads(report_path.with_suffix('.diagnostics.json').read_text())
+    assert summary['trace_file'] == trace_path.name
     assert summary['samples'] == metrics['eval_rollout_samples'] == 1
     assert summary['metrics'] == metrics
     assert summary['stop_reasons'][stop_reason] == 1
@@ -282,11 +295,17 @@ def test_eval_writes_sample_diagnostics_summary_and_metrics_without_extra_calls(
     assert all(isinstance(value, (int, float)) for value in metrics.values())
 
 
-def test_failed_eval_does_not_publish_completed_reports(prepared, tmp_path):
+@pytest.mark.parametrize('fail_after_call', [False, True])
+def test_failed_eval_does_not_publish_completed_reports(prepared, tmp_path, fail_after_call):
     out, _, _, _ = prepared
     evaluator = StateToolEvaluator(out, json.loads((out / 'manifest.json').read_text()))
     class LLM:
-        def generate(self, system, user): raise RuntimeError('model failure')
+        count = 0
+        def generate(self, system, user):
+            self.count += 1
+            if fail_after_call and self.count == 1:
+                return '{"action":"call","name":"smart_home.get_status","arguments":{}}'
+            raise RuntimeError('model failure')
     report_path = tmp_path / 'failed.jsonl'
     try:
         with pytest.raises(RuntimeError, match='model failure'):
@@ -296,3 +315,12 @@ def test_failed_eval_does_not_publish_completed_reports(prepared, tmp_path):
     assert report_path.with_suffix('.partial.jsonl').exists()
     assert not report_path.exists()
     assert not report_path.with_suffix('.diagnostics.json').exists()
+    assert not report_path.with_suffix('.trace.jsonl').exists()
+    partial_trace = report_path.with_suffix('.trace.partial.jsonl')
+    events = [json.loads(line) for line in partial_trace.read_text().splitlines()]
+    assert events[-2]['event'] == 'llm_error' and events[-1]['event'] == 'sample_error'
+    assert events[-1]['exception']['message'] == 'model failure'
+    results = [e for e in events if e['event'] == 'call_result']
+    assert len(results) == int(fail_after_call)
+    if fail_after_call:
+        assert results[0]['result']['devices'][0]['id'] == 'light_living'

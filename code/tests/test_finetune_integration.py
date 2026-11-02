@@ -125,6 +125,14 @@ def test_train_adapter_reload_and_merge(tmp_path, architecture):
     trainer_state = json.loads((run / 'training/trainer_state.json').read_text())
     assert config['best_state_tool_score'] == trainer_state['best_metric']
     assert (run / 'training/validation_scores.jsonl').is_file()
+    attempts = [json.loads(line) for line in (run / 'training/validation_scores.jsonl').read_text().splitlines()]
+    assert attempts
+    for attempt in attempts:
+        trace_path = Path(attempt['trace'])
+        assert trace_path.is_file()
+        events = [json.loads(line) for line in trace_path.read_text().splitlines()]
+        assert events[0]['event'] == 'sample_start' and events[-1]['event'] == 'sample_end'
+        assert any(event['event'] == 'llm_output' for event in events)
     llm = LocalLLM(base, device='cpu', dtype='float32', adapter_path=adapter, max_new_tokens=2)
     merged_runtime = json.loads((run / 'merged/lifemate_runtime.json').read_text())
     assert merged_runtime['generation'] == runtime['generation']

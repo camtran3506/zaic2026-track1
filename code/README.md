@@ -641,12 +641,13 @@ resumed with the new selection settings.
 
 ### Validation error diagnostics
 
-Each held-out TRAIN evaluation automatically writes two files under
+Each held-out TRAIN evaluation automatically writes reports under
 `training/validation_rollouts/`: `<run>.jsonl` contains per-sample predictions,
 gold calls/hashes, `agent_stats.stop_reason`, transcript source and `diagnostics`;
 `<run>.diagnostics.json` contains aggregate counts, rates and the same numeric
 metrics returned to Trainer. `validation_scores.jsonl` links both files. The
-notebook exports completed reports to Output alongside other training artifacts.
+notebook exports completed reports and partial debug traces to Output alongside
+other training artifacts.
 
 Analysis happens **after** the rollout. It does not add model generations, tokens
 or tool calls, does not put gold/diagnostics into prompts, and does not access
@@ -692,6 +693,45 @@ Unexpected evaluation failures still abort the run and leave `.partial` output;
 completed JSONL/summary files are promoted only after every held-out sample has
 been evaluated. This module classifies discrepancies against gold, not their
 cause: ASR mistakes or the first reasoning error require inspection of the sample.
+
+### Automatic per-step eval debug trace
+
+Every validation evaluation also writes `<run>.trace.jsonl` beside its rollout
+report under `training/validation_rollouts/`. No flag is required. The rollout
+rows and diagnostics summary contain `trace_file`; `validation_scores.jsonl`
+links the full `trace` path for each evaluation attempt/epoch/checkpoint.
+
+Each JSONL event has `version`, a run-wide one-based `event_index`, `sample_id`
+and elapsed seconds since the evaluation started. Agent events also have a
+one-based `step` identifying the LLM turn (zero when no generation occurred).
+Execution events include a zero-based `call_index` for the execution attempt.
+
+| Event | Saved data |
+| --- | --- |
+| `sample_start` | Sample ID, selected transcript and transcript source. |
+| `llm_start` | Complete system/user request passed to `LocalLLM.generate`. For native FC this is the portable input, before checkpoint-template rendering. |
+| `llm_output` | Exact output returned by the model wrapper, including native XML call delimiters. |
+| `decision_parsed` | Parsed action, tool name and arguments. |
+| `decision_rejected` | Parse/precheck/validation rejection stage and error feedback. |
+| `validate_start` / `validate_result` | Proposed tool/arguments, original validator return value and whether the agent accepted it. |
+| `call_start` / `call_result` | Executed tool/arguments and complete original return value, including `ok: false` returns. |
+| `llm_error`, `validate_error`, `call_error` | Exception type, message and repr. A call exception also includes `agent_result`, the synthesized error sent back to the planner. |
+| `stop` / `sample_end` | Stop reason, counters and final official calls/state hash. |
+| `sample_error` | Unexpected sample failure; evaluation still aborts instead of treating it as a completed sample. |
+
+Events are written and flushed immediately. During evaluation the filename is
+`<run>.trace.partial.jsonl`; a successful full evaluation promotes it to
+`<run>.trace.jsonl`. If a model/runtime failure occurs after tool execution, the
+partial trace retains those results and the failing stage. The notebook also
+exports these explicitly named partial traces; console logs report their path.
+
+Tracing is enabled only by the evaluator. Normal inference has no trace sink by
+default. It does not repeat `validate` or `call`, create a second ToolEnv, read
+application state files, change prompts/retry budgets or add model generations.
+Logged arguments/results are not text-normalized or truncated. The trace stores
+full prompts/results and can be large; it is local debug output, not a substitute
+for the official ToolEnv call log or part of the submission. No cached SFT/model
+format changes are needed for this logging feature.
 
 ### Run the main task with the fine-tuned adapter
 

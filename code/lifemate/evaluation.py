@@ -10,6 +10,7 @@ import sys
 from .agent import AgentConfig, LifeMateAgent
 from .catalog import load_catalog
 from .eval_diagnostics import DiagnosticSummary, analyze_rollout
+from .eval_trace import EvalTraceWriter, exception_details
 from .scoring import call_f1, state_tool_score
 from .sft import file_sha256, validate_prompt_policy
 
@@ -54,33 +55,47 @@ class StateToolEvaluator:
         diagnostics = DiagnosticSummary()
         agent = LifeMateAgent(None, llm, self.catalog, self.config)
         partial = output_path.with_suffix(".partial.jsonl")
-        with partial.open("w", encoding="utf-8") as output:
+        trace_path = output_path.with_suffix(".trace.jsonl")
+        trace_partial = output_path.with_suffix(".trace.partial.jsonl")
+        logging.info("Validation debug trace (in progress): %s", trace_partial)
+        with partial.open("w", encoding="utf-8") as output, trace_partial.open("w", encoding="utf-8") as trace_stream:
+            trace = EvalTraceWriter(trace_stream)
             for row in self.rows:
                 # Golds are used only below for scoring, never passed into the agent.
                 item = copy.deepcopy(row["item"])
                 item.pop("label", None)
-                env = self.tool_env("train", item["id"], root=str(self.env_root))
-                stats = agent.run(item, env, self.split_dir, "train",
-                                  prepared_transcript=copy.deepcopy(row["prepared_transcript"]))
-                calls, state_hash = env.get_tool_calls(), env.get_state_hash()
-                if not isinstance(calls, list) or not isinstance(state_hash, str) or not state_hash:
-                    raise ValueError(f"{item['id']}: invalid ToolEnv call log/state hash")
-                score = state_tool_score(calls, row["gold_tool_calls"], state_hash,
-                                         row["gold_state_hash"], self.catalog)
-                f1, _ = call_f1(calls, row["gold_tool_calls"], self.catalog)
-                diagnostic = analyze_rollout(calls, row["gold_tool_calls"], state_hash,
-                    row["gold_state_hash"], self.catalog, stats.get("stop_reason", "unknown"))
                 source = row["prepared_transcript"].get("transcript_source", "unknown")
-                diagnostics.add(diagnostic, source)
-                scores.append(score)
-                f1s.append(f1)
-                hashes.append(state_hash == row["gold_state_hash"])
-                output.write(json.dumps({"id": item["id"], "tool_calls": calls,
-                    "state_hash": state_hash, "gold_state_hash": row["gold_state_hash"],
-                    "gold_tool_calls": row["gold_tool_calls"], "transcript_source": source,
-                    "score": score, "tool_call_f1": f1, "agent_stats": stats,
-                    "diagnostics": diagnostic}, ensure_ascii=False) + "\n")
-                output.flush()
+                emit = trace.for_sample(item["id"])
+                emit({"event": "sample_start", "transcript_source": source,
+                      "request_transcript": row["prepared_transcript"]["transcript"]})
+                try:
+                    env = self.tool_env("train", item["id"], root=str(self.env_root))
+                    stats = agent.run(item, env, self.split_dir, "train",
+                        prepared_transcript=copy.deepcopy(row["prepared_transcript"]), trace=emit)
+                    calls, state_hash = env.get_tool_calls(), env.get_state_hash()
+                    if not isinstance(calls, list) or not isinstance(state_hash, str) or not state_hash:
+                        raise ValueError(f"{item['id']}: invalid ToolEnv call log/state hash")
+                    score = state_tool_score(calls, row["gold_tool_calls"], state_hash,
+                                             row["gold_state_hash"], self.catalog)
+                    f1, _ = call_f1(calls, row["gold_tool_calls"], self.catalog)
+                    diagnostic = analyze_rollout(calls, row["gold_tool_calls"], state_hash,
+                        row["gold_state_hash"], self.catalog, stats.get("stop_reason", "unknown"))
+                    diagnostics.add(diagnostic, source)
+                    scores.append(score)
+                    f1s.append(f1)
+                    hashes.append(state_hash == row["gold_state_hash"])
+                    output.write(json.dumps({"id": item["id"], "tool_calls": calls,
+                        "state_hash": state_hash, "gold_state_hash": row["gold_state_hash"],
+                        "gold_tool_calls": row["gold_tool_calls"], "transcript_source": source,
+                        "score": score, "tool_call_f1": f1, "agent_stats": stats,
+                        "trace_file": trace_path.name, "diagnostics": diagnostic}, ensure_ascii=False) + "\n")
+                    output.flush()
+                    emit({"event": "sample_end", "agent_stats": stats, "tool_calls": calls,
+                          "state_hash": state_hash})
+                except Exception as exc:
+                    emit({"event": "sample_error", "exception": exception_details(exc)})
+                    logging.exception("Validation sample %s failed; partial trace: %s", item["id"], trace_partial)
+                    raise
                 logging.info("Validation rollout %d/%d %s: score %.4f, hash_match=%s",
                              len(scores), len(self.rows), item["id"], score, hashes[-1])
         n = len(scores)
@@ -90,10 +105,13 @@ class StateToolEvaluator:
                 "eval_rollout_samples": n, **diagnostics.metrics()}
         summary_path = output_path.with_suffix(".diagnostics.json")
         summary_partial = summary_path.with_suffix(".partial.json")
-        summary_partial.write_text(json.dumps({**diagnostics.as_dict(), "metrics": metrics},
+        summary_partial.write_text(json.dumps({**diagnostics.as_dict(), "metrics": metrics,
+                                              "trace_file": trace_path.name},
                                               ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
         partial.replace(output_path)
+        trace_partial.replace(trace_path)
         summary_partial.replace(summary_path)
+        logging.info("Validation debug trace saved: %s", trace_path)
         return metrics
 
 
@@ -147,6 +165,7 @@ def score_callback(evaluator, tokenizer, output_dir, fast_language_model=None):
             with (output_dir / "validation_scores.jsonl").open("a", encoding="utf-8") as log:
                 log.write(json.dumps({"step": state.global_step, "epoch": state.epoch,
                     "rollouts": str(path), "diagnostics": str(path.with_suffix(".diagnostics.json")),
+                    "trace": str(path.with_suffix(".trace.jsonl")),
                     **result}) + "\n")
             logging.info("Validation state/tool score: %.4f/100", result["eval_state_tool_score"])
             return control

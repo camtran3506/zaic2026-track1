@@ -8,6 +8,7 @@ from pathlib import Path
 from typing import Any
 
 from .catalog import allowed_tools, prompt_catalog
+from .eval_trace import exception_details
 from .history import prompt_history, resolve_history
 from .text import normalize_transcript
 
@@ -137,12 +138,18 @@ class LifeMateAgent:
         self.cfg = cfg
 
     def run(self, item: dict, env: Any, split_dir: Path, split: str,
-            prepared_transcript: dict | None = None) -> dict:
+            prepared_transcript: dict | None = None, *, trace=None) -> dict:
         """env is created exactly once by caller; never instantiate another here."""
         t0 = time.monotonic()
+        step = 0
+        def emit(event, **data):
+            if trace is not None:
+                trace({"event": event, "step": step, **data})
+
         context = item.get("context", {})
         enabled = allowed_tools(self.catalog, context.get("installed_apps", {}))
         if len(enabled) == 1:  # only sys.ask_missing_info; no app can act
+            emit("stop", reason="no_available_tools", executed=0, invalid_proposals=0)
             return {"transcript": normalize_transcript(prepared_transcript["transcript"]) if prepared_transcript else "",
                     "elapsed_seconds": 0, "executed": 0, "invalid_proposals": 0,
                     "stop_reason": "no_available_tools"}
@@ -161,49 +168,69 @@ class LifeMateAgent:
         invalid = 0
         executed = 0
         stop_reason = None
+
+        def reject(error, stage, **feedback):
+            nonlocal invalid
+            invalid += 1
+            observations.append({"error": error, **feedback})
+            emit("decision_rejected", stage=stage, error=error)
+
         while executed < self.cfg.max_calls and invalid < self.cfg.max_invalid:
             if time.monotonic() - t0 > self.cfg.sample_seconds - self.cfg.reserve_seconds:
                 stop_reason = "time_limit"
                 break
             tools, user_prompt = build_step_prompt(
                 transcript, context, history, enabled, observations)
-            raw = self.llm.generate(SYSTEM_PROMPT, user_prompt)
+            step += 1
+            emit("llm_start", request={"system": SYSTEM_PROMPT, "user": user_prompt})
+            try:
+                raw = self.llm.generate(SYSTEM_PROMPT, user_prompt)
+            except Exception as exc:
+                emit("llm_error", exception=exception_details(exc))
+                raise
+            emit("llm_output", output=raw)
             try:
                 decision = parse_decision(raw, enabled)
             except ValueError as exc:
-                invalid += 1
-                observations.append({"error": str(exc), "instruction": "Trả về JSON hợp lệ."})
+                reject(str(exc), "parse", instruction="Trả về JSON hợp lệ.")
                 continue
+            emit("decision_parsed", decision=decision)
             if decision["action"] == "done":
                 stop_reason = "done"
                 break
             name, args = decision.get("name"), decision.get("arguments")
             if not isinstance(name, str) or name not in enabled or name not in {x["name"] for x in tools["tool_schemas"]}:
-                invalid += 1
-                observations.append({"error": f"Tool {name!r} not exposed in tool_schemas; choose only from listed schemas."})
+                reject(f"Tool {name!r} not exposed in tool_schemas; choose only from listed schemas.", "precheck")
                 continue
             if not isinstance(args, dict):
-                invalid += 1
-                observations.append({"error": "arguments must be a JSON object"})
+                reject("arguments must be a JSON object", "precheck")
                 continue
             if name == "sys.ask_missing_info":
                 if args.get("tool_name") not in enabled or args.get("tool_name") == name:
-                    invalid += 1
-                    observations.append({"error": "Missing-info tool_name must be another available tool."})
+                    reject("Missing-info tool_name must be another available tool.", "precheck")
                     continue
+            emit("validate_start", name=name, arguments=args)
             try:
                 validation = env.validate(name, args)
-                if not isinstance(validation, dict) or not validation.get("ok"):
-                    raise ValueError(f"Schema invalid: {validation!r}")
             except Exception as exc:
-                invalid += 1
-                observations.append({"error": str(exc), "name": name})
+                emit("validate_error", name=name, arguments=args, exception=exception_details(exc))
+                reject(str(exc), "validate", name=name)
+                continue
+            accepted = isinstance(validation, dict) and bool(validation.get("ok"))
+            emit("validate_result", name=name, arguments=args, result=validation, accepted=accepted)
+            if not accepted:
+                reject(f"Schema invalid: {validation!r}", "validate", name=name)
                 continue
             # This is the *only* place execution takes place. Calls that fail are logged by ToolEnv.
+            emit("call_start", name=name, arguments=args, call_index=executed)
             try:
                 result = env.call(name, args)
             except Exception as exc:
                 result = {"ok": False, "error": repr(exc)}
+                emit("call_error", name=name, arguments=args, call_index=executed,
+                     exception=exception_details(exc), agent_result=result)
+            else:
+                emit("call_result", name=name, arguments=args, call_index=executed, result=result)
             executed += 1
             observations.append({"name": name, "arguments": args, "result": full_json(result)})
             if name == "sys.ask_missing_info":
@@ -211,6 +238,7 @@ class LifeMateAgent:
                 break
         if stop_reason is None:
             stop_reason = "max_calls" if executed >= self.cfg.max_calls else "max_invalid"
+        emit("stop", reason=stop_reason, executed=executed, invalid_proposals=invalid)
         return {"transcript": transcript, "elapsed_seconds": round(time.monotonic() - t0, 3),
                 "executed": executed, "invalid_proposals": invalid,
                 "stop_reason": stop_reason}
