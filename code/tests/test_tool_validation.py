@@ -93,6 +93,14 @@ def test_full_rejected_arguments_and_validation_reach_next_native_planning_step(
                 assert feedback['name'] == 'smart_home.light_set'
                 assert feedback['arguments'] == proposed
                 assert feedback['validation'] == validation
+            if self.count == 3:
+                observations = json.loads(user)['previous_actions_and_results']
+                assert len(observations) == 1
+                assert observations[0]['arguments'] == corrected
+                assert json.loads(observations[0]['result'])['ok'] is True
+                chat, _ = native_chat([{'role': 'system', 'content': system},
+                                      {'role': 'user', 'content': user}])
+                assert not any('agent_feedback' in turn.get('content', '') for turn in chat)
             return (json.dumps({'action': 'call', 'name': 'smart_home.light_set',
                                 'arguments': proposed if self.count == 1 else corrected})
                     if self.count < 3 else '{"action":"done"}')
@@ -102,6 +110,46 @@ def test_full_rejected_arguments_and_validation_reach_next_native_planning_step(
     assert report['invalid_proposals'] == 1 and report['executed'] == 1
     assert env.validations == [proposed, corrected]
     assert env.calls == [{'name': 'smart_home.light_set', 'arguments': corrected}]
+
+
+@pytest.mark.parametrize('outcome', ['ok', 'error_return', 'exception'])
+def test_rejection_expires_after_execution_but_call_failure_remains_visible(outcome):
+    proposed = {'device_id': 'wrong_id', 'power': 'on'}
+    corrected = {'device_id': 'Device_A', 'power': 'on'}
+    result = ({'ok': True} if outcome == 'ok' else
+              {'ok': False, 'error': 'Call failed'} if outcome == 'error_return' else
+              {'ok': False, 'error': "RuntimeError('Call failed')"})
+    class Env(FakeEnv):
+        def validate(self, name, args):
+            return {'ok': args == corrected, 'error': 'Wrong ID' if args == proposed else None}
+        def call(self, name, args):
+            self.calls.append({'name': name, 'arguments': deepcopy(args)})
+            if outcome == 'exception':
+                raise RuntimeError('Call failed')
+            return result
+    class LLM:
+        count = 0
+        def generate(self, system, user):
+            self.count += 1
+            if self.count == 2:
+                assert rejection_feedback(system, user)['arguments'] == proposed
+            if self.count == 3:
+                assert json.loads(user)['previous_actions_and_results'] == [{
+                    'name': 'smart_home.light_set', 'arguments': corrected,
+                    'result': json.dumps(result, ensure_ascii=False, separators=(',', ':'))}]
+                chat, _ = native_chat([{'role': 'system', 'content': system},
+                                      {'role': 'user', 'content': user}])
+                assert chat[-2]['tool_calls'][0]['function']['arguments'] == corrected
+                assert chat[-1]['role'] == 'tool' and json.loads(chat[-1]['content']) == result
+                assert not any('agent_feedback' in turn.get('content', '') for turn in chat)
+                return '{"action":"done"}'
+            return json.dumps({'action': 'call', 'name': 'smart_home.light_set',
+                               'arguments': proposed if self.count == 1 else corrected})
+    env = Env()
+    report = LifeMateAgent(StubASR(), LLM(), CATALOG, AgentConfig()).run(
+        item(), env, Path('/unused'), 'train')
+    assert env.calls == [{'name': 'smart_home.light_set', 'arguments': corrected}]
+    assert report['executed'] == 1 and report['invalid_proposals'] == 1
 
 
 @pytest.mark.parametrize('response', [None, True, {}, {'ok': False}, {'error': 'invalid'}])

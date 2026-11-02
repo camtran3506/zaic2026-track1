@@ -19,6 +19,8 @@ Chỉnh cấu hình bên dưới. `LIMIT=0` chạy **toàn bộ split**. Model t
 
 Qwen3.5 dùng function calling native từ chat template của checkpoint: `tools`, assistant `tool_calls` và tool responses; SFT/inference dùng chung template, không train JSON action call làm output model. Schema, lịch sử hội thoại và kết quả tool được giữ đầy đủ khi finetune và inference; không tự rút gọn khi prompt dài. Vượt giới hạn token sẽ báo lỗi rõ ràng.
 
+Feedback parse/precheck/validate được giữ khi LLM đang sửa lỗi. Sau khi validate thành công và call được thực thi, feedback từ chối cũ được bỏ khỏi prompt tiếp theo; mọi lời gọi đã thực thi và kết quả vẫn được giữ, kể cả call trả lỗi. Trace debug vẫn lưu đầy đủ lỗi trước đó.
+
 ASR chạy toàn bộ split (bao gồm audio lịch sử), lưu transcript rồi thoát tiến trình và giải phóng runtime CPU. LLM sau đó đọc cache; không nạp GIPformer cùng lúc. Mặc định không giới hạn thời gian mỗi mẫu (`float("inf")`); vẫn giữ giới hạn tool calls và token/context ≤16.384.
 
 Kết quả lưu trong `/kaggle/working/lifemate_runs/<RUN_NAME>/`: `transcripts.jsonl`, `transcripts.manifest.json`, `asr.log`, `submission.jsonl`, `diagnostics.jsonl`, `inference.log`, `setup.log`, `models.log`, `validation.json`, `run_config.json`, `environment.txt`, và `lifemate_artifacts.zip`. Transcript/logs có nội dung người dùng; kiểm tra trước khi chia sẻ. Đây không phải chế độ bảo đảm giới hạn 30 giây/mẫu của cuộc thi.''')

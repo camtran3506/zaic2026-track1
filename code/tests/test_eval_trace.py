@@ -65,6 +65,15 @@ def test_tracing_keeps_prompts_outputs_validation_and_execution_identical(tmp_pa
     with path.open('w', encoding='utf-8') as stream:
         traced_requests, env, stats = run(EvalTraceWriter(stream).for_sample('train_0001'))
     assert traced_requests == untraced_requests
+    # Both errors survive retrying; after the next actual call only executed
+    # calls/results remain visible, while the trace below retains the errors.
+    pending = json.loads(traced_requests[2]['user'])['previous_actions_and_results']
+    assert [observation['stage'] for observation in pending] == ['parse', 'validate']
+    for request, expected_names in zip(traced_requests[3:], [
+            ['smart_home.get_status'], ['smart_home.get_status', 'smart_home.light_set']]):
+        observations = json.loads(request['user'])['previous_actions_and_results']
+        assert [observation['name'] for observation in observations] == expected_names
+        assert all('result' in observation and 'stage' not in observation for observation in observations)
     assert env.calls == untraced_env.calls and env.validations == untraced_env.validations
     assert {k: v for k, v in stats.items() if k != 'elapsed_seconds'} == {
         k: v for k, v in untraced_stats.items() if k != 'elapsed_seconds'}

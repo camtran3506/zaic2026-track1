@@ -472,6 +472,11 @@ failures preserve the original model output and ask for the format required by
 the system/chat template, including native FC for Qwen3.5. Under native FC,
 rejections are `agent_feedback` user messages; they are never represented as an
 executed tool call or tool result. Original values remain unmodified.
+Pending parse/precheck/validation feedback stays visible while the model retries.
+After validation succeeds and `env.call` is attempted and counted, all pending
+rejection feedback is removed from subsequent planner prompts. All executed
+calls/results remain, including `ok: false` returns and call exceptions. The
+cumulative invalid-proposal count and the full debug trace retain earlier errors.
 No local type coercion, temporal repair, ID provenance inference, collection alias
 mapping or duplicate-read blocking is applied. ToolEnv decides argument validity;
 `env.call` may still report execution errors, which are also returned to the model.
@@ -576,7 +581,7 @@ exposed by `installed_apps` remain unavailable.
 There is no schema ranking/subset, character-based size fitting, history window,
 text clipping, tool-result clipping, or limit on the number of past observations
 included in a prompt. Each step sees all earlier real calls, arguments, results
-and validation errors. JSON serialization still uses compact whitespace; it does
+and any rejection feedback since the latest executed call. JSON serialization still uses compact whitespace; it does
 not shorten field values or remove fields. SFT emits call/done examples directly;
 all schemas are already visible. The internal `inspect` action and its counters
 have been removed; legacy outputs requesting it are invalid proposals and consume

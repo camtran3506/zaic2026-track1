@@ -172,8 +172,8 @@ class LifeMateAgent:
         def reject(error, stage, **feedback):
             nonlocal invalid
             invalid += 1
-            # Keep the rejected proposal and validator evidence available to the
-            # next planning step. A rejection is feedback, not an executed call:
+            # Keep rejected proposals available until a call is executed.
+            # A rejection is feedback, not an executed call:
             # deliberately avoid the `result` key used for actual tool results.
             observation = {"error": error, "stage": stage, **feedback}
             observations.append(observation)
@@ -240,6 +240,10 @@ class LifeMateAgent:
             else:
                 emit("call_result", name=name, arguments=args, call_index=executed, result=result)
             executed += 1
+            # Move on using actual calls/results once validation led to execution.
+            # Executed failures remain evidence; only unexecuted feedback expires.
+            # The debug trace and cumulative invalid counter retain earlier errors.
+            observations[:] = [observation for observation in observations if "result" in observation]
             observations.append({"name": name, "arguments": args, "result": full_json(result)})
             if name == "sys.ask_missing_info":
                 stop_reason = "ask_missing_info"
