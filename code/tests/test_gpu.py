@@ -97,10 +97,14 @@ def test_child_processes_inherit_single_gpu(monkeypatch, tmp_path, pipeline):
         monkeypatch.setattr(finetune, 'subprocess', fake_subprocess)
         base = tmp_path / 'base'
         base.mkdir()
-        monkeypatch.setattr(sys, 'argv', ['finetune.py', '--data-root', 'data',
+        monkeypatch.setattr(sys, 'argv', ['finetune.py', '--data-root', 'data', '--asr-model', 'asr',
             '--base-model', str(base), '--output-dir', str(tmp_path / 'run')])
         finetune.main()
         assert [Path(cmd[1]).name for cmd, _ in observed] == ['prepare_sft.py', 'train_lora.py']
+        prepare = observed[0][0]
+        assert prepare[prepare.index('--asr-transcript-ratio') + 1] == '0.5'
+        assert prepare[prepare.index('--asr-model') + 1] == 'asr'
+        assert '--asr-transcript-ratio' not in observed[1][0]
     assert [mask for _, mask in observed] == ['2', '2']
 
 

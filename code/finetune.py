@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
+from lifemate.sft import DEFAULT_ASR_TRANSCRIPT_RATIO, asr_transcript_ratio
 
 
 def main():
@@ -17,7 +18,9 @@ def main():
     p.add_argument("--base-model", required=True, help="Local directory or Hugging Face model ID")
     p.add_argument("--revision", default="main", help="HF commit or revision; resolved SHA is logged")
     p.add_argument("--output-dir", type=Path, required=True)
-    p.add_argument("--asr-model", type=Path, help="Optional fallback for train audio/history without text")
+    p.add_argument("--asr-model", type=Path, help="Local ASR weights; required for the default 50:50 transcript mix")
+    p.add_argument("--asr-transcript-ratio", type=asr_transcript_ratio, default=DEFAULT_ASR_TRANSCRIPT_RATIO,
+                   help="Fraction of sample IDs using ASR transcripts (default 0.5)")
     p.add_argument("--asr-device", choices=["cpu"], default="cpu")
     p.add_argument("--asr-precision", choices=["int8", "fp32"], default="int8")
     p.add_argument("--asr-threads", type=int, default=4)
@@ -28,6 +31,8 @@ def main():
     # Remaining args are forwarded to train_lora.py, e.g. --max-steps or --quantization.
     args, training_options = p.parse_known_args()
     configure_cuda_device(args)
+    if args.asr_transcript_ratio > 0 and args.asr_model is None:
+        p.error("--asr-model is required when --asr-transcript-ratio > 0 (default 0.5)")
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise FileExistsError("Choose an empty run directory. To resume training use train_lora.py directly.")
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -57,6 +62,7 @@ def main():
     env.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_DATASETS_OFFLINE="1")
     prepare = ["--data-root", args.data_root, "--output-dir", args.output_dir / "sft",
                "--validation-fraction", args.validation_fraction, "--seed", args.seed,
+               "--asr-transcript-ratio", args.asr_transcript_ratio,
                "--missing-tool-policy", args.missing_tool_policy]
     if args.asr_model:
         prepare.extend(["--asr-model", args.asr_model, "--device", args.asr_device,

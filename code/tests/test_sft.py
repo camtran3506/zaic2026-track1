@@ -76,7 +76,7 @@ def test_prepare_skip_reports_whole_samples_and_retains_partition_ids(tmp_path, 
         return replay_sample(record, *args, **kwargs)
     monkeypatch.setattr(prepare_sft, 'replay_sample', replay)
     out = tmp_path / 'sft'
-    monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--data-root', str(source),
+    monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--asr-transcript-ratio', '0', '--data-root', str(source),
         '--output-dir', str(out), '--validation-fraction', '0.3', '--missing-tool-policy', 'skip'])
     prepare_sft.main()
     manifest = json.loads((out / 'manifest.json').read_text())

@@ -90,7 +90,7 @@ Other model families keep the portable JSON-decision protocol. Runtime manifests
 record `qwen35-native-fc-v1` for Qwen3.5; an old Qwen3.5 JSON-protocol adapter is
 rejected instead of silently mixing protocols. Regenerate SFT in a fresh directory
 and retrain that adapter. The current preparation policy is
-`full-context-native-fc-v2`. Production never replaces the checkpoint template;
+`full-context-native-fc-mix-v3`. Production never replaces the checkpoint template;
 tests use a pinned upstream Qwen3.5 template fixture without downloading weights.
 
 ## 1. Install dependencies on the server
@@ -269,7 +269,7 @@ including tool-only turns. Tool results are not clipped. The on-disk transcript
 cache retains this same full history, so compatible caches can be reused.
 Regenerate older SFT datasets in a new output directory: shortened data cannot
 be recovered by the trainer. Training and rollout evaluation reject manifests
-without the current `prompt_policy: full-context-native-fc-v2` marker.
+without the current `prompt_policy: full-context-native-fc-mix-v3` marker.
 `--use-train-transcript` still requires `split=train`; test request audio is always
 transcribed rather than read from a possible `audio_text` field.
 
@@ -464,6 +464,31 @@ The training schema is the same as inference: `audio_text`, `context`, `history`
 `done` target; missing labels are errors. Only TRAIN data is accepted by the preparation
 entrypoint. Keep the organizer's train-specific `zaic_tools` next to `train.jsonl`.
 
+Fine-tuning now defaults to **50% provided `audio_text` + 50% ASR transcripts**
+(`--asr-transcript-ratio 0.5`). Train/validation are split by original sample ID
+first; each partition then gets a deterministic seeded selection of transcript
+sources. The ASR count is rounded to the nearest integer for the full source
+dataset and for the training partition (ties round up); validation receives the
+remainder. Thus 50:50 stays exact for an even total, and an odd partition differs
+by at most one sample between sources. The ratio is by sample,
+not by expanded tool-call steps. Each sample keeps the same selected transcript
+throughout its trajectory and held-out rollout; samples are not duplicated across
+partitions. History uses the existing full text/audio resolver unchanged.
+
+Pass local GIPformer weights via `--asr-model`, including when all train records
+already contain `audio_text`. ASR-selected samples are transcribed once during
+preparation and **ignore** the supplied current `audio_text`. A missing selected
+source or ASR failure stops preparation; it never silently substitutes clean text.
+`--asr-transcript-ratio 0` is an explicit text-only ablation; `1` selects ASR for
+all samples. Notebook defaults match the CLI through `TRAIN_ASR_TRANSCRIPT_RATIO`.
+
+Each SFT row records `transcript_source`. The manifest saves the ratio, seed,
+ASR model/settings, per-sample assignments and requested/retained source counts.
+Validation rollouts reuse the selected transcript without rerunning ASR. If the
+explicit diagnostic skip policy removes samples, retained counts may differ from
+the requested ratio; both counts are reported. Create a new SFT/run directory to
+apply the mix; older prepared data is rejected by the current preparation policy.
+
 The default training backend is **Unsloth** (`FastVisionModel` for Qwen3.5 with
 vision layers frozen and text-only LoRA), imported before
 Transformers/PEFT in the training process. It uses Unsloth gradient checkpointing,
@@ -482,6 +507,7 @@ python -m pip install -r requirements.txt
 python finetune.py \
   --data-root /path/to/lifemate_data \
   --base-model Qwen/Qwen3.5-4B \
+  --asr-model ./models/asr --asr-transcript-ratio 0.5 \
   --output-dir /path/to/runs/toolcalling_v1 \
   --backend unsloth --epochs 3 --quantization none --max-length 16384 \
   --batch-size 1 --gradient-accumulation 8 --learning-rate 2e-4
@@ -528,7 +554,7 @@ inspection never changes the prompt or calls ToolEnv. `--max-tool-details` and t
 notebook's `MAX_TOOL_DETAILS` setting have been removed.
 
 Unavailable/schema-invalid gold labels still fail with the sample ID. Training
-transcripts are required; pass `--asr-model` for records/history that need ASR. No
+transcripts are required; the default mix requires `--asr-model`. No
 synthetic tool results or gold arguments are inserted into earlier prompts. Loss
 masks system/user/padding tokens and trains only the assistant JSON and its
 end-of-turn tokens. The notebook defaults to `TRAIN_MISSING_TOOL_POLICY="error"`;

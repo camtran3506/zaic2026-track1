@@ -37,7 +37,7 @@ def prepared(tmp_path, monkeypatch):
     monkeypatch.setitem(sys.modules, 'zaic_tools', SimpleNamespace(ToolEnv=Env))
     monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '')
     out = tmp_path / 'sft'
-    monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--data-root', str(source), '--output-dir', str(out)])
+    monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--asr-transcript-ratio', '0', '--data-root', str(source), '--output-dir', str(out)])
     prepare_sft.main()
     return out, instances, source, records
 
@@ -103,7 +103,7 @@ def test_mean_is_over_original_samples_not_sft_steps_or_calls(prepared, tmp_path
             record['label']['tool_calls'].append({'name': 'smart_home.get_status', 'arguments': {}})
     (source / 'train.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in records))
     out = tmp_path / 'two-samples'
-    monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--data-root', str(source),
+    monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--asr-transcript-ratio', '0', '--data-root', str(source),
         '--output-dir', str(out), '--validation-fraction', '0.5'])
     prepare_sft.main()
     evaluator = StateToolEvaluator(out, json.loads((out / 'manifest.json').read_text()))
@@ -131,7 +131,7 @@ def test_supplied_gold_hash_must_agree_with_replay(prepared, tmp_path, monkeypat
     _, valid = split_records(records)
     next(r for r in records if r['id'] == valid[0]['id'])['label']['state_hash'] = 'wrong-gold'
     (source / 'train.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in records))
-    monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--data-root', str(source),
+    monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--asr-transcript-ratio', '0', '--data-root', str(source),
         '--output-dir', str(tmp_path / 'bad-hash')])
     with pytest.raises(ValueError, match='differs from the provided gold hash'):
         prepare_sft.main()
@@ -149,7 +149,7 @@ def test_validation_samples_cannot_be_silently_skipped(prepared, tmp_path, monke
         return original(record, *args, **kwargs)
 
     monkeypatch.setattr(prepare_sft, 'replay_sample', replay)
-    monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--data-root', str(source),
+    monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--asr-transcript-ratio', '0', '--data-root', str(source),
         '--output-dir', str(tmp_path / 'skip'), '--missing-tool-policy', 'skip'])
     with pytest.raises(ValueError):
         prepare_sft.main()
@@ -206,7 +206,7 @@ def test_callback_restores_training_mode_and_unsloth_state(tmp_path, fail):
     assert calls == ['inference', 'training']
 
 
-@pytest.mark.parametrize('policy', [None, 'shortened-context-v0'])
+@pytest.mark.parametrize('policy', [None, 'shortened-context-v0', 'full-context-native-fc-v2'])
 def test_old_prepared_data_requires_regeneration(prepared, policy):
     out, _, _, _ = prepared
     manifest = json.loads((out / 'manifest.json').read_text())

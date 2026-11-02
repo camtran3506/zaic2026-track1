@@ -12,7 +12,29 @@ from .catalog import allowed_tools
 from .llm import chat_token_ids
 
 
-SFT_PROMPT_POLICY = "full-context-native-fc-v2"
+SFT_PROMPT_POLICY = "full-context-native-fc-mix-v3"
+DEFAULT_ASR_TRANSCRIPT_RATIO = 0.5
+
+
+def asr_transcript_ratio(value):
+    ratio = float(value)
+    if not 0 <= ratio <= 1:
+        raise ValueError("ASR transcript ratio must be between 0 and 1")
+    return ratio
+
+
+def assign_transcript_sources(records, ratio=DEFAULT_ASR_TRANSCRIPT_RATIO, seed=42, *, count=None):
+    """Choose one source per sample, independently of order and trajectory length."""
+    ratio = asr_transcript_ratio(ratio)
+    ids = sorted(record["id"] for record in records)
+    if len(set(ids)) != len(ids):
+        raise ValueError("Duplicate sample IDs")
+    random.Random(seed).shuffle(ids)
+    count = int(len(ids) * ratio + 0.5) if count is None else count
+    if not isinstance(count, int) or not 0 <= count <= len(ids):
+        raise ValueError("ASR sample count is out of range")
+    asr_ids = set(ids[:count])
+    return {sample_id: "asr" if sample_id in asr_ids else "audio_text" for sample_id in ids}
 
 
 def validate_prompt_policy(manifest):
@@ -37,19 +59,35 @@ def split_records(records, validation_fraction=0.1, seed=42):
     return ordered[count:], ordered[:count]
 
 
-def prepare_train_transcript(item, split_dir, asr=None):
-    """Resolve train text/audio once; reuse the same input for SFT and rollouts."""
+def prepare_train_transcript(item, split_dir, asr=None, *, transcript_source=None):
+    """Resolve the selected source once; reuse it for all SFT steps and rollouts.
+
+    Explicit mixed-source assignments never silently fall back to the other
+    source. None retains automatic resolution for direct library callers.
+    """
+    if transcript_source not in (None, "audio_text", "asr"):
+        raise ValueError(f"Unknown transcript source: {transcript_source}")
     started = time.monotonic()
-    transcript = _train_transcript(item)
+    transcript = None if transcript_source == "asr" else _train_transcript(item)
+    if transcript_source == "audio_text" and transcript is None:
+        raise ValueError(f"{item['id']}: selected audio_text source is missing")
     if transcript is None:
         if asr is None:
-            raise ValueError(f"{item['id']}: audio_text missing; pass --asr-model to transcribe train audio")
+            raise ValueError(f"{item['id']}: ASR transcript required; pass --asr-model to transcribe train audio")
+        if not isinstance(item.get("audio"), str):
+            raise ValueError(f"{item['id']}: selected ASR source requires an audio path")
         transcript = asr.transcribe(audio_path(split_dir, item["audio"]))
+        transcript_source = "asr"
+    else:
+        transcript_source = "audio_text"
+    if not isinstance(transcript, str):
+        raise ValueError(f"{item['id']}: transcript must be text")
     class MissingASR:
         def transcribe(self, path):
             raise ValueError("History audio needs --asr-model or a train history transcript")
     history = history_text(item.get("history", []), split_dir, asr or MissingASR(), started, float("inf"))
-    return {"id": item["id"], "transcript": transcript, "history": history}
+    return {"id": item["id"], "transcript": transcript, "history": history,
+            "transcript_source": transcript_source}
 
 
 def replay_sample(item, catalog, env, split_dir, asr=None, prepared_transcript=None):

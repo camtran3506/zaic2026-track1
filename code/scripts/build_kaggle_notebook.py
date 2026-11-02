@@ -38,7 +38,7 @@ REFRESH_TRANSCRIPTS = False  # True: thay cache hoàn tất nếu đổi ASR/d�
 # Fine-tune trước rồi tự nạp adapter cho inference.
 TRAIN_LLM = True
 TRAIN_BACKEND = "unsloth"  # backend mặc định; cần CUDA
-TRAIN_USE_ASR = False  # bật nếu train/history thiếu transcript
+TRAIN_ASR_TRANSCRIPT_RATIO = 0.5  # 50% sample dùng audio_text, 50% dùng ASR; chọn theo SEED
 TRAIN_MISSING_TOOL_POLICY = "error"  # toàn bộ schema được giữ; lỗi schema không mặc định bỏ mẫu
 TRAIN_DATA_ROOT = None  # None: tự tìm train/train.jsonl trong /kaggle/input
 LOCAL_ADAPTER = None   # TRAIN_LLM=False + đường dẫn adapter để dùng bản đã train
@@ -221,7 +221,8 @@ for rel in ['lifemate/__init__.py', 'lifemate/catalog.py', 'lifemate/models.py',
             'tests/test_finetune_integration.py', 'tests/test_audio.py', 'tests/test_catalog_inspection.py',
             'tests/test_staged_pipeline.py', 'tests/test_decoding.py', 'tests/test_scoring.py', 'tests/test_evaluation.py',
             'tests/test_raw_transcripts.py', 'tests/test_runtime_parity.py', 'tests/test_runtime_config.py',
-            'tests/test_native_function_calling.py', 'tests/fixtures/qwen35_chat_template.jinja']:
+            'tests/test_native_function_calling.py', 'tests/test_transcript_mixing.py',
+            'tests/fixtures/qwen35_chat_template.jinja']:
     md(f'### `{rel}`')
     code(f'%%writefile /kaggle/working/lifemate_app/{rel}\n' + (ROOT/'code'/rel).read_text())
 
@@ -347,9 +348,9 @@ print("ASR process has exited; LLM will read and verify cache before loading wei
 
 md('''## 6. Fine-tune tool calling trên TRAIN (LoRA/QLoRA)
 
-Mặc định `TRAIN_LLM=True`: huấn luyện LoRA/QLoRA, rồi tự chuyển sang **base model + adapter vừa train** cho task chính. Nhãn phải là `label.tool_calls` theo thứ tự thực thi. Replay dùng `ToolEnv` thật của train; kết quả tool trước được đưa vào prompt bước sau. Chỉ tính loss trên assistant JSON, split theo sample ID trước khi tạo các bước, không đọc nhãn test.
+Mặc định `TRAIN_LLM=True`, `TRAIN_ASR_TRANSCRIPT_RATIO=0.5`: chia train/validation theo sample ID trước, rồi trộn 50% sample dùng audio_text và 50% dùng ASR trong mỗi phần (số mẫu lẻ lệch tối đa một). SEED quyết định việc chọn nguồn; mọi bước của một sample dùng cùng transcript. ASR không tự quay về audio_text khi lỗi; nguồn và số lượng được ghi trong manifest. History giữ đầy đủ theo resolver chung. Sau đó huấn luyện LoRA/QLoRA, rồi tự chuyển sang **base model + adapter vừa train** cho task chính. Nhãn phải là `label.tool_calls` theo thứ tự thực thi. Replay dùng `ToolEnv` thật của train; kết quả tool trước được đưa vào prompt bước sau. Chỉ tính loss trên assistant JSON, split theo sample ID trước khi tạo các bước, không đọc nhãn test.
 
-`tool_schemas` giữ toàn bộ schema của mọi tool được phép ngay từ bước đầu, gồm đầy đủ description, returns và metadata. History và mọi kết quả tool được giữ nguyên, không giới hạn lượt/ký tự hoặc giảm theo độ dài prompt. SFT tạo trực tiếp action call/done, không thêm bước inspect. Vượt giới hạn token sẽ báo lỗi, không tự cắt dữ liệu. Cần tạo lại SFT cũ trong thư mục mới; manifest phải có `prompt_policy=full-context-native-fc-v2`. Mặc định `TRAIN_MISSING_TOOL_POLICY="error"`, không tự bỏ mẫu lỗi schema.
+`tool_schemas` giữ toàn bộ schema của mọi tool được phép ngay từ bước đầu, gồm đầy đủ description, returns và metadata. History và mọi kết quả tool được giữ nguyên, không giới hạn lượt/ký tự hoặc giảm theo độ dài prompt. SFT tạo trực tiếp action call/done, không thêm bước inspect. Vượt giới hạn token sẽ báo lỗi, không tự cắt dữ liệu. Cần tạo lại SFT cũ trong thư mục mới; manifest phải có `prompt_policy=full-context-native-fc-mix-v3`. Mặc định `TRAIN_MISSING_TOOL_POLICY="error"`, không tự bỏ mẫu lỗi schema.
 
 Muốn dùng adapter đã có: đặt `TRAIN_LLM=False`, `LOCAL_ADAPTER` tới thư mục adapter. Muốn dùng model đã merge: đặt `TRAIN_LLM=False`, `LOCAL_ADAPTER=None`, `LOCAL_LLM` tới model merged. Nếu thiếu train data khi bật training, cell sẽ dừng rõ ràng thay vì dùng model gốc âm thầm.
 
@@ -370,6 +371,7 @@ if TRAIN_LLM:
         "--data-root", training_data, "--base-model", LLM_PATH, "--output-dir", FT_RUN,
         "--backend", TRAIN_BACKEND,
         "--validation-fraction", str(TRAIN_VALIDATION_FRACTION),
+        "--asr-transcript-ratio", str(TRAIN_ASR_TRANSCRIPT_RATIO),
         "--seed", str(SEED),
         "--missing-tool-policy", TRAIN_MISSING_TOOL_POLICY,
         "--epochs", str(TRAIN_EPOCHS), "--max-steps", str(TRAIN_MAX_STEPS),
@@ -377,9 +379,8 @@ if TRAIN_LLM:
         "--batch-size", str(TRAIN_BATCH_SIZE),
         "--gradient-accumulation", str(TRAIN_GRAD_ACCUMULATION),
         "--quantization", TRAIN_QUANTIZATION]
-    if TRAIN_USE_ASR:
-        train_command.extend(["--asr-model", ASR_PATH, "--asr-device", "cpu",
-                              "--asr-precision", ASR_PRECISION, "--asr-threads", str(ASR_THREADS)])
+    train_command.extend(["--asr-model", ASR_PATH, "--asr-device", "cpu",
+                          "--asr-precision", ASR_PRECISION, "--asr-threads", str(ASR_THREADS)])
     try:
         run_logged(train_command, OUT / "training_pipeline.log", cwd=APP, env=FT_ENV)
     finally:

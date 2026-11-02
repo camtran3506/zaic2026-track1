@@ -87,6 +87,7 @@ def test_train_adapter_reload_and_merge(tmp_path, architecture):
            'PYTHONDONTWRITEBYTECODE': '1', 'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1'}
     result = subprocess.run([sys.executable, app / 'finetune.py', '--data-root', data.parent,
         '--base-model', base, '--output-dir', run, '--backend', 'transformers',
+        '--asr-transcript-ratio', '0',  # This LoRA-only fixture has no ASR/audio; mixing has dedicated tests.
         '--max-steps', '2', '--gradient-accumulation', '1', '--save-steps', '1',
         '--learning-rate', '0.01', '--export-merged'],
         env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
