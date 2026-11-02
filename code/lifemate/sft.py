@@ -1,6 +1,7 @@
 """Train-only gold replay, sample-level splitting, and assistant-only SFT loss."""
 from __future__ import annotations
 
+from copy import deepcopy
 import hashlib
 import json
 import random
@@ -13,7 +14,8 @@ from .llm import chat_token_ids
 from .text import TEXT_NORMALIZATION, normalize_transcript
 
 
-SFT_PROMPT_POLICY = "full-context-native-fc-mix-normalized-v4"
+SFT_PROMPT_POLICY = "full-context-native-fc-mix-asr-eval-v5"
+VALIDATION_ROLLOUT_POLICY = "asr-only-paired-clean-v1"
 DEFAULT_ASR_TRANSCRIPT_RATIO = 0.5
 
 
@@ -41,7 +43,7 @@ def assign_transcript_sources(records, ratio=DEFAULT_ASR_TRANSCRIPT_RATIO, seed=
 def validate_prompt_policy(manifest):
     if (manifest.get("prompt_policy") != SFT_PROMPT_POLICY
             or manifest.get("text_normalization") != TEXT_NORMALIZATION):
-        raise ValueError("Prepared SFT data uses an older prompt/text-normalization policy; "
+        raise ValueError("Prepared SFT data uses an older prompt/text-normalization/evaluation policy; "
                          "rerun prepare_sft.py in a new output directory")
 
 
@@ -61,15 +63,9 @@ def split_records(records, validation_fraction=0.1, seed=42):
     return ordered[count:], ordered[:count]
 
 
-def prepare_train_transcript(item, split_dir, asr=None, *, transcript_source=None):
-    """Resolve the selected source once; reuse it for all SFT steps and rollouts.
-
-    Explicit mixed-source assignments never silently fall back to the other
-    source. None retains automatic resolution for direct library callers.
-    """
+def _current_train_transcript(item, split_dir, asr, transcript_source):
     if transcript_source not in (None, "audio_text", "asr"):
         raise ValueError(f"Unknown transcript source: {transcript_source}")
-    started = time.monotonic()
     transcript = None if transcript_source == "asr" else _train_transcript(item)
     if transcript_source == "audio_text" and transcript is None:
         raise ValueError(f"{item['id']}: selected audio_text source is missing")
@@ -84,13 +80,39 @@ def prepare_train_transcript(item, split_dir, asr=None, *, transcript_source=Non
         transcript_source = "audio_text"
     if not isinstance(transcript, str):
         raise ValueError(f"{item['id']}: transcript must be text")
-    transcript = normalize_transcript(transcript)
+    return normalize_transcript(transcript), transcript_source
+
+
+def prepare_train_transcript(item, split_dir, asr=None, *, transcript_source=None):
+    """Resolve one selected source for all SFT steps, without silent fallback."""
+    started = time.monotonic()
+    transcript, transcript_source = _current_train_transcript(item, split_dir, asr, transcript_source)
     class MissingASR:
         def transcribe(self, path):
             raise ValueError("History audio needs --asr-model or a train history transcript")
     history = history_text(item.get("history", []), split_dir, asr or MissingASR(), started, float("inf"))
     return {"id": item["id"], "transcript": transcript, "history": history,
             "transcript_source": transcript_source}
+
+
+def prepare_validation_transcripts(item, split_dir, asr, prepared_transcript):
+    """Use ASR for selection and preserve an optional clean view of the same IDs.
+
+    History is resolved once by the SFT preparation. Only the current request
+    differs between views, so paired rollouts isolate its recognition errors.
+    """
+    if asr is None:
+        raise ValueError("ASR validation requires --asr-model, including clean-only SFT ablations")
+    asr_prepared = deepcopy(prepared_transcript)
+    if asr_prepared["transcript_source"] != "asr":
+        transcript, source = _current_train_transcript(item, split_dir, asr, "asr")
+        asr_prepared.update(transcript=transcript, transcript_source=source)
+    clean = _train_transcript(item)
+    clean_prepared = None
+    if clean is not None:
+        clean_prepared = deepcopy(asr_prepared)
+        clean_prepared.update(transcript=normalize_transcript(clean), transcript_source="audio_text")
+    return asr_prepared, clean_prepared
 
 
 def replay_sample(item, catalog, env, split_dir, asr=None, prepared_transcript=None):

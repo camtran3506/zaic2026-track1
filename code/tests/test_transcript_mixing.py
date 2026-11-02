@@ -64,10 +64,12 @@ def test_asr_error_is_not_replaced_by_existing_audio_text(tmp_path):
 
 
 @pytest.mark.parametrize('script', ['finetune.py', 'prepare_sft.py'])
-def test_default_mix_requires_asr_before_creating_output(script, tmp_path):
+@pytest.mark.parametrize('ratio', [0, 0.5])
+def test_validation_requires_asr_at_every_mix_ratio_before_creating_output(script, ratio, tmp_path):
     app = Path(__file__).resolve().parents[1]
     output = tmp_path / 'run'
-    command = [sys.executable, app / script, '--data-root', 'unused', '--output-dir', output]
+    command = [sys.executable, app / script, '--data-root', 'unused', '--output-dir', output,
+               '--asr-transcript-ratio', str(ratio)]
     if script == 'finetune.py':
         command += ['--base-model', 'unused']
     result = subprocess.run(command, capture_output=True, text=True)
@@ -76,7 +78,7 @@ def test_default_mix_requires_asr_before_creating_output(script, tmp_path):
 
 
 @pytest.mark.parametrize('samples,validation_fraction', [(20, 0.2), (10, 0.1)])
-def test_preparation_default_mix_reuses_sources_in_all_steps_and_validation(
+def test_preparation_keeps_sft_mix_and_uses_asr_for_every_validation_rollout(
         tmp_path, monkeypatch, samples, validation_fraction):
     import prepare_sft
     import lifemate.models
@@ -108,6 +110,7 @@ def test_preparation_default_mix_reuses_sources_in_all_steps_and_validation(
     golds = {r['id']: r['label']['tool_calls'] for r in records}
     assignments = []
     for attempt in range(2):
+        transcribed_before = len(transcribed)
         output = tmp_path / f'sft-{attempt}'
         monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--data-root', str(source),
             '--output-dir', str(output), '--asr-model', 'stub-asr',
@@ -139,7 +142,10 @@ def test_preparation_default_mix_reuses_sources_in_all_steps_and_validation(
                 if decision['action'] == 'call':
                     assert decision['name'] == golds[sample_id][step['step']]['name']
         assert Counter(sources.values()) == {'asr': samples // 2, 'audio_text': samples // 2}
-        assert len(transcribed) == (attempt + 1) * samples // 2  # Once per selected sample, not per step.
+        expected_asr_ids = {sid for sid, source in sources.items() if source == 'asr'} | set(saved['partitions']['validation']['sample_ids'])
+        # Selected SFT ASR + every held-out request, each transcribed once.
+        assert Counter(transcribed[transcribed_before:]) == {sid: 1 for sid in expected_asr_ids}
+        transcribed_after_preparation = len(transcribed)
         assignments.append(sources)
         evaluator = StateToolEvaluator(output, saved)
         rollout_transcripts = []
@@ -152,10 +158,13 @@ def test_preparation_default_mix_reuses_sources_in_all_steps_and_validation(
             assert metrics['eval_rollout_samples'] == len(evaluator.rows)
             assert rollout_transcripts == [row['prepared_transcript']['transcript'] for row in evaluator.rows]
             for row in evaluator.rows:
-                assert row['prepared_transcript']['transcript_source'] == sources[row['item']['id']]
+                assert row['prepared_transcript']['transcript_source'] == 'asr'
+                assert row['prepared_transcript']['transcript'] == f'Asr {row["item"]["id"]}: lỗi nhận dạng!'
+                assert row['clean_prepared_transcript']['transcript_source'] == 'audio_text'
+                assert row['clean_prepared_transcript']['history'] == row['prepared_transcript']['history']
         finally:
             evaluator.close()
-        assert len(transcribed) == (attempt + 1) * samples // 2
+        assert len(transcribed) == transcribed_after_preparation  # Evaluation never decodes audio again.
         manifest_path.write_text(''.join(json.dumps(r) + '\n' for r in reversed(records)))
     assert assignments[0] == assignments[1]
 

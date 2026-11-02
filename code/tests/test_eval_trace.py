@@ -74,6 +74,10 @@ def test_tracing_keeps_prompts_outputs_validation_and_execution_identical(tmp_pa
     assert [e['output'] for e in events if e['event'] == 'llm_output'] == outputs
     rejected = [e for e in events if e['event'] == 'decision_rejected']
     assert [e['stage'] for e in rejected] == ['parse', 'validate']
+    assert rejected[0]['raw_output'] == outputs[0]
+    assert rejected[1]['name'] == 'smart_home.light_set'
+    assert rejected[1]['arguments'] == {'power': 'on'}
+    assert rejected[1]['validation'] == {'ok': False, 'error': 'missing required'}
     validations = [e for e in events if e['event'] == 'validate_result']
     assert [e['accepted'] for e in validations] == [False, True, True]
     assert validations[0]['arguments'] == {'power': 'on'}

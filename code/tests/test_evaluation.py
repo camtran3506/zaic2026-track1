@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from lifemate.evaluation import StateToolEvaluator, score_callback
-from lifemate.sft import UnexposedToolError, split_records
+from lifemate.sft import UnexposedToolError, file_sha256, split_records
 from test_baseline import CATALOG, FakeEnv
 from test_sft import labeled
 
@@ -13,9 +13,11 @@ from test_sft import labeled
 @pytest.fixture
 def prepared(tmp_path, monkeypatch):
     import prepare_sft
+    import lifemate.models
+    import lifemate.transcripts
     source = tmp_path / 'train'
     source.mkdir()
-    records = [dict(labeled(), id=f'train_{i}') for i in range(4)]
+    records = [dict(labeled(), id=f'train_{i}', audio=f'train_{i}.wav') for i in range(4)]
     (source / 'train.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in records))
     (source / 'train_tools_catalog.json').write_text(json.dumps({'apps': [{'tools': list(CATALOG.values())}]}))
     instances = []
@@ -35,9 +37,14 @@ def prepared(tmp_path, monkeypatch):
         def get_state_hash(self): return f'real-fixture-api:{self.power}'
 
     monkeypatch.setitem(sys.modules, 'zaic_tools', SimpleNamespace(ToolEnv=Env))
+    class ASR:
+        def __init__(self, *a, **kw): pass
+        def transcribe(self, path): return 'ASR bật đèn phòng khách'
+    monkeypatch.setattr(lifemate.models, 'LocalASR', ASR)
+    monkeypatch.setattr(lifemate.transcripts, 'asr_identity', lambda *a: {'model': 'stub-asr'})
     monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '')
     out = tmp_path / 'sft'
-    monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--asr-transcript-ratio', '0', '--data-root', str(source), '--output-dir', str(out)])
+    monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--asr-model', 'stub-asr', '--asr-transcript-ratio', '0', '--data-root', str(source), '--output-dir', str(out)])
     prepare_sft.main()
     return out, instances, source, records
 
@@ -103,7 +110,7 @@ def test_mean_is_over_original_samples_not_sft_steps_or_calls(prepared, tmp_path
             record['label']['tool_calls'].append({'name': 'smart_home.get_status', 'arguments': {}})
     (source / 'train.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in records))
     out = tmp_path / 'two-samples'
-    monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--asr-transcript-ratio', '0', '--data-root', str(source),
+    monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--asr-model', 'stub-asr', '--asr-transcript-ratio', '0', '--data-root', str(source),
         '--output-dir', str(out), '--validation-fraction', '0.5'])
     prepare_sft.main()
     evaluator = StateToolEvaluator(out, json.loads((out / 'manifest.json').read_text()))
@@ -131,7 +138,7 @@ def test_supplied_gold_hash_must_agree_with_replay(prepared, tmp_path, monkeypat
     _, valid = split_records(records)
     next(r for r in records if r['id'] == valid[0]['id'])['label']['state_hash'] = 'wrong-gold'
     (source / 'train.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in records))
-    monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--asr-transcript-ratio', '0', '--data-root', str(source),
+    monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--asr-model', 'stub-asr', '--asr-transcript-ratio', '0', '--data-root', str(source),
         '--output-dir', str(tmp_path / 'bad-hash')])
     with pytest.raises(ValueError, match='differs from the provided gold hash'):
         prepare_sft.main()
@@ -149,7 +156,7 @@ def test_validation_samples_cannot_be_silently_skipped(prepared, tmp_path, monke
         return original(record, *args, **kwargs)
 
     monkeypatch.setattr(prepare_sft, 'replay_sample', replay)
-    monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--asr-transcript-ratio', '0', '--data-root', str(source),
+    monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--asr-model', 'stub-asr', '--asr-transcript-ratio', '0', '--data-root', str(source),
         '--output-dir', str(tmp_path / 'skip'), '--missing-tool-policy', 'skip'])
     with pytest.raises(ValueError):
         prepare_sft.main()
@@ -163,11 +170,80 @@ def test_best_checkpoint_uses_score_even_when_loss_improves(tmp_path):
         metric_for_best_model='state_tool_score', greater_is_better=True)
     trainer = Trainer(model=torch.nn.Linear(1, 1), args=args, eval_dataset=[{'x': 0}])
     trainer.state.global_step = 1
-    assert trainer._determine_best_metric({'eval_state_tool_score': 80, 'eval_loss': 5}, trial=None)
+    assert trainer._determine_best_metric({'eval_state_tool_score': 80, 'eval_clean_state_tool_score': 20, 'eval_loss': 5}, trial=None)
     trainer.state.global_step = 2
-    assert not trainer._determine_best_metric({'eval_state_tool_score': 60, 'eval_loss': 1}, trial=None)
+    assert not trainer._determine_best_metric({'eval_state_tool_score': 60, 'eval_clean_state_tool_score': 100, 'eval_loss': 1}, trial=None)
     assert trainer.state.best_metric == 80
     assert trainer.state.best_global_step == 1
+
+
+def test_paired_clean_diagnostics_use_same_ids_but_cannot_override_asr_metrics(prepared, tmp_path):
+    out, instances, _, _ = prepared
+    evaluator = StateToolEvaluator(out, json.loads((out / 'manifest.json').read_text()), require_clean_transcripts=True)
+    class LLM:
+        def generate(self, system, user):
+            payload = json.loads(user)
+            assert 'clean_prepared_transcript' not in payload and 'gold_tool_calls' not in payload
+            if payload['request_transcript'].startswith('Asr'):
+                return '{"action":"done"}'
+            observations = payload['previous_actions_and_results']
+            if not observations:
+                return '{"action":"call","name":"smart_home.get_status","arguments":{}}'
+            if len(observations) == 1:
+                return '{"action":"call","name":"smart_home.light_set","arguments":{"device_id":"light_living","power":"on"}}'
+            return '{"action":"done"}'
+    before = len(instances)
+    try:
+        asr = evaluator.evaluate(LLM(), tmp_path / 'asr.jsonl')
+        clean = evaluator.evaluate(LLM(), tmp_path / 'clean.jsonl', transcript_source='audio_text')
+    finally:
+        evaluator.close()
+    assert asr['eval_state_tool_score'] == 0
+    assert clean['eval_clean_state_tool_score'] == 100
+    assert not asr.keys() & clean.keys()
+    assert {**asr, **clean}['eval_state_tool_score'] == 0
+    assert clean['eval_clean_rollout_samples'] == asr['eval_rollout_samples'] == 1
+    assert len(instances) == before + 2 and instances[-1] is not instances[-2]
+    asr_row, clean_row = (json.loads((tmp_path / f'{source}.jsonl').read_text()) for source in ('asr', 'clean'))
+    assert asr_row['id'] == clean_row['id'] == evaluator.rows[0]['item']['id']
+    assert asr_row['transcript_source'] == 'asr' and clean_row['transcript_source'] == 'audio_text'
+
+
+@pytest.mark.parametrize('broken', ['policy', 'source'])
+def test_mixed_rollouts_cannot_be_used_for_asr_checkpoint_selection(prepared, broken):
+    out, _, _, _ = prepared
+    manifest = json.loads((out / 'manifest.json').read_text())
+    if broken == 'policy':
+        manifest['validation_rollouts'].pop('policy')
+    else:
+        path = out / 'validation_rollouts.jsonl'
+        row = json.loads(path.read_text())
+        row['prepared_transcript']['transcript_source'] = 'audio_text'
+        path.write_text(json.dumps(row) + '\n')
+        manifest['validation_rollouts']['sha256'] = file_sha256(path)
+    with pytest.raises(ValueError, match='ASR'):
+        StateToolEvaluator(out, manifest)
+
+
+def test_clean_diagnostics_require_every_heldout_view_before_any_rollout(prepared, tmp_path):
+    out, instances, _, _ = prepared
+    manifest = json.loads((out / 'manifest.json').read_text())
+    path = out / 'validation_rollouts.jsonl'
+    row = json.loads(path.read_text())
+    row['clean_prepared_transcript'] = None
+    path.write_text(json.dumps(row) + '\n')
+    manifest['validation_rollouts']['sha256'] = file_sha256(path)
+    before = len(instances)
+    with pytest.raises(ValueError, match='every held-out sample'):
+        StateToolEvaluator(out, manifest, require_clean_transcripts=True)
+    evaluator = StateToolEvaluator(out, manifest)
+    try:
+        with pytest.raises(ValueError, match='every held-out sample'):
+            evaluator.evaluate(None, tmp_path / 'clean.jsonl', transcript_source='audio_text')
+    finally:
+        evaluator.close()
+    assert len(instances) == before
+    assert not (tmp_path / 'clean.partial.jsonl').exists()
 
 
 @pytest.mark.parametrize('fail', [False, True])
@@ -206,7 +282,7 @@ def test_callback_restores_training_mode_and_unsloth_state(tmp_path, fail):
     assert calls == ['inference', 'training']
 
 
-@pytest.mark.parametrize('policy', [None, 'shortened-context-v0', 'full-context-native-fc-v2', 'full-context-native-fc-mix-v3'])
+@pytest.mark.parametrize('policy', [None, 'shortened-context-v0', 'full-context-native-fc-v2', 'full-context-native-fc-mix-v3', 'full-context-native-fc-mix-normalized-v4'])
 def test_old_prepared_data_requires_regeneration(prepared, policy):
     out, _, _, _ = prepared
     manifest = json.loads((out / 'manifest.json').read_text())
@@ -286,7 +362,7 @@ def test_eval_writes_sample_diagnostics_summary_and_metrics_without_extra_calls(
     assert summary['samples'] == metrics['eval_rollout_samples'] == 1
     assert summary['metrics'] == metrics
     assert summary['stop_reasons'][stop_reason] == 1
-    assert summary['by_transcript_source']['audio_text']['samples'] == 1
+    assert summary['by_transcript_source']['asr']['samples'] == 1
     for error in summary['error_samples']:
         assert summary['error_samples'][error] == int(error in expected_errors)
         assert metrics[f'eval_{error}_samples'] == int(error in expected_errors)

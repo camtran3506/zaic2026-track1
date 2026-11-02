@@ -34,6 +34,8 @@ def main():
     p.add_argument("--save-steps", type=int, default=100)
     p.add_argument("--eval-strategy", choices=["epoch", "steps"], default="epoch",
                    help="Run full held-out agent rollouts and save candidates each epoch, or every --save-steps")
+    p.add_argument("--eval-clean-transcripts", action="store_true",
+                   help="Also run independent clean-text diagnostics on the same held-out IDs; checkpoint selection always uses ASR")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--resume-from-checkpoint", type=Path)
     args = p.parse_args()
@@ -101,13 +103,14 @@ def main():
     if ids["train"] & ids["validation"]:
         raise ValueError("Train/validation sample leakage")
     from lifemate.evaluation import StateToolEvaluator, score_callback
-    evaluator = StateToolEvaluator(args.sft_dir, manifest)
+    evaluator = StateToolEvaluator(args.sft_dir, manifest, require_clean_transcripts=args.eval_clean_transcripts)
     runtime = make_runtime_manifest(args.base_model, tokenizer, seed=args.seed)
     run_config = {
         **{k: str(v.resolve()) if isinstance(v, Path) else v for k, v in vars(args).items()},
         "torch": torch.__version__, "train_steps": len(data["train"]),
         "validation_steps": len(data["validation"]), "data_manifest": manifest,
         "selection_metric": "eval_state_tool_score",
+        "selection_transcript_source": "asr",
         "runtime": runtime,
         "training_dtype": str(dtype),
     }
@@ -118,7 +121,7 @@ def main():
         original = json.loads(original_path.read_text(encoding="utf-8"))
         for key in ("backend", "base_model", "data_manifest", "quantization", "max_length",
                     "batch_size", "gradient_accumulation", "learning_rate", "lora_r",
-                    "lora_alpha", "lora_dropout", "seed", "eval_strategy", "runtime"):
+                    "lora_alpha", "lora_dropout", "seed", "eval_strategy", "eval_clean_transcripts", "runtime"):
             if original.get(key) != run_config[key]:
                 raise ValueError(f"Resume configuration mismatch: {key}")
     # Save before training so interrupted runs can still be resumed safely.
@@ -165,7 +168,8 @@ def main():
     trainer = Trainer(model=model, args=training_args, processing_class=tokenizer,
         train_dataset=data["train"], eval_dataset=data["validation"],
         data_collator=AssistantCollator(tokenizer.pad_token_id),
-        callbacks=[score_callback(evaluator, tokenizer, args.output_dir, FastLanguageModel),
+        callbacks=[score_callback(evaluator, tokenizer, args.output_dir, FastLanguageModel,
+                                  eval_clean_transcripts=args.eval_clean_transcripts),
                    runtime_save_callback(runtime)])
     try:
         train_result = trainer.train(resume_from_checkpoint=str(args.resume_from_checkpoint) if args.resume_from_checkpoint else None)

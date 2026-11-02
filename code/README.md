@@ -90,7 +90,7 @@ Other model families keep the portable JSON-decision protocol. Runtime manifests
 record `qwen35-native-fc-v1` for Qwen3.5; an old Qwen3.5 JSON-protocol adapter is
 rejected instead of silently mixing protocols. Regenerate SFT in a fresh directory
 and retrain that adapter. The current preparation policy is
-`full-context-native-fc-mix-normalized-v4`. Production never replaces the checkpoint template;
+`full-context-native-fc-mix-asr-eval-v5`. Production never replaces the checkpoint template;
 tests use a pinned upstream Qwen3.5 template fixture without downloading weights.
 
 ## 1. Install dependencies on the server
@@ -269,7 +269,7 @@ including tool-only turns. Tool results are not clipped. The on-disk transcript
 cache retains this same full history, so compatible caches can be reused.
 Regenerate older SFT datasets in a new output directory: shortened data cannot
 be recovered by the trainer. Training and rollout evaluation reject manifests
-without the current `prompt_policy: full-context-native-fc-mix-normalized-v4` marker.
+without the current `prompt_policy: full-context-native-fc-mix-asr-eval-v5` marker.
 `--use-train-transcript` still requires `split=train`; test request audio is always
 transcribed rather than read from a possible `audio_text` field.
 
@@ -466,6 +466,12 @@ Before `env.call`, the agent checks tool availability and argument-object shape,
 then passes the original arguments directly to `env.validate`. Only a dictionary
 response with `ok` set to true permits execution. Invalid arguments or validation
 exceptions are returned to the model as observations so it can correct its proposal.
+Each rejected proposal preserves its rejection stage, attempted tool name and
+arguments, and the complete validation response or exception details. Parse
+failures preserve the original model output and ask for the format required by
+the system/chat template, including native FC for Qwen3.5. Under native FC,
+rejections are `agent_feedback` user messages; they are never represented as an
+executed tool call or tool result. Original values remain unmodified.
 No local type coercion, temporal repair, ID provenance inference, collection alias
 mapping or duplicate-read blocking is applied. ToolEnv decides argument validity;
 `env.call` may still report execution errors, which are also returned to the model.
@@ -490,20 +496,25 @@ sources. The ASR count is rounded to the nearest integer for the full source
 dataset and for the training partition (ties round up); validation receives the
 remainder. Thus 50:50 stays exact for an even total, and an odd partition differs
 by at most one sample between sources. The ratio is by sample,
-not by expanded tool-call steps. Each sample keeps the same selected transcript
-throughout its trajectory and held-out rollout; samples are not duplicated across
-partitions. History uses the existing full text/audio resolver unchanged.
+not by expanded tool-call steps. Each SFT sample keeps the same selected transcript
+throughout its trajectory; samples are not duplicated across partitions. History
+uses the existing full text/audio resolver unchanged. Checkpoint-selection
+rollouts use ASR for **every** held-out sample, independently of its SFT source.
 
 Pass local GIPformer weights via `--asr-model`, including when all train records
 already contain `audio_text`. ASR-selected samples are transcribed once during
 preparation and **ignore** the supplied current `audio_text`. A missing selected
 source or ASR failure stops preparation; it never silently substitutes clean text.
-`--asr-transcript-ratio 0` is an explicit text-only ablation; `1` selects ASR for
-all samples. Notebook defaults match the CLI through `TRAIN_ASR_TRANSCRIPT_RATIO`.
+`--asr-transcript-ratio 0` is an explicit clean-text SFT ablation; `1` selects ASR
+for all SFT samples. **Both still require `--asr-model`**, because checkpoint
+selection always evaluates ASR input. Notebook defaults match the CLI through
+`TRAIN_ASR_TRANSCRIPT_RATIO`.
 
 Each SFT row records `transcript_source`. The manifest saves the ratio, seed,
 ASR model/settings, per-sample assignments and requested/retained source counts.
-Validation rollouts reuse the selected transcript without rerunning ASR. If the
+Preparation also saves ASR transcripts for the entire held-out set, reusing an
+already transcribed current request where possible. Validation rollouts reuse
+these ASR transcripts without loading ASR alongside the LLM. If the
 explicit diagnostic skip policy removes samples, retained counts may differ from
 the requested ratio; both counts are reported. Create a new SFT/run directory to
 apply the mix; older prepared data is rejected by the current preparation policy.
@@ -573,7 +584,7 @@ have been removed; legacy outputs requesting it are invalid proposals and consum
 `MAX_TOOL_DETAILS` setting have also been removed.
 
 Unavailable/schema-invalid gold labels still fail with the sample ID. Training
-transcripts are required; the default mix requires `--asr-model`. No
+transcripts and ASR weights for held-out evaluation are required at every mix ratio. No
 synthetic tool results or gold arguments are inserted into earlier prompts. Loss
 masks system/user/padding tokens and trains only the assistant JSON and its
 end-of-turn tokens. The notebook defaults to `TRAIN_MISSING_TOOL_POLICY="error"`;
@@ -596,10 +607,20 @@ and logs for every stage.
 
 The default selection metric is **`eval_state_tool_score` (0–100), higher is better**,
 not teacher-forced `eval_loss`. After each epoch, the current model runs the same
-agent/JSON decoding used for inference on every held-out TRAIN sample ID (10% by
-default, split before SFT expansion). ASR is not loaded during these rollouts:
-validation uses the train transcript/history resolved during preparation, so this
-measures the tool agent rather than end-to-end audio accuracy.
+agent decoding used for inference on every held-out TRAIN sample ID (10% by
+default, split before SFT expansion), using **ASR transcripts for all IDs**.
+The training mixture remains 50:50 by default; teacher-forced validation loss
+still uses the assigned SFT sources. ASR runs during preparation and is not
+loaded during LLM rollouts, so selection measures the agent on cached ASR input
+without including ASR latency.
+
+Pass `--eval-clean-transcripts` to `finetune.py` or `train_lora.py` to additionally
+evaluate clean `audio_text` on the same held-out IDs. This optional comparison
+runs separate rollouts, each with exactly one fresh ToolEnv per sample, and
+approximately doubles the rollout work. Its metrics are named `eval_clean_*`
+and its reports are separate; **only ASR `eval_state_tool_score` selects the
+checkpoint**. Clean text must be available for every held-out sample when this
+option is enabled. In the notebook set `TRAIN_EVAL_CLEAN_TRANSCRIPTS=True`.
 
 Preparation replays gold calls through the train-specific `ToolEnv` and saves the
 result of `env.get_state_hash()`. If a gold hash is supplied in labels, it must
@@ -636,8 +657,9 @@ Audit files: `sft/validation_rollouts.jsonl` (inputs, replayed gold hashes/calls
 private train text/tool results. All held-out IDs must be evaluated: skipped
 validation samples are rejected, and unexpected runtime/evaluation failures stop
 the run rather than silently reducing the denominator. Old SFT folders without
-rollout metadata must be regenerated; old loss-selected checkpoints cannot be
-resumed with the new selection settings.
+ASR-only rollout-policy metadata must be regenerated in a new directory;
+older mixed-source rollout data is rejected. Old loss-selected checkpoints
+cannot be resumed with the new selection settings.
 
 ### Validation error diagnostics
 

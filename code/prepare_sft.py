@@ -7,9 +7,9 @@ import sys
 
 from main import resolve_data_layout
 from lifemate.catalog import load_catalog
-from lifemate.sft import (DEFAULT_ASR_TRANSCRIPT_RATIO, SFT_PROMPT_POLICY, UnexposedToolError,
+from lifemate.sft import (DEFAULT_ASR_TRANSCRIPT_RATIO, SFT_PROMPT_POLICY, VALIDATION_ROLLOUT_POLICY, UnexposedToolError,
                          asr_transcript_ratio, assign_transcript_sources, file_sha256,
-                         prepare_train_transcript, replay_sample, split_records)
+                         prepare_train_transcript, prepare_validation_transcripts, replay_sample, split_records)
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
 from lifemate.text import TEXT_NORMALIZATION
 
@@ -24,15 +24,15 @@ def main():
     p.add_argument("--missing-tool-policy", choices=["error", "skip"], default="error",
                    help="Skip/report whole samples whose gold tools are absent from prompts, or stop")
     p.add_argument("--asr-transcript-ratio", type=asr_transcript_ratio, default=DEFAULT_ASR_TRANSCRIPT_RATIO,
-                   help="Fraction of sample IDs using ASR instead of audio_text in each partition (default 0.5)")
-    p.add_argument("--asr-model", type=Path, help="Required when --asr-transcript-ratio > 0")
+                   help="Fraction of SFT sample IDs using ASR instead of audio_text (default 0.5); rollout selection always uses ASR")
+    p.add_argument("--asr-model", type=Path, help="Required for ASR validation rollouts at every training mix ratio")
     p.add_argument("--device", choices=["cpu"], default="cpu", help="ASR is CPU-only")
     p.add_argument("--asr-precision", choices=["int8", "fp32"], default="int8")
     p.add_argument("--asr-threads", type=int, default=4)
     args = p.parse_args()
     configure_cuda_device(args)
-    if args.asr_transcript_ratio > 0 and args.asr_model is None:
-        p.error("--asr-model is required when --asr-transcript-ratio > 0 (default 0.5)")
+    if args.asr_model is None:
+        p.error("--asr-model is required for ASR validation rollouts, even when --asr-transcript-ratio is 0")
     split_dir, env_root, holder = resolve_data_layout(args.data_root, "train")
     source = split_dir / "train.jsonl"
     records = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -82,6 +82,8 @@ def main():
                 try:
                     prepared = prepare_train_transcript(record, split_dir, asr,
                                                         transcript_source=sources[record["id"]])
+                    if partition == "validation":
+                        asr_prepared, clean_prepared = prepare_validation_transcripts(record, split_dir, asr, prepared)
                     examples = replay_sample(record, catalog, env, split_dir, asr,
                                              prepared_transcript=prepared)
                 except UnexposedToolError as exc:
@@ -102,7 +104,8 @@ def main():
                         raise ValueError(f"{record['id']}: replayed gold hash differs from the provided gold hash")
                     rollout_rows.append({
                         "item": {k: v for k, v in record.items() if k not in ("label", "audio_text")},
-                        "prepared_transcript": prepared,
+                        "prepared_transcript": asr_prepared,
+                        "clean_prepared_transcript": clean_prepared,
                         "gold_tool_calls": record["label"]["tool_calls"], "gold_state_hash": gold_hash,
                     })
                 retained_ids.append(record["id"])
@@ -127,7 +130,9 @@ def main():
         raise ValueError("State/tool checkpoint selection requires every held-out validation sample; do not skip them")
     rollout_path = args.output_dir / "validation_rollouts.jsonl"
     rollout_path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rollout_rows), encoding="utf-8")
-    metadata["validation_rollouts"] = {"path": rollout_path.name, "sha256": file_sha256(rollout_path)}
+    metadata["validation_rollouts"] = {"path": rollout_path.name, "sha256": file_sha256(rollout_path),
+        "policy": VALIDATION_ROLLOUT_POLICY, "selection_transcript_source": "asr",
+        "clean_view_samples": sum(r["clean_prepared_transcript"] is not None for r in rollout_rows)}
     (args.output_dir / "manifest.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     print("Prepared TRAIN-only SFT data:", args.output_dir)
     if holder is not None:

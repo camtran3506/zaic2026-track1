@@ -12,15 +12,18 @@ from .catalog import load_catalog
 from .eval_diagnostics import DiagnosticSummary, analyze_rollout
 from .eval_trace import EvalTraceWriter, exception_details
 from .scoring import call_f1, state_tool_score
-from .sft import file_sha256, validate_prompt_policy
+from .sft import VALIDATION_ROLLOUT_POLICY, file_sha256, validate_prompt_policy
 
 
 class StateToolEvaluator:
-    def __init__(self, sft_dir, manifest):
+    def __init__(self, sft_dir, manifest, *, require_clean_transcripts=False):
         validate_prompt_policy(manifest)
         info = manifest.get("validation_rollouts")
         if not info:
             raise ValueError("Missing validation rollout data; rerun prepare_sft.py with the current code")
+        if (info.get("policy") != VALIDATION_ROLLOUT_POLICY
+                or info.get("selection_transcript_source") != "asr"):
+            raise ValueError("Validation rollouts must use the ASR-only selection policy; rerun prepare_sft.py")
         path = sft_dir / info["path"]
         if file_sha256(path) != info["sha256"]:
             raise ValueError("Validation rollout data changed after preparation")
@@ -31,6 +34,19 @@ class StateToolEvaluator:
                 or set(ids) & set(manifest["partitions"]["train"]["sample_ids"])
                 or valid["skipped_samples"]):
             raise ValueError("Rollouts must cover all held-out validation IDs, with no train IDs or skipped samples")
+        for row in self.rows:
+            sample_id = row["item"]["id"]
+            prepared = row.get("prepared_transcript", {})
+            if (prepared.get("id") != sample_id or prepared.get("transcript_source") != "asr"
+                    or not isinstance(prepared.get("transcript"), str) or not isinstance(prepared.get("history"), list)):
+                raise ValueError("Every held-out selection rollout requires ASR text; rerun prepare_sft.py")
+            clean = row.get("clean_prepared_transcript")
+            if clean is not None and (clean.get("id") != sample_id
+                    or clean.get("transcript_source") != "audio_text"
+                    or not isinstance(clean.get("transcript"), str) or clean.get("history") != prepared["history"]):
+                raise ValueError("Clean diagnostic views must match the ASR held-out IDs and history; rerun prepare_sft.py")
+        if require_clean_transcripts and any(not row.get("clean_prepared_transcript") for row in self.rows):
+            raise ValueError("Clean diagnostic evaluation requires audio_text for every held-out sample")
         source = Path(manifest["source"])
         if file_sha256(source) != manifest["source_sha256"]:
             raise ValueError("Source TRAIN data changed after preparation")
@@ -49,7 +65,13 @@ class StateToolEvaluator:
         if self.holder is not None:
             self.holder.cleanup()
 
-    def evaluate(self, llm, output_path):
+    def evaluate(self, llm, output_path, *, transcript_source="asr"):
+        """Run one independent rollout/view; only ASR metrics select checkpoints."""
+        if transcript_source not in {"asr", "audio_text"}:
+            raise ValueError("Validation transcript source must be asr or audio_text")
+        prepared_key = "prepared_transcript" if transcript_source == "asr" else "clean_prepared_transcript"
+        if any(not row.get(prepared_key) for row in self.rows):
+            raise ValueError("Clean diagnostic evaluation requires audio_text for every held-out sample")
         output_path = Path(output_path)
         scores, f1s, hashes = [], [], []
         diagnostics = DiagnosticSummary()
@@ -64,14 +86,15 @@ class StateToolEvaluator:
                 # Golds are used only below for scoring, never passed into the agent.
                 item = copy.deepcopy(row["item"])
                 item.pop("label", None)
-                source = row["prepared_transcript"].get("transcript_source", "unknown")
+                prepared = row[prepared_key]
+                source = prepared["transcript_source"]
                 emit = trace.for_sample(item["id"])
                 emit({"event": "sample_start", "transcript_source": source,
-                      "request_transcript": row["prepared_transcript"]["transcript"]})
+                      "request_transcript": prepared["transcript"]})
                 try:
                     env = self.tool_env("train", item["id"], root=str(self.env_root))
                     stats = agent.run(item, env, self.split_dir, "train",
-                        prepared_transcript=copy.deepcopy(row["prepared_transcript"]), trace=emit)
+                        prepared_transcript=copy.deepcopy(prepared), trace=emit)
                     calls, state_hash = env.get_tool_calls(), env.get_state_hash()
                     if not isinstance(calls, list) or not isinstance(state_hash, str) or not state_hash:
                         raise ValueError(f"{item['id']}: invalid ToolEnv call log/state hash")
@@ -103,6 +126,8 @@ class StateToolEvaluator:
                 "eval_tool_call_f1": 100 * sum(f1s) / n,
                 "eval_state_match_rate": 100 * sum(hashes) / n,
                 "eval_rollout_samples": n, **diagnostics.metrics()}
+        if transcript_source == "audio_text":
+            metrics = {key.replace("eval_", "eval_clean_", 1): value for key, value in metrics.items()}
         summary_path = output_path.with_suffix(".diagnostics.json")
         summary_partial = summary_path.with_suffix(".partial.json")
         summary_partial.write_text(json.dumps({**diagnostics.as_dict(), "metrics": metrics,
@@ -115,7 +140,7 @@ class StateToolEvaluator:
         return metrics
 
 
-def score_callback(evaluator, tokenizer, output_dir, fast_language_model=None):
+def score_callback(evaluator, tokenizer, output_dir, fast_language_model=None, *, eval_clean_transcripts=False):
     # Called only after Unsloth has been imported/patched by the training entrypoint.
     from transformers import TrainerCallback
     from .models import LocalLLM
@@ -151,6 +176,9 @@ def score_callback(evaluator, tokenizer, output_dir, fast_language_model=None):
                     model.config.use_cache = True
                     llm = LocalLLM.from_loaded_model(model, tokenizer)
                     result = evaluator.evaluate(llm, path)
+                    if eval_clean_transcripts:
+                        clean_path = path.with_name(path.stem + ".clean.jsonl")
+                        result.update(evaluator.evaluate(llm, clean_path, transcript_source="audio_text"))
             finally:
                 if fast_language_model is not None:
                     fast_language_model.for_training(model)
@@ -166,6 +194,11 @@ def score_callback(evaluator, tokenizer, output_dir, fast_language_model=None):
                 log.write(json.dumps({"step": state.global_step, "epoch": state.epoch,
                     "rollouts": str(path), "diagnostics": str(path.with_suffix(".diagnostics.json")),
                     "trace": str(path.with_suffix(".trace.jsonl")),
+                    "selection_transcript_source": "asr",
+                    **({"clean_rollouts": str(clean_path),
+                        "clean_diagnostics": str(clean_path.with_suffix(".diagnostics.json")),
+                        "clean_trace": str(clean_path.with_suffix(".trace.jsonl"))}
+                       if eval_clean_transcripts else {}),
                     **result}) + "\n")
             logging.info("Validation state/tool score: %.4f/100", result["eval_state_tool_score"])
             return control

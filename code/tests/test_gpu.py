@@ -98,14 +98,28 @@ def test_child_processes_inherit_single_gpu(monkeypatch, tmp_path, pipeline):
         base = tmp_path / 'base'
         base.mkdir()
         monkeypatch.setattr(sys, 'argv', ['finetune.py', '--data-root', 'data', '--asr-model', 'asr',
-            '--base-model', str(base), '--output-dir', str(tmp_path / 'run')])
+            '--base-model', str(base), '--output-dir', str(tmp_path / 'run'), '--eval-clean-transcripts'])
         finetune.main()
         assert [Path(cmd[1]).name for cmd, _ in observed] == ['prepare_sft.py', 'train_lora.py']
         prepare = observed[0][0]
         assert prepare[prepare.index('--asr-transcript-ratio') + 1] == '0.5'
         assert prepare[prepare.index('--asr-model') + 1] == 'asr'
         assert '--asr-transcript-ratio' not in observed[1][0]
+        assert '--eval-clean-transcripts' not in prepare
+        assert '--eval-clean-transcripts' in observed[1][0]
     assert [mask for _, mask in observed] == ['2', '2']
+
+
+def test_finetune_clean_sft_still_requires_asr_before_creating_run(monkeypatch, tmp_path, capsys):
+    import finetune
+    output = tmp_path / 'run'
+    monkeypatch.setattr(sys, 'argv', ['finetune.py', '--data-root', 'data',
+        '--base-model', 'unused-model', '--output-dir', str(output), '--asr-transcript-ratio', '0'])
+    with pytest.raises(SystemExit) as exc:
+        finetune.main()
+    assert exc.value.code == 2
+    assert 'ASR-only checkpoint evaluation' in capsys.readouterr().err
+    assert not output.exists()
 
 
 def test_server_forwards_gpu_argument(tmp_path):

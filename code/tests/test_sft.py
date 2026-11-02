@@ -60,6 +60,8 @@ def test_gold_tool_must_exist_in_complete_prompt(monkeypatch):
 
 def test_prepare_skip_reports_whole_samples_and_retains_partition_ids(tmp_path, monkeypatch):
     import prepare_sft
+    import lifemate.models
+    import lifemate.transcripts
     source = tmp_path / 'data' / 'train'
     source.mkdir(parents=True)
     records = [dict(labeled(), id=f'train_{i}') for i in range(8)]
@@ -70,13 +72,18 @@ def test_prepare_skip_reports_whole_samples_and_retains_partition_ids(tmp_path, 
     class HashEnv(FakeEnv):
         def get_state_hash(self): return 'fixture-gold-hash'
     monkeypatch.setitem(sys.modules, 'zaic_tools', types.SimpleNamespace(ToolEnv=lambda *a, **k: HashEnv()))
+    class ASR:
+        def __init__(self, *a, **kw): pass
+        def transcribe(self, path): return 'Bật đèn phòng khách'
+    monkeypatch.setattr(lifemate.models, 'LocalASR', ASR)
+    monkeypatch.setattr(lifemate.transcripts, 'asr_identity', lambda *a: {'model': 'stub-asr'})
     def replay(record, *args, **kwargs):
         if record['id'] in rejected:
             raise UnexposedToolError(f"{record['id']}: target not exposed")
         return replay_sample(record, *args, **kwargs)
     monkeypatch.setattr(prepare_sft, 'replay_sample', replay)
     out = tmp_path / 'sft'
-    monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--asr-transcript-ratio', '0', '--data-root', str(source),
+    monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--asr-model', 'stub-asr', '--asr-transcript-ratio', '0', '--data-root', str(source),
         '--output-dir', str(out), '--validation-fraction', '0.3', '--missing-tool-policy', 'skip'])
     prepare_sft.main()
     manifest = json.loads((out / 'manifest.json').read_text())

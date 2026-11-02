@@ -172,8 +172,12 @@ class LifeMateAgent:
         def reject(error, stage, **feedback):
             nonlocal invalid
             invalid += 1
-            observations.append({"error": error, **feedback})
-            emit("decision_rejected", stage=stage, error=error)
+            # Keep the rejected proposal and validator evidence available to the
+            # next planning step. A rejection is feedback, not an executed call:
+            # deliberately avoid the `result` key used for actual tool results.
+            observation = {"error": error, "stage": stage, **feedback}
+            observations.append(observation)
+            emit("decision_rejected", **observation)
 
         while executed < self.cfg.max_calls and invalid < self.cfg.max_invalid:
             if time.monotonic() - t0 > self.cfg.sample_seconds - self.cfg.reserve_seconds:
@@ -192,7 +196,8 @@ class LifeMateAgent:
             try:
                 decision = parse_decision(raw, enabled)
             except ValueError as exc:
-                reject(str(exc), "parse", instruction="Trả về JSON hợp lệ.")
+                reject(str(exc), "parse", raw_output=raw,
+                       instruction="Trả về quyết định đúng định dạng đã được hướng dẫn bởi system prompt và chat template; không markdown hoặc diễn giải.")
                 continue
             emit("decision_parsed", decision=decision)
             if decision["action"] == "done":
@@ -200,26 +205,29 @@ class LifeMateAgent:
                 break
             name, args = decision.get("name"), decision.get("arguments")
             if not isinstance(name, str) or name not in enabled or name not in {x["name"] for x in tools["tool_schemas"]}:
-                reject(f"Tool {name!r} not exposed in tool_schemas; choose only from listed schemas.", "precheck")
+                reject(f"Tool {name!r} not exposed in tool_schemas; choose only from listed schemas.",
+                       "precheck", name=name, arguments=args)
                 continue
             if not isinstance(args, dict):
-                reject("arguments must be a JSON object", "precheck")
+                reject("arguments must be a JSON object", "precheck", name=name, arguments=args)
                 continue
             if name == "sys.ask_missing_info":
                 if args.get("tool_name") not in enabled or args.get("tool_name") == name:
-                    reject("Missing-info tool_name must be another available tool.", "precheck")
+                    reject("Missing-info tool_name must be another available tool.",
+                           "precheck", name=name, arguments=args)
                     continue
             emit("validate_start", name=name, arguments=args)
             try:
                 validation = env.validate(name, args)
             except Exception as exc:
                 emit("validate_error", name=name, arguments=args, exception=exception_details(exc))
-                reject(str(exc), "validate", name=name)
+                reject(str(exc), "validate", name=name, arguments=args, exception=exception_details(exc))
                 continue
             accepted = isinstance(validation, dict) and bool(validation.get("ok"))
             emit("validate_result", name=name, arguments=args, result=validation, accepted=accepted)
             if not accepted:
-                reject(f"Schema invalid: {validation!r}", "validate", name=name)
+                reject(f"Schema invalid: {validation!r}", "validate", name=name,
+                       arguments=args, validation=validation)
                 continue
             # This is the *only* place execution takes place. Calls that fail are logged by ToolEnv.
             emit("call_start", name=name, arguments=args, call_index=executed)

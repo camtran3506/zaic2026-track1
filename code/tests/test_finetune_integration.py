@@ -66,7 +66,7 @@ def test_train_adapter_reload_and_merge(tmp_path, architecture):
     (data / 'train_tools_catalog.json').write_text(json.dumps({'apps': [{'tools': [
         {'name': 'home.read', 'kind': 'read', 'parameters': {'type': 'object', 'properties': {}}}]}]}))
     (data / 'train.jsonl').write_text(''.join(json.dumps({
-        'id': f'train_{i}', 'audio_text': 'Kiểm tra thiết bị',
+        'id': f'train_{i}', 'audio': f'train_{i}.wav', 'audio_text': 'Kiểm tra thiết bị',
         'context': {'installed_apps': {'home': {'tools': ['home.read']}}}, 'history': [],
         'label': {'tool_calls': [{'name': 'home.read', 'arguments': {}}]},
     }) + '\n' for i in range(4)))
@@ -81,13 +81,36 @@ def test_train_adapter_reload_and_merge(tmp_path, architecture):
     def get_tool_calls(self): return self.calls
     def get_state_hash(self): return 'fixture-unchanged-state'
 ''')
+    # Real audio loading/model provenance with a stubbed recognizer: no ONNX
+    # downloads are needed to exercise ASR-only held-out checkpoint selection.
+    import numpy as np
+    import soundfile as sf
+    for i in range(4):
+        sf.write(data / f'train_{i}.wav', np.zeros(1600, dtype=np.float32), 16000)
+    asr = tmp_path / 'asr'
+    asr.mkdir()
+    for filename in ('encoder.int8.onnx', 'decoder.int8.onnx', 'joiner.int8.onnx', 'tokens.txt'):
+        (asr / filename).write_bytes(b'fixture ASR export')
+    stubs = tmp_path / 'stub-runtime'
+    stubs.mkdir()
+    (stubs / 'sherpa_onnx.py').write_text('''from types import SimpleNamespace
+class OfflineRecognizer:
+    @staticmethod
+    def from_transducer(**kwargs):
+        class Stream:
+            result = SimpleNamespace(text='ASR kiểm tra thiết bị')
+            def accept_waveform(self, rate, samples):
+                assert rate == 16000 and len(samples) == 1600
+        return SimpleNamespace(create_stream=Stream, decode_streams=lambda streams: None)
+''')
     app = Path(__file__).resolve().parents[1]
     run = tmp_path / 'run'
     env = {**os.environ, 'CUDA_VISIBLE_DEVICES': '', 'OMP_NUM_THREADS': '1',
-           'PYTHONDONTWRITEBYTECODE': '1', 'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1'}
+           'PYTHONDONTWRITEBYTECODE': '1', 'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1',
+           'PYTHONPATH': str(stubs) + os.pathsep + os.environ.get('PYTHONPATH', '')}
     result = subprocess.run([sys.executable, app / 'finetune.py', '--data-root', data.parent,
         '--base-model', base, '--output-dir', run, '--backend', 'transformers',
-        '--asr-transcript-ratio', '0',  # This LoRA-only fixture has no ASR/audio; mixing has dedicated tests.
+        '--asr-transcript-ratio', '0', '--asr-model', asr, '--eval-clean-transcripts',
         '--max-steps', '2', '--gradient-accumulation', '1', '--save-steps', '1',
         '--learning-rate', '0.01', '--export-merged'],
         env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
@@ -122,12 +145,20 @@ def test_train_adapter_reload_and_merge(tmp_path, architecture):
     assert 0 <= metrics['eval_state_tool_score'] <= 100
     assert metrics['eval_rollout_samples'] == 1
     assert config['selection_metric'] == 'eval_state_tool_score'
+    assert config['selection_transcript_source'] == 'asr'
+    assert metrics['eval_clean_rollout_samples'] == metrics['eval_rollout_samples']
+    rollouts = [json.loads(line) for line in (run / 'sft/validation_rollouts.jsonl').read_text().splitlines()]
+    assert all(row['prepared_transcript']['transcript_source'] == 'asr' for row in rollouts)
+    assert all(row['clean_prepared_transcript']['transcript_source'] == 'audio_text' for row in rollouts)
     trainer_state = json.loads((run / 'training/trainer_state.json').read_text())
     assert config['best_state_tool_score'] == trainer_state['best_metric']
     assert (run / 'training/validation_scores.jsonl').is_file()
     attempts = [json.loads(line) for line in (run / 'training/validation_scores.jsonl').read_text().splitlines()]
     assert attempts
     for attempt in attempts:
+        assert attempt['selection_transcript_source'] == 'asr'
+        assert Path(attempt['clean_rollouts']).is_file()
+        assert Path(attempt['clean_trace']).is_file()
         trace_path = Path(attempt['trace'])
         assert trace_path.is_file()
         events = [json.loads(line) for line in trace_path.read_text().splitlines()]
@@ -154,6 +185,7 @@ def test_train_adapter_reload_and_merge(tmp_path, architecture):
         '--sft-dir', run / 'sft', '--output-dir', run / 'training', '--backend', 'transformers',
         '--max-steps', '3', '--gradient-accumulation', '1', '--save-steps', '1',
         '--learning-rate', '0.01',
+        '--eval-clean-transcripts',
         '--resume-from-checkpoint', run / 'training/checkpoint-2'],
         env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
     assert resume.returncode == 0, resume.stdout

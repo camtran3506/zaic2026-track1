@@ -18,21 +18,23 @@ def main():
     p.add_argument("--base-model", required=True, help="Local directory or Hugging Face model ID")
     p.add_argument("--revision", default="main", help="HF commit or revision; resolved SHA is logged")
     p.add_argument("--output-dir", type=Path, required=True)
-    p.add_argument("--asr-model", type=Path, help="Local ASR weights; required for the default 50:50 transcript mix")
+    p.add_argument("--asr-model", type=Path, help="Local ASR weights; required for ASR-only checkpoint evaluation at every training mix ratio")
     p.add_argument("--asr-transcript-ratio", type=asr_transcript_ratio, default=DEFAULT_ASR_TRANSCRIPT_RATIO,
                    help="Fraction of sample IDs using ASR transcripts (default 0.5)")
     p.add_argument("--asr-device", choices=["cpu"], default="cpu")
     p.add_argument("--asr-precision", choices=["int8", "fp32"], default="int8")
     p.add_argument("--asr-threads", type=int, default=4)
     p.add_argument("--validation-fraction", type=float, default=0.1)
+    p.add_argument("--eval-clean-transcripts", action="store_true",
+                   help="Also evaluate clean text on the same held-out IDs for diagnostics; select checkpoints using ASR only")
     p.add_argument("--missing-tool-policy", choices=["error", "skip"], default="error")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--export-merged", action="store_true", help="Needs RAM/disk for full-precision base + adapter")
     # Remaining args are forwarded to train_lora.py, e.g. --max-steps or --quantization.
     args, training_options = p.parse_known_args()
     configure_cuda_device(args)
-    if args.asr_transcript_ratio > 0 and args.asr_model is None:
-        p.error("--asr-model is required when --asr-transcript-ratio > 0 (default 0.5)")
+    if args.asr_model is None:
+        p.error("--asr-model is required for ASR-only checkpoint evaluation, including --asr-transcript-ratio 0")
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise FileExistsError("Choose an empty run directory. To resume training use train_lora.py directly.")
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -68,6 +70,8 @@ def main():
         prepare.extend(["--asr-model", args.asr_model, "--device", args.asr_device,
                         "--asr-precision", args.asr_precision, "--asr-threads", str(args.asr_threads)])
     run("prepare_sft.py", prepare)
+    if args.eval_clean_transcripts:
+        training_options.append("--eval-clean-transcripts")
     run("train_lora.py", [*training_options, "--base-model", base, "--sft-dir", args.output_dir / "sft",
                           "--output-dir", args.output_dir / "training", "--seed", args.seed])
     if args.export_merged:
