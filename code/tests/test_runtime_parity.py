@@ -43,10 +43,10 @@ def assert_history_parity(tmp_path, history, expected):
 def test_audio_only_history_for_all_roles_matches_sft_and_inference(tmp_path):
     history = [{'role': 'assistant', 'audio': 'assistant.wav'},
                {'speaker': 'system', 'audio_path': 'system.wav'},
-               {'role': 'user', 'text': ' ĐỪNG sửa, 08:30! '}]
-    expected = [{'role': 'assistant', 'text': '  GIỮ chữ HOA, dấu câu! assistant.wav'},
-                {'role': 'system', 'text': '  GIỮ chữ HOA, dấu câu! system.wav'},
-                {'role': 'user', 'text': ' ĐỪNG sửa, 08:30! '}]
+               {'role': 'user', 'text': 'Đừng sửa, 08:30!'}]
+    expected = [{'role': 'assistant', 'text': 'Giữ chữ hoa, dấu câu! assistant.wav.'},
+                {'role': 'system', 'text': 'Giữ chữ hoa, dấu câu! system.wav.'},
+                {'role': 'user', 'text': 'Đừng sửa, 08:30!'}]
     assert_history_parity(tmp_path, history, expected)
 
 
@@ -61,10 +61,11 @@ def test_all_usable_history_turns_and_long_text_reach_every_workflow(tmp_path):
     valid = [{'role': 'user', 'text': f' TURN-{i}! '} for i in range(15)]
     valid[-1]['text'] = ' A! ' * 500
     history = valid + [{'role': 'user'}, None, {'role': 'assistant', 'text': ''}]
-    expected = valid
+    expected = [{'role': 'user', 'text': f'Turn-{i}!'} for i in range(14)]
+    expected.append({'role': 'user', 'text': 'A! ' + 'a! ' * 498 + 'a!'})
     cached, prepared = assert_history_parity(tmp_path, history, expected)
     assert len(cached['history']) == 15  # Full history remains available on disk.
-    assert cached['history'][-1]['text'] == valid[-1]['text']
+    assert cached['history'][-1]['text'] == expected[-1]['text']
     assert prepared['history'] == expected
 
 

@@ -190,3 +190,17 @@ def test_native_protocol_is_persisted_and_legacy_json_adapter_rejected(artifact)
     (adapter / RUNTIME_MANIFEST).write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match='regenerate SFT and retrain'):
         load_runtime_manifest(base, tok, adapter)
+
+
+@pytest.mark.parametrize('policy', [None, 'old-normalization'])
+def test_runtime_rejects_different_text_normalization(artifact, policy):
+    from lifemate.text import TEXT_NORMALIZATION
+    base, adapter, tok, manifest = artifact
+    assert manifest['text_normalization'] == TEXT_NORMALIZATION
+    if policy is None:
+        manifest.pop('text_normalization')
+    else:
+        manifest['text_normalization'] = policy
+    (adapter / RUNTIME_MANIFEST).write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match='Text normalization differs'):
+        load_runtime_manifest(base, tok, adapter)

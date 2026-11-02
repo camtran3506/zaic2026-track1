@@ -9,6 +9,7 @@ from typing import Any
 
 from .catalog import allowed_tools, prompt_catalog
 from .history import prompt_history, resolve_history
+from .text import normalize_transcript
 
 SYSTEM_PROMPT = """Bạn là AI Agent LifeMate. Chỉ xuất ĐÚNG MỘT JSON object, KHÔNG markdown hoặc diễn giải.
 Bạn có transcript yêu cầu nói tiếng Việt, context, history, các tool được cài và kết quả các calls trước.
@@ -118,9 +119,9 @@ def build_step_prompt(transcript, context, history, enabled, observations):
     """Use the same complete catalog, history and observations in SFT/inference."""
     tools = prompt_catalog(enabled)
     info = {
-        "request_transcript": transcript,
+        "request_transcript": normalize_transcript(transcript),
         "user_context": {k: v for k, v in context.items() if k != "installed_apps"},
-        "conversation_history": history,
+        "conversation_history": prompt_history(history),
         "available_tools": tools,
         "previous_actions_and_results": observations,
     }
@@ -142,7 +143,7 @@ class LifeMateAgent:
         context = item.get("context", {})
         enabled = allowed_tools(self.catalog, context.get("installed_apps", {}))
         if len(enabled) == 1:  # only sys.ask_missing_info; no app can act
-            return {"transcript": prepared_transcript["transcript"] if prepared_transcript else "",
+            return {"transcript": normalize_transcript(prepared_transcript["transcript"]) if prepared_transcript else "",
                     "elapsed_seconds": 0, "executed": 0, "invalid_proposals": 0,
                     "stop_reason": "no_available_tools"}
         if prepared_transcript is not None:
@@ -155,6 +156,7 @@ class LifeMateAgent:
             if transcript is None:
                 transcript = self.asr.transcribe(audio_path(split_dir, item["audio"]))
             history = history_text(item.get("history", []), split_dir, self.asr, t0, self.cfg.sample_seconds)
+        transcript = normalize_transcript(transcript)
         observations: list[dict] = []
         invalid = 0
         executed = 0

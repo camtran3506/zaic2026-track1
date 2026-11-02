@@ -22,7 +22,7 @@ def dataset(tmp_path):
         rows.append({'id': f'public_{i}', 'audio': f'{i}.wav',
             'context': {'installed_apps': {'home': {'tools': ['home.read']}}},
             'history': [{'role': 'user', 'audio': 'history.wav'},
-                        {'role': 'assistant', 'text': 'Earlier answer'}]})
+                        {'role': 'assistant', 'text': 'Earlier answer.'}]})
     (split / 'history.wav').write_bytes(b'history fixture')
     (split / 'public_test.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in rows))
     (split / 'public_test_tools_catalog.json').write_text(json.dumps({'apps': [{'tools': [
@@ -44,9 +44,9 @@ def test_cache_current_and_history_is_complete_and_reusable(dataset, tmp_path):
     asr = ASR()
     prepare_transcripts(items, split, cache, identity, {'model': 'medium'}, lambda: asr)
     rows, metadata = load_transcripts(cache, identity)
-    assert rows[0]['transcript'] == 'recognized:0.wav'
-    assert rows[0]['history'] == [{'role': 'user', 'text': 'recognized:history.wav'},
-                                  {'role': 'assistant', 'text': 'Earlier answer'}]
+    assert rows[0]['transcript'] == 'Recognized:0.wav.'
+    assert rows[0]['history'] == [{'role': 'user', 'text': 'Recognized:history.wav.'},
+                                  {'role': 'assistant', 'text': 'Earlier answer.'}]
     assert metadata['status'] == 'complete'
     assert len(rows) == 3
     def must_not_load():
@@ -73,9 +73,9 @@ def test_public_request_uses_asr_and_full_history_is_saved(dataset, tmp_path):
     cache = tmp_path / 'all-text.jsonl'
     prepare_transcripts(items, split, cache, identity, {}, ASR)
     row = load_transcripts(cache, identity)[0][0]
-    assert row['transcript'] == 'recognized:0.wav'
+    assert row['transcript'] == 'Recognized:0.wav.'
     assert len(row['history']) == 18
-    assert row['history'][2] == {'role': 'assistant', 'text': 'recognized:history.wav'}
+    assert row['history'][2] == {'role': 'assistant', 'text': 'Recognized:history.wav.'}
     assert len(row['history'][-1]['text']) > 1700
     with pytest.raises(ValueError, match='forbidden'):
         dataset_identity(items, split, 'public_test', use_train_transcript=True)
@@ -126,8 +126,8 @@ class LocalLLM:
         event('llm_load')
     def generate(self,system,user):
         payload=json.loads(user)
-        assert payload['request_transcript'].startswith('recognized:')
-        assert payload['conversation_history'][0]['text']=='recognized:history.wav'
+        assert payload['request_transcript'].startswith('Recognized:')
+        assert payload['conversation_history'][0]['text']=='Recognized:history.wav.'
         return '{"action":"done"}' if payload['previous_actions_and_results'] else '{"action":"call","name":"home.read","arguments":{}}'
 ''')
     (split / 'zaic_tools.py').write_text('''class ToolEnv:
@@ -176,12 +176,12 @@ def test_agent_default_is_unlimited_and_uses_only_prepared_history():
         def transcribe(self, path): raise AssertionError('LLM stage tried to run ASR')
     class Planner:
         def generate(self, system, user):
-            assert json.loads(user)['request_transcript'] == 'cached request'
+            assert json.loads(user)['request_transcript'] == 'Cached request.'
             return '{"action":"done"}'
     prepared = {'id': 'train_0001', 'transcript': 'cached request', 'history': []}
     result = LifeMateAgent(NoAudio(), Planner(), CATALOG, AgentConfig()).run(
         item(), FakeEnv(), Path('/unused'), 'train', prepared_transcript=prepared)
-    assert result['transcript'] == 'cached request'
+    assert result['transcript'] == 'Cached request.'
 
 
 def test_repo_cli_defaults_to_single_gpu_and_unlimited_time(monkeypatch):

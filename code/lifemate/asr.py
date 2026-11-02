@@ -1,6 +1,7 @@
 """Offline GIPformer 1.5 ONNX transducer inference on CPU."""
 from collections import OrderedDict
 from pathlib import Path
+from .text import normalize_transcript
 
 ASR_REPO_ID = "g-group-ai-lab/gipformer1.5-68M-rnnt"
 ASR_BACKEND = "sherpa-onnx"
@@ -57,7 +58,7 @@ class LocalASR:
         stream = self.model.create_stream()
         stream.accept_waveform(sample_rate, samples)
         self.model.decode_streams([stream])
-        result = stream.result.text
+        result = normalize_transcript(stream.result.text)
         self.cache[key] = result
         if len(self.cache) > 512:
             self.cache.popitem(last=False)

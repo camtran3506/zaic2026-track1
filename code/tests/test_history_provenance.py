@@ -106,7 +106,7 @@ def test_old_tool_only_history_is_retained_with_all_later_turns():
     resolved = prompt_history(resolve_history(history, None))
     assert len(resolved) == 21
     assert resolved[0]['tool_results'] == HISTORY[0]['tool_results']
-    assert resolved[-1]['text'] == '19'
+    assert resolved[-1]['text'] == '19.'
 
 
 @pytest.mark.parametrize('result_kind', ['object', 'string', 'error'])

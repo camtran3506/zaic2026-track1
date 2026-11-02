@@ -115,7 +115,7 @@ class LocalASR:
 class LocalLLM:
     def __init__(self, path, **kwargs): event('llm', path, kwargs.get('adapter_path'))
     def generate(self, system, user):
-        assert json.loads(user)['request_transcript'] == 'bật đèn'
+        assert json.loads(user)['request_transcript'] == 'Bật đèn.'
         return '{"action":"done"}'
 ''')
     asr = app / "models/asr"

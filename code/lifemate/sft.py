@@ -10,9 +10,10 @@ from .agent import (SYSTEM_PROMPT, _train_transcript, audio_path, build_step_pro
                     full_json, history_text)
 from .catalog import allowed_tools
 from .llm import chat_token_ids
+from .text import TEXT_NORMALIZATION, normalize_transcript
 
 
-SFT_PROMPT_POLICY = "full-context-native-fc-mix-v3"
+SFT_PROMPT_POLICY = "full-context-native-fc-mix-normalized-v4"
 DEFAULT_ASR_TRANSCRIPT_RATIO = 0.5
 
 
@@ -38,8 +39,9 @@ def assign_transcript_sources(records, ratio=DEFAULT_ASR_TRANSCRIPT_RATIO, seed=
 
 
 def validate_prompt_policy(manifest):
-    if manifest.get("prompt_policy") != SFT_PROMPT_POLICY:
-        raise ValueError("Prepared SFT data uses an older schema/history/function-calling policy; "
+    if (manifest.get("prompt_policy") != SFT_PROMPT_POLICY
+            or manifest.get("text_normalization") != TEXT_NORMALIZATION):
+        raise ValueError("Prepared SFT data uses an older prompt/text-normalization policy; "
                          "rerun prepare_sft.py in a new output directory")
 
 
@@ -82,6 +84,7 @@ def prepare_train_transcript(item, split_dir, asr=None, *, transcript_source=Non
         transcript_source = "audio_text"
     if not isinstance(transcript, str):
         raise ValueError(f"{item['id']}: transcript must be text")
+    transcript = normalize_transcript(transcript)
     class MissingASR:
         def transcribe(self, path):
             raise ValueError("History audio needs --asr-model or a train history transcript")

@@ -206,7 +206,7 @@ def test_callback_restores_training_mode_and_unsloth_state(tmp_path, fail):
     assert calls == ['inference', 'training']
 
 
-@pytest.mark.parametrize('policy', [None, 'shortened-context-v0', 'full-context-native-fc-v2'])
+@pytest.mark.parametrize('policy', [None, 'shortened-context-v0', 'full-context-native-fc-v2', 'full-context-native-fc-mix-v3'])
 def test_old_prepared_data_requires_regeneration(prepared, policy):
     out, _, _, _ = prepared
     manifest = json.loads((out / 'manifest.json').read_text())

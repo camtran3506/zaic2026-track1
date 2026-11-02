@@ -10,11 +10,11 @@ import time
 
 from .agent import _train_transcript, audio_path
 from .history import history_entries as iter_history_entries, resolve_history
+from .text import TEXT_NORMALIZATION, normalize_transcript
 
 LOG = logging.getLogger("lifemate.asr")
-# Version 3 also preserves structured historical tool results for the planner.
-# Older caches discarded this evidence and must be rebuilt.
-TRANSCRIPT_CACHE_VERSION = 3
+# Version 4 records the shared utterance normalization policy.
+TRANSCRIPT_CACHE_VERSION = 4
 
 
 def sha256_file(path):
@@ -36,7 +36,7 @@ def read_jsonl(path):
 
 
 def history_entries(item):
-    """Keep full history transcripts on disk; agent applies prompt history limits later."""
+    """Yield all history text/audio without a turn or character limit."""
     yield from iter_history_entries(item.get("history", []))
 
 
@@ -89,6 +89,9 @@ def validate_rows(rows, identity, complete=True):
         if any(not isinstance(turn, dict) or not isinstance(turn.get("role"), str)
                or not isinstance(turn.get("text"), str) for turn in row["history"]):
             raise ValueError(f"Invalid cached history: {row.get('id')}")
+        if (row["transcript"] != normalize_transcript(row["transcript"])
+                or any(turn["text"] != normalize_transcript(turn["text"]) for turn in row["history"])):
+            raise ValueError(f"Cached text violates transcript normalization: {row.get('id')}")
         if not isinstance(row.get("asr_seconds"), (float, int)) or row["asr_seconds"] < 0:
             raise ValueError(f"Invalid ASR timing: {row.get('id')}")
 
@@ -99,6 +102,8 @@ def load_transcripts(path, identity, expected_asr=None):
     manifest = json.loads(manifest_path.read_text(encoding="utf-8"))
     if manifest.get("version") != TRANSCRIPT_CACHE_VERSION:
         raise ValueError("Transcript cache format changed; rebuild with --refresh-transcripts")
+    if manifest.get("text_normalization") != TEXT_NORMALIZATION:
+        raise ValueError("Transcript normalization changed; rebuild with --refresh-transcripts")
     if manifest.get("status") != "complete":
         raise ValueError("Transcript cache is incomplete; finish the ASR stage first")
     if manifest.get("dataset") != identity:
@@ -121,7 +126,8 @@ def prepare_transcripts(items, split_dir, cache_path, identity, asr_settings, as
         LOG.info("Reusing completed ASR cache: %s (%d samples)", cache_path, len(rows))
         return
     cache_path.parent.mkdir(parents=True, exist_ok=True)
-    header = {"version": TRANSCRIPT_CACHE_VERSION, "dataset": identity, "asr": asr_settings}
+    header = {"version": TRANSCRIPT_CACHE_VERSION, "dataset": identity, "asr": asr_settings,
+              "text_normalization": TEXT_NORMALIZATION}
     rows = []
     if partial.exists():
         previous = json.loads(partial_manifest.read_text(encoding="utf-8")) if partial_manifest.exists() else None
@@ -149,6 +155,7 @@ def prepare_transcripts(items, split_dir, cache_path, identity, asr_settings, as
                 transcript = _train_transcript(item) if identity["use_train_transcript"] else None
                 if transcript is None:
                     transcript = transcribe(item["audio"])
+                transcript = normalize_transcript(transcript)
                 history = resolve_history(item.get("history", []), transcribe)
                 row = {"id": item["id"], "transcript": transcript, "history": history,
                        "asr_seconds": round(time.monotonic() - start, 6)}

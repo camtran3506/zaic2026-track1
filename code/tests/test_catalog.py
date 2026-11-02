@@ -92,7 +92,8 @@ def test_large_payload_preserves_all_fields_without_size_fitting():
     assert {t['name']: t for t in tools['tool_schemas']} == catalog
     assert next(t['description'] for t in tools['tool_index'] if t['name'] == target) == catalog[target]['description']
     assert payload['user_context'] == {'profile': {'notes': 'x' * 6000}}
-    assert payload['conversation_history'] == history
+    assert payload['conversation_history'] == [
+        {'role': 'user', 'text': f'Lượt {i}: ' + 'lịch sử! ' * 999 + 'lịch sử!'} for i in range(20)]
     assert payload['previous_actions_and_results'] == observations
     assert (catalog, history, observations) == original
 

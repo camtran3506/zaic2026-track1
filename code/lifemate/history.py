@@ -1,5 +1,6 @@
-"""Shared verbatim history handling for ASR caches, SFT and inference."""
+"""Shared normalized history handling for ASR caches, SFT and inference."""
 from copy import deepcopy
+from .text import normalize_transcript
 
 
 def history_tool_pairs(turn):
@@ -43,6 +44,8 @@ def resolve_history(history, transcribe):
         role, text, audio = next(history_entries([turn]))
         if text is None and audio:
             text = transcribe(audio)
+        if text is not None:
+            text = normalize_transcript(text)
         pairs = history_tool_pairs(turn)
         if text or pairs:
             resolved = {"role": role, "text": text or ""}
@@ -58,7 +61,7 @@ def prompt_history(history):
     turns = [turn for turn in history if turn["text"] or history_tool_pairs(turn)]
     result = []
     for turn in turns:
-        row = {"role": turn["role"], "text": turn["text"]}
+        row = {"role": turn["role"], "text": normalize_transcript(turn["text"])}
         pairs = history_tool_pairs(turn)
         if pairs:
             row["tool_calls"] = deepcopy([call for call, _ in pairs])

@@ -54,7 +54,8 @@ def test_native_template_preserves_tools_history_and_results(native_tokenizer):
     assert {t['function']['name']: t['function'] for t in tools} == catalog
     historical = [m for m in chat[1:] if m['role'] != 'tool'][:len(history)]
     assert [json.loads(m['content']) for m in historical] == [
-        {'history_role': turn['role'], 'text': turn['text']} for turn in history]
+        {'history_role': turn['role'], 'text': 'Giữ: </think> và <think>, 08:30! ' +
+         'giữ: </think> và <think>, 08:30! ' * 98 + 'giữ: </think> và <think>, 08:30!'} for turn in history]
     assert sum(m['role'] == 'tool' for m in chat) == 11
     assert all(json.loads(m['content']) == result for m in chat if m['role'] == 'tool')
     assert json.loads(chat[-1]['content']) == {'agent_feedback': observations[-1]}

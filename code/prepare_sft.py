@@ -11,6 +11,7 @@ from lifemate.sft import (DEFAULT_ASR_TRANSCRIPT_RATIO, SFT_PROMPT_POLICY, Unexp
                          asr_transcript_ratio, assign_transcript_sources, file_sha256,
                          prepare_train_transcript, replay_sample, split_records)
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
+from lifemate.text import TEXT_NORMALIZATION
 
 
 def main():
@@ -58,6 +59,7 @@ def main():
     metadata = dict(source=str(source), source_sha256=file_sha256(source),
                     catalog_sha256=file_sha256(catalog_path), seed=args.seed,
                     prompt_policy=SFT_PROMPT_POLICY, missing_tool_policy=args.missing_tool_policy,
+                    text_normalization=TEXT_NORMALIZATION,
                     transcript_mixing={"policy": "seeded-sample-v1", "unit": "sample",
                                        "asr_ratio": args.asr_transcript_ratio, "seed": args.seed,
                                        "rounding": "nearest-total-and-train-validation-remainder"},

@@ -75,7 +75,7 @@ SFT JSONL still stores the portable LifeMate payload and action target. At
 **tokenization**, the shared adapter turns call targets into structured assistant
 `tool_calls`; it does not teach the model the custom action-call JSON format.
 Inference uses the same conversion, including every history turn and result.
-Historical text is wrapped in JSON to preserve boundary whitespace and literal
+Normalized historical text is wrapped in JSON to preserve its content and literal
 reasoning markers through the native template. Only assistant target tokens
 (including native call delimiters and end-of-turn) receive training loss.
 
@@ -90,7 +90,7 @@ Other model families keep the portable JSON-decision protocol. Runtime manifests
 record `qwen35-native-fc-v1` for Qwen3.5; an old Qwen3.5 JSON-protocol adapter is
 rejected instead of silently mixing protocols. Regenerate SFT in a fresh directory
 and retrain that adapter. The current preparation policy is
-`full-context-native-fc-mix-v3`. Production never replaces the checkpoint template;
+`full-context-native-fc-mix-normalized-v4`. Production never replaces the checkpoint template;
 tests use a pinned upstream Qwen3.5 template fixture without downloading weights.
 
 ## 1. Install dependencies on the server
@@ -148,8 +148,8 @@ The CPU recognizer uses `OfflineRecognizer.from_transducer`, 16 kHz features,
 80 feature dimensions and greedy decoding. SoundFile decodes PCM to float32,
 channels are averaged to mono, and `accept_waveform` receives the original
 sample rate so sherpa-onnx resamples internally if needed. Empty, nonfinite and
-out-of-range audio is rejected. The recognizer output is cached verbatim, preserving case, punctuation,
-Unicode representation and whitespace. `--asr-threads 4` controls CPU concurrency independently
+out-of-range audio is rejected. Recognizer output uses the shared utterance
+normalization below before caching and model input. `--asr-threads 4` controls CPU concurrency independently
 of `--device` / CUDA GPU selection for the LLM.
 
 Example ASR-only run (no LLM weights or Torch/CUDA needed for this stage):
@@ -269,7 +269,7 @@ including tool-only turns. Tool results are not clipped. The on-disk transcript
 cache retains this same full history, so compatible caches can be reused.
 Regenerate older SFT datasets in a new output directory: shortened data cannot
 be recovered by the trainer. Training and rollout evaluation reject manifests
-without the current `prompt_policy: full-context-native-fc-mix-v3` marker.
+without the current `prompt_policy: full-context-native-fc-mix-normalized-v4` marker.
 `--use-train-transcript` still requires `split=train`; test request audio is always
 transcribed rather than read from a possible `audio_text` field.
 
@@ -283,21 +283,40 @@ cache is reused without reloading ASR; use a different cache per ASR variant, or
 detect ordinary replacement; they are not cryptographic hashes of all source audio
 and model weights. Keep the original data and frozen model revisions for reproduction.
 
-### Verbatim transcript text
+### Shared transcript normalization
 
-ASR output, TRAIN `audio_text` and history text are passed through as provided.
-The pipeline does not lowercase, convert Unicode forms, remove punctuation or
-collapse whitespace. For example, ` BẬT đèn, lúc 08:30! ` stays unchanged in the
-cache, LLM prompt and SFT input. Existing history length/token limits still apply.
-After rendering the chat template, inference tokenizes with
-`add_special_tokens=False` so BOS/EOS tokens already inserted by the template
-are not added a second time. This matches the SFT prefix tokenization.
+ASR output, TRAIN `audio_text` and the text of every history turn use the same
+`lifemate.text.normalize_transcript` function in finetuning and inference:
 
-Transcript caches now use manifest version 3. Rebuild older caches with
-`--refresh-transcripts` in ASR/full mode, or choose a new path. A completed cache
-from the previous text-processing pipeline is rejected, including in LLM-only
-mode; old partial prefixes cannot be mixed into new runs. Regenerate existing
-SFT datasets in a new output directory to retain original text and history tool evidence.
+1. Normalize Unicode to NFC.
+2. Lowercase the whole turn; collapse Unicode whitespace to single spaces and
+   strip leading/trailing whitespace.
+3. Capitalize only the first alphabetic character of the turn, including after
+   leading quotes/digits. Later sentences remain lowercase.
+4. Append a period if terminal punctuation is absent. Existing `.`, `?`, `!` or
+   `…` endings (also inside closing quotes/brackets) are kept without an extra dot.
+   Empty/whitespace-only text stays empty.
+
+For example, `  BẬT\tĐÈN PHÒNG KHÁCH  ` becomes `Bật đèn phòng khách.` and
+`TẮT ĐÈN. ĐẶT BÁO THỨC.` becomes `Tắt đèn. đặt báo thức.`. Existing internal
+punctuation, diacritics and numeric separators are preserved; no turn or content
+is truncated. The function does not infer sentence boundaries, split joined words, correct
+ASR errors or convert spoken numbers. Case changes also apply to names/emails
+inside utterance text. Structured tool schemas, arguments, results, context and
+SFT target calls remain unchanged. No extra model or tool call is needed.
+
+Normalization is idempotent and applies at ASR, cache and prompt boundaries, so
+both sources in the existing 50:50 mixture and direct/cached inference use the
+same style. Original dataset files are not modified. After rendering the chat
+template, inference still tokenizes with `add_special_tokens=False`, matching SFT.
+
+Transcript caches now use manifest **version 4**, recording
+`text_normalization: nfc-whitespace-lower-initial-terminal-v1`. Rebuild old caches
+with `--refresh-transcripts` in ASR/full mode or choose a new path. LLM-only mode
+rejects stale caches, and incompatible partial prefixes cannot be resumed into
+new ones. Regenerate existing SFT in a fresh directory and retrain adapters;
+prepared-data and runtime manifests verify the normalization policy rather than
+silently mixing old and new input styles.
 
 With `--stage full`, the default cache is `<output-stem>.transcripts.jsonl`, and
 stdout/stderr for both stages is saved to `<cache-stem>.asr.log` and

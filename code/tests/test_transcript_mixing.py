@@ -35,7 +35,7 @@ def test_invalid_ratios_fail(ratio):
         assign_transcript_sources([{'id': 'train_1'}], ratio)
 
 
-def test_explicit_sources_never_substitute_clean_text_or_normalize_asr(tmp_path):
+def test_explicit_sources_normalize_without_substituting_clean_text(tmp_path):
     entry = dict(labeled(), audio='request.wav')
     calls = []
     raw = '  ASR sai dấu, lúc 08:30!  '
@@ -44,9 +44,9 @@ def test_explicit_sources_never_substitute_clean_text_or_normalize_asr(tmp_path)
             calls.append(path)
             return raw
     human = prepare_train_transcript(entry, tmp_path, ASR(), transcript_source='audio_text')
-    assert human['transcript'] == entry['audio_text'] and not calls
+    assert human['transcript'] == entry['audio_text'] + '.' and not calls
     noisy = prepare_train_transcript(entry, tmp_path, ASR(), transcript_source='asr')
-    assert noisy['transcript'] == raw and noisy['transcript_source'] == 'asr'
+    assert noisy['transcript'] == 'Asr sai dấu, lúc 08:30!' and noisy['transcript_source'] == 'asr'
     assert calls == [tmp_path / 'request.wav']
     entry.pop('audio_text')
     with pytest.raises(ValueError, match='selected audio_text source is missing'):
@@ -105,7 +105,6 @@ def test_preparation_default_mix_reuses_sources_in_all_steps_and_validation(
     monkeypatch.setattr(lifemate.models, 'LocalASR', ASR)
     monkeypatch.setattr(lifemate.transcripts, 'asr_identity', lambda *a: {'model': 'stub-asr', 'precision': 'int8'})
     monkeypatch.setitem(sys.modules, 'zaic_tools', SimpleNamespace(ToolEnv=Env))
-    clean_text = {r['id']: r['audio_text'] for r in records}
     golds = {r['id']: r['label']['tool_calls'] for r in records}
     assignments = []
     for attempt in range(2):
@@ -132,9 +131,9 @@ def test_preparation_default_mix_reuses_sources_in_all_steps_and_validation(
                 expected_source = info['transcript_sources'][sample_id]
                 assert step['transcript_source'] == expected_source
                 prompt = json.loads(step['messages'][1]['content'])
-                expected = clean_text[sample_id] if expected_source == 'audio_text' else f'  ASR {sample_id}: lỗi nhận dạng!  '
+                expected = f'Human {sample_id.removeprefix("train_")}!' if expected_source == 'audio_text' else f'Asr {sample_id}: lỗi nhận dạng!'
                 assert prompt['request_transcript'] == expected
-                assert prompt['conversation_history'] == [{'role': 'user', 'text': ' Full history! '}]
+                assert prompt['conversation_history'] == [{'role': 'user', 'text': 'Full history!'}]
                 # Gold targets and previous real observations are source-independent.
                 decision = json.loads(step['messages'][-1]['content'])
                 if decision['action'] == 'call':
