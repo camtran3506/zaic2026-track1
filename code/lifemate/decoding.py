@@ -53,9 +53,7 @@ def complete_decision_json(text: str) -> str | None:
             action = decision.get('action')
             if action in ('done', 'finish', 'stop', 'none'):
                 return candidate
-            if action == 'inspect' and isinstance(decision.get('name'), str):
-                return candidate
-            if (action == 'call' or ('name' in decision and 'arguments' in decision)):
+            if (action == 'call' or ('action' not in decision and 'name' in decision and 'arguments' in decision)):
                 if isinstance(decision.get('name'), str) and isinstance(decision.get('arguments'), dict):
                     return candidate
     return None

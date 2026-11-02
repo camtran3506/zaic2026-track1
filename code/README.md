@@ -10,7 +10,7 @@ ASR and LLM weights are never resident together during the main pipeline. `main.
 defaults to `--stage full`: it waits for the ASR subprocess to complete and exit
 before launching the LLM subprocess. The notebook runs these two stages in separate
 cells/subprocesses. Per-sample time is unlimited by default (`--sample-seconds inf`);
-`max_calls`, `max_invalid`, schema-inspection and token/context limits still apply.
+`max_calls`, `max_invalid` and token/context limits still apply.
 
 Defaults: `Qwen/Qwen3.5-4B` (~4.0B, Apache-2.0) and `g-group-ai-lab/gipformer1.5-68M-rnnt` (~68M). Total model parameters ~4.07B; LLM <5B. Training and inference share a 16,384-token context limit. Inference defaults to 16,000 prompt tokens + up to 384 generated tokens per decision. Check all model/dependency licenses and freeze revisions before submission. Neither model is fetched at runtime.
 
@@ -360,7 +360,7 @@ cache to repeat only LLM inference; keep the manifest beside that cache. To run
 without fine-tuning set `TRAIN_LLM=False` and choose base weights or `LOCAL_ADAPTER`.
 
 Greedy inference now stops immediately after the first complete decision JSON
-(`call`, `inspect`, `done`, or the supported `tool_calls` wrapper). The stop check
+(`call`, `done`, or the supported `tool_calls` wrapper). The stop check
 only examines generated tokens, respects nested objects/arrays and escaped strings,
 and ignores JSON inside thinking blocks. The generation returns the complete
 decision rather than trailing explanations. Tool availability and argument schema
@@ -548,10 +548,10 @@ text clipping, tool-result clipping, or limit on the number of past observations
 included in a prompt. Each step sees all earlier real calls, arguments, results
 and validation errors. JSON serialization still uses compact whitespace; it does
 not shorten field values or remove fields. SFT emits call/done examples directly;
-it no longer inserts schema-inspection examples. Inference accepts legacy
-`inspect` decisions for compatibility, but all schemas are already visible and
-inspection never changes the prompt or calls ToolEnv. `--max-tool-details` and the
-notebook's `MAX_TOOL_DETAILS` setting have been removed.
+all schemas are already visible. The internal `inspect` action and its counters
+have been removed; legacy outputs requesting it are invalid proposals and consume
+`max_invalid`, never executing a tool. `--max-tool-details` and the notebook's
+`MAX_TOOL_DETAILS` setting have also been removed.
 
 Unavailable/schema-invalid gold labels still fail with the sample ID. Training
 transcripts are required; the default mix requires `--asr-model`. No

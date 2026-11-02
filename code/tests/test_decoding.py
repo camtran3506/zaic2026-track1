@@ -8,7 +8,6 @@ from lifemate.decoding import complete_decision_json, DecisionJsonStoppingCriter
 
 @pytest.mark.parametrize('obj', [
     {'action': 'done'},
-    {'action': 'inspect', 'name': 'home.read'},
     {'action': 'call', 'name': 'home.write', 'arguments': {
         'nested': {'list': [1, {'text': 'a } { brace, "quote", \\ slash, tiếng Việt'}]},
         'literal': '<think>this is an argument, not a reasoning block'}},
@@ -23,7 +22,7 @@ def test_only_stops_on_complete_outer_decision(obj):
 
 def test_skips_reasoning_and_non_decision_objects():
     assert complete_decision_json('<think>{"action":"done"}') is None
-    assert complete_decision_json('<think>{"action":"done"}</think> {"action":"inspect","name":"a.b"}') == '{"action":"inspect","name":"a.b"}'
+    assert complete_decision_json('<think>{"action":"done"}</think> {"action":"call","name":"a.b","arguments":{}}') == '{"action":"call","name":"a.b","arguments":{}}'
     assert complete_decision_json('{"reason":"not a decision"} {"action":"done"}') == '{"action":"done"}'
     assert complete_decision_json('{"arguments":{"action":"done"}}') is None
     assert complete_decision_json('{"action":"call","name":"x","arguments":') is None
@@ -79,3 +78,13 @@ def test_hf_generate_stops_before_trailing_tokens_and_ignores_prompt_json():
         max_input_tokens=6000, max_new_tokens=8)
     assert json.loads(llm.generate('system', 'user')) == {'action': 'done'}
     assert produced == [3]
+
+
+@pytest.mark.parametrize('arguments', [None, {}, {'action': 'done'}])
+def test_removed_action_does_not_trigger_decision_stopping(arguments):
+    decision = {'action': 'inspect', 'name': 'home.read'}
+    if arguments is not None:
+        decision['arguments'] = arguments
+    text = json.dumps(decision)
+    for end in range(len(text) + 1):
+        assert complete_decision_json(text[:end]) is None

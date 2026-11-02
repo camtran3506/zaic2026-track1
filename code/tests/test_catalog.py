@@ -3,6 +3,8 @@ from copy import deepcopy
 import json
 from pathlib import Path
 
+import pytest
+
 from lifemate.agent import AgentConfig, LifeMateAgent, build_step_prompt, parse_decision
 from lifemate.sft import replay_sample
 from test_baseline import CATALOG, FakeEnv, StubASR, item
@@ -34,7 +36,7 @@ class CatalogEnv(FakeEnv):
         return {'ok': name == 'smart_home.zz_custom' and args == {'mode': 'on'}}
 
 
-def test_sft_exposes_every_schema_from_the_first_step_without_inspection():
+def test_sft_exposes_every_schema_from_the_first_step():
     catalog, target = large_catalog()
     env = CatalogEnv()
     rows = replay_sample(sample(catalog, target), catalog, env, Path('/unused'))
@@ -49,7 +51,7 @@ def test_sft_exposes_every_schema_from_the_first_step_without_inspection():
     assert [r['step'] for r in rows] == [0, 1]
 
 
-def test_inference_can_execute_any_allowed_tool_without_inspection():
+def test_inference_can_execute_any_allowed_tool():
     catalog, target = large_catalog()
     entry = sample(catalog, target)
     class Planner:
@@ -63,7 +65,7 @@ def test_inference_can_execute_any_allowed_tool_without_inspection():
             return '{"action":"done"}'
     llm, env = Planner(), CatalogEnv()
     stats = LifeMateAgent(StubASR(), llm, catalog, AgentConfig()).run(entry, env, Path('/unused'), 'train')
-    assert stats['executed'] == 1 and stats['schema_inspections'] == 0
+    assert stats['executed'] == 1
     assert stats['invalid_proposals'] == 0
     assert env.calls == [{'name': target, 'arguments': {'mode': 'on'}}]
 
@@ -95,18 +97,42 @@ def test_large_payload_preserves_all_fields_without_size_fitting():
     assert (catalog, history, observations) == original
 
 
-def test_legacy_inspection_does_not_hide_or_replace_schemas():
+@pytest.mark.parametrize('arguments', [None, {}, {'action': 'done'}])
+def test_removed_action_is_invalid_even_with_arguments(arguments):
     catalog, target = large_catalog()
+    decision = {'action': 'inspect', 'name': target}
+    if arguments is not None:
+        decision['arguments'] = arguments
+    raw = json.dumps(decision)
+    with pytest.raises(ValueError, match='Unsupported agent action'):
+        parse_decision(raw)
     class Planner:
         def __init__(self): self.prompts = []
         def generate(self, system, user):
             self.prompts.append(user)
             if len(self.prompts) == 1:
-                return json.dumps({'action': 'inspect', 'name': target})
-            assert user == self.prompts[0]
+                return raw
+            feedback = json.loads(user)['previous_actions_and_results']
+            assert 'Unsupported agent action' in feedback[-1]['error']
             return '{"action":"done"}'
     llm, env = Planner(), CatalogEnv()
     stats = LifeMateAgent(StubASR(), llm, catalog, AgentConfig()).run(
         sample(catalog, target), env, Path('/unused'), 'train')
-    assert stats['schema_inspections'] == 1 and not env.calls
-    assert parse_decision('{"action":"inspect","name":"x.y"}') == {'action': 'inspect', 'name': 'x.y'}
+    assert stats['invalid_proposals'] == 1 and not env.calls
+    assert stats['stop_reason'] == 'done'
+    assert 'schema_inspections' not in stats
+
+
+def test_repeated_removed_action_uses_invalid_budget_and_never_executes():
+    catalog, target = large_catalog()
+    class Planner:
+        count = 0
+        def generate(self, system, user):
+            self.count += 1
+            return json.dumps({'action': 'inspect', 'name': target})
+    llm, env = Planner(), CatalogEnv()
+    stats = LifeMateAgent(StubASR(), llm, catalog, AgentConfig()).run(
+        sample(catalog, target), env, Path('/unused'), 'train')
+    assert llm.count == stats['invalid_proposals'] == 3
+    assert stats['stop_reason'] == 'max_invalid'
+    assert not env.calls

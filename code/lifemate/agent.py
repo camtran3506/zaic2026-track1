@@ -56,10 +56,10 @@ def parse_decision(raw: str, catalog=None) -> dict:
             obj = obj["tool_calls"][0]
         if obj.get("action") in ("done", "finish", "stop", "none"):
             return {"action": "done"}
-        if obj.get("action") == "inspect":
-            return {"action": "inspect", "name": obj.get("name")}
-        if obj.get("action") == "call" or ("name" in obj and "arguments" in obj):
+        if obj.get("action") == "call" or ("action" not in obj and "name" in obj and "arguments" in obj):
             return {"action": "call", "name": obj.get("name"), "arguments": obj.get("arguments")}
+        if "action" in obj:
+            raise ValueError(f"Unsupported agent action: {obj['action']!r}")
     raise ValueError(f"Model did not produce a valid tool decision: {raw}")
 
 
@@ -158,8 +158,6 @@ class LifeMateAgent:
         observations: list[dict] = []
         invalid = 0
         executed = 0
-        inspected_tool = None
-        inspections = 0
         stop_reason = None
         while executed < self.cfg.max_calls and invalid < self.cfg.max_invalid:
             if time.monotonic() - t0 > self.cfg.sample_seconds - self.cfg.reserve_seconds:
@@ -177,17 +175,6 @@ class LifeMateAgent:
             if decision["action"] == "done":
                 stop_reason = "done"
                 break
-            if decision["action"] == "inspect":
-                # Compatibility with older adapters: all schemas are already exposed.
-                name = decision.get("name")
-                if (not isinstance(name, str) or name not in enabled or name == inspected_tool
-                        or inspections >= self.cfg.max_calls):
-                    invalid += 1
-                    observations.append({"error": "Invalid, duplicate or excessive schema inspection"})
-                else:
-                    inspected_tool = name
-                    inspections += 1
-                continue
             name, args = decision.get("name"), decision.get("arguments")
             if not isinstance(name, str) or name not in enabled or name not in {x["name"] for x in tools["tool_schemas"]}:
                 invalid += 1
@@ -223,5 +210,5 @@ class LifeMateAgent:
         if stop_reason is None:
             stop_reason = "max_calls" if executed >= self.cfg.max_calls else "max_invalid"
         return {"transcript": transcript, "elapsed_seconds": round(time.monotonic() - t0, 3),
-                "executed": executed, "invalid_proposals": invalid, "schema_inspections": inspections,
+                "executed": executed, "invalid_proposals": invalid,
                 "stop_reason": stop_reason}
