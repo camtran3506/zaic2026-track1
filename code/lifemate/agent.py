@@ -143,7 +143,8 @@ class LifeMateAgent:
         enabled = allowed_tools(self.catalog, context.get("installed_apps", {}))
         if len(enabled) == 1:  # only sys.ask_missing_info; no app can act
             return {"transcript": prepared_transcript["transcript"] if prepared_transcript else "",
-                    "elapsed_seconds": 0, "executed": 0, "invalid_proposals": 0}
+                    "elapsed_seconds": 0, "executed": 0, "invalid_proposals": 0,
+                    "stop_reason": "no_available_tools"}
         if prepared_transcript is not None:
             if prepared_transcript.get("id") != item["id"]:
                 raise ValueError("Prepared transcript ID does not match current sample")
@@ -159,8 +160,10 @@ class LifeMateAgent:
         executed = 0
         inspected_tool = None
         inspections = 0
+        stop_reason = None
         while executed < self.cfg.max_calls and invalid < self.cfg.max_invalid:
             if time.monotonic() - t0 > self.cfg.sample_seconds - self.cfg.reserve_seconds:
+                stop_reason = "time_limit"
                 break
             tools, user_prompt = build_step_prompt(
                 transcript, context, history, enabled, observations)
@@ -172,6 +175,7 @@ class LifeMateAgent:
                 observations.append({"error": str(exc), "instruction": "Trả về JSON hợp lệ."})
                 continue
             if decision["action"] == "done":
+                stop_reason = "done"
                 break
             if decision["action"] == "inspect":
                 # Compatibility with older adapters: all schemas are already exposed.
@@ -214,6 +218,10 @@ class LifeMateAgent:
             executed += 1
             observations.append({"name": name, "arguments": args, "result": full_json(result)})
             if name == "sys.ask_missing_info":
+                stop_reason = "ask_missing_info"
                 break
+        if stop_reason is None:
+            stop_reason = "max_calls" if executed >= self.cfg.max_calls else "max_invalid"
         return {"transcript": transcript, "elapsed_seconds": round(time.monotonic() - t0, 3),
-                "executed": executed, "invalid_proposals": invalid, "schema_inspections": inspections}
+                "executed": executed, "invalid_proposals": invalid, "schema_inspections": inspections,
+                "stop_reason": stop_reason}

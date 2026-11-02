@@ -9,6 +9,7 @@ import sys
 
 from .agent import AgentConfig, LifeMateAgent
 from .catalog import load_catalog
+from .eval_diagnostics import DiagnosticSummary, analyze_rollout
 from .scoring import call_f1, state_tool_score
 from .sft import file_sha256, validate_prompt_policy
 
@@ -48,7 +49,9 @@ class StateToolEvaluator:
             self.holder.cleanup()
 
     def evaluate(self, llm, output_path):
+        output_path = Path(output_path)
         scores, f1s, hashes = [], [], []
+        diagnostics = DiagnosticSummary()
         agent = LifeMateAgent(None, llm, self.catalog, self.config)
         partial = output_path.with_suffix(".partial.jsonl")
         with partial.open("w", encoding="utf-8") as output:
@@ -65,21 +68,33 @@ class StateToolEvaluator:
                 score = state_tool_score(calls, row["gold_tool_calls"], state_hash,
                                          row["gold_state_hash"], self.catalog)
                 f1, _ = call_f1(calls, row["gold_tool_calls"], self.catalog)
+                diagnostic = analyze_rollout(calls, row["gold_tool_calls"], state_hash,
+                    row["gold_state_hash"], self.catalog, stats.get("stop_reason", "unknown"))
+                source = row["prepared_transcript"].get("transcript_source", "unknown")
+                diagnostics.add(diagnostic, source)
                 scores.append(score)
                 f1s.append(f1)
                 hashes.append(state_hash == row["gold_state_hash"])
                 output.write(json.dumps({"id": item["id"], "tool_calls": calls,
                     "state_hash": state_hash, "gold_state_hash": row["gold_state_hash"],
-                    "score": score, "tool_call_f1": f1, "agent_stats": stats}, ensure_ascii=False) + "\n")
+                    "gold_tool_calls": row["gold_tool_calls"], "transcript_source": source,
+                    "score": score, "tool_call_f1": f1, "agent_stats": stats,
+                    "diagnostics": diagnostic}, ensure_ascii=False) + "\n")
                 output.flush()
                 logging.info("Validation rollout %d/%d %s: score %.4f, hash_match=%s",
                              len(scores), len(self.rows), item["id"], score, hashes[-1])
-        partial.replace(output_path)
         n = len(scores)
-        return {"eval_state_tool_score": 100 * sum(scores) / n,
+        metrics = {"eval_state_tool_score": 100 * sum(scores) / n,
                 "eval_tool_call_f1": 100 * sum(f1s) / n,
                 "eval_state_match_rate": 100 * sum(hashes) / n,
-                "eval_rollout_samples": n}
+                "eval_rollout_samples": n, **diagnostics.metrics()}
+        summary_path = output_path.with_suffix(".diagnostics.json")
+        summary_partial = summary_path.with_suffix(".partial.json")
+        summary_partial.write_text(json.dumps({**diagnostics.as_dict(), "metrics": metrics},
+                                              ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
+        partial.replace(output_path)
+        summary_partial.replace(summary_path)
+        return metrics
 
 
 def score_callback(evaluator, tokenizer, output_dir, fast_language_model=None):
@@ -131,7 +146,8 @@ def score_callback(evaluator, tokenizer, output_dir, fast_language_model=None):
                 state.log_history[-1].update(result)
             with (output_dir / "validation_scores.jsonl").open("a", encoding="utf-8") as log:
                 log.write(json.dumps({"step": state.global_step, "epoch": state.epoch,
-                    "rollouts": str(path), **result}) + "\n")
+                    "rollouts": str(path), "diagnostics": str(path.with_suffix(".diagnostics.json")),
+                    **result}) + "\n")
             logging.info("Validation state/tool score: %.4f/100", result["eval_state_tool_score"])
             return control
 

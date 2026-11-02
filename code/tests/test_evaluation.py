@@ -216,3 +216,83 @@ def test_old_prepared_data_requires_regeneration(prepared, policy):
         manifest['prompt_policy'] = policy
     with pytest.raises(ValueError, match='rerun prepare_sft.py'):
         StateToolEvaluator(out, manifest)
+
+
+@pytest.mark.parametrize('mode,expected_errors,stop_reason', [
+    ('good', set(), 'done'),
+    ('wrong_args', {'state_hash_mismatch', 'missing_calls', 'extra_calls', 'wrong_arguments'}, 'done'),
+    ('early', {'state_hash_mismatch', 'missing_calls', 'early_stop'}, 'done'),
+    ('max_calls', {'state_hash_mismatch', 'missing_calls'}, 'max_calls'),
+    ('max_invalid', {'state_hash_mismatch', 'missing_calls'}, 'max_invalid'),
+    ('timeout', {'state_hash_mismatch', 'missing_calls'}, 'time_limit'),
+    ('extra', {'extra_calls'}, 'done'),
+])
+def test_eval_writes_sample_diagnostics_summary_and_metrics_without_extra_calls(
+        prepared, tmp_path, mode, expected_errors, stop_reason):
+    out, instances, _, _ = prepared
+    evaluator = StateToolEvaluator(out, json.loads((out / 'manifest.json').read_text()))
+    read = {'action': 'call', 'name': 'smart_home.get_status', 'arguments': {}}
+    write = {'action': 'call', 'name': 'smart_home.light_set',
+             'arguments': {'device_id': 'light_living', 'power': 'off' if mode == 'wrong_args' else 'on'}}
+    done = {'action': 'done'}
+    if mode == 'max_calls':
+        evaluator.config.max_calls = 1
+        outputs = [read]
+    elif mode == 'max_invalid':
+        evaluator.config.max_invalid = 1
+        outputs = ['invalid output']
+    elif mode == 'timeout':
+        evaluator.config.sample_seconds = 0
+        outputs = []
+    else:
+        outputs = [read, done] if mode == 'early' else [read, write, *([read] if mode == 'extra' else []), done]
+    class LLM:
+        def __init__(self): self.count = 0
+        def generate(self, system, user):
+            payload = json.loads(user)
+            assert not {'gold_tool_calls', 'gold_state_hash', 'diagnostics'} & payload.keys()
+            decision = outputs[self.count]
+            self.count += 1
+            return decision if isinstance(decision, str) else json.dumps(decision)
+    llm = LLM()
+    before = len(instances)
+    report_path = tmp_path / f'{mode}.jsonl'
+    try:
+        metrics = evaluator.evaluate(llm, report_path)
+    finally:
+        evaluator.close()
+    assert llm.count == len(outputs)
+    assert len(instances) == before + 1
+    assert len(instances[-1].calls) == sum(isinstance(d, dict) and d['action'] == 'call' for d in outputs)
+    report = json.loads(report_path.read_text())
+    diagnostic = report['diagnostics']
+    assert set(diagnostic['error_types']) == expected_errors
+    assert diagnostic['stop_reason'] == report['agent_stats']['stop_reason'] == stop_reason
+    assert report['gold_tool_calls'] == evaluator.rows[0]['gold_tool_calls']
+    summary = json.loads(report_path.with_suffix('.diagnostics.json').read_text())
+    assert summary['samples'] == metrics['eval_rollout_samples'] == 1
+    assert summary['metrics'] == metrics
+    assert summary['stop_reasons'][stop_reason] == 1
+    assert summary['by_transcript_source']['audio_text']['samples'] == 1
+    for error in summary['error_samples']:
+        assert summary['error_samples'][error] == int(error in expected_errors)
+        assert metrics[f'eval_{error}_samples'] == int(error in expected_errors)
+    for name in ('missing', 'extra', 'wrong_arguments'):
+        assert summary['call_counts'][name] == metrics[f'eval_{name}_calls'] == diagnostic['call_counts'][name]
+    assert all(isinstance(value, (int, float)) for value in metrics.values())
+
+
+def test_failed_eval_does_not_publish_completed_reports(prepared, tmp_path):
+    out, _, _, _ = prepared
+    evaluator = StateToolEvaluator(out, json.loads((out / 'manifest.json').read_text()))
+    class LLM:
+        def generate(self, system, user): raise RuntimeError('model failure')
+    report_path = tmp_path / 'failed.jsonl'
+    try:
+        with pytest.raises(RuntimeError, match='model failure'):
+            evaluator.evaluate(LLM(), report_path)
+    finally:
+        evaluator.close()
+    assert report_path.with_suffix('.partial.jsonl').exists()
+    assert not report_path.exists()
+    assert not report_path.with_suffix('.diagnostics.json').exists()

@@ -620,6 +620,60 @@ the run rather than silently reducing the denominator. Old SFT folders without
 rollout metadata must be regenerated; old loss-selected checkpoints cannot be
 resumed with the new selection settings.
 
+### Validation error diagnostics
+
+Each held-out TRAIN evaluation automatically writes two files under
+`training/validation_rollouts/`: `<run>.jsonl` contains per-sample predictions,
+gold calls/hashes, `agent_stats.stop_reason`, transcript source and `diagnostics`;
+`<run>.diagnostics.json` contains aggregate counts, rates and the same numeric
+metrics returned to Trainer. `validation_scores.jsonl` links both files. The
+notebook exports completed reports to Output alongside other training artifacts.
+
+Analysis happens **after** the rollout. It does not add model generations, tokens
+or tool calls, does not put gold/diagnostics into prompts, and does not access
+application environment files. The checkpoint selection metric remains
+`eval_state_tool_score`; diagnostic counters are additional observations.
+
+Error categories can overlap:
+
+| Category | Definition |
+| --- | --- |
+| `state_hash_mismatch` | Final hash differs from the saved gold replay hash. |
+| `missing_calls` | At least one gold call has no matching prediction. |
+| `extra_calls` | At least one submitted call has no matching gold call. |
+| `wrong_arguments` | After full-call matching, an unmatched prediction and gold call share a tool name but have differing arguments. |
+| `early_stop` | The agent explicitly returned `done`, the hash is wrong, and a gold call remains unattempted after full-call and same-name argument pairing. This is a conservative diagnostic indicator, not proof of the root cause. |
+
+Matching uses the scorer's same maximum one-to-one assignment, duplicate-call
+counting and exact/fuzzy argument rules, independently of call order. A wrong-arg
+call still contributes one missing gold and one extra prediction. Rejected
+proposals absent from ToolEnv's submitted-call log are tracked by
+`agent_stats.invalid_proposals`, not counted as extra executed calls. For repeated
+tool names, remaining same-name calls are paired in their original order for
+argument diagnosis only; this advisory pairing never changes the score. Reports
+include zero-based call indices and top-level argument differences (missing,
+unexpected, type mismatch or value mismatch, with complete expected/predicted
+values). Nested values are preserved, not shortened.
+
+Stop reasons are `done`, `ask_missing_info`, `max_calls`, `max_invalid`,
+`time_limit`, `no_available_tools` or `unknown`. Reaching a limit is recorded
+separately from explicit early completion. Missing a gold read with the correct
+state hash is not labeled `early_stop`; an attempted tool with wrong arguments
+alone is not sufficient either. Hash mismatch remains observable even in the
+empty-gold case, where the existing scoring rule may still award full credit.
+
+The summary separates **samples with each error** (`error_samples`, rates from
+0 to 1) from **individual calls** (`call_counts`), and groups results by
+`audio_text`, `asr` or `unknown` transcript source. Trainer receives
+`eval_<category>_samples`, `eval_missing_calls`, `eval_extra_calls`,
+`eval_wrong_arguments_calls` and `eval_stop_<reason>_samples` in addition to its
+existing metrics. These counters are also saved in `eval_results.json`.
+
+Unexpected evaluation failures still abort the run and leave `.partial` output;
+completed JSONL/summary files are promoted only after every held-out sample has
+been evaluated. This module classifies discrepancies against gold, not their
+cause: ASR mistakes or the first reasoning error require inspection of the sample.
+
 ### Run the main task with the fine-tuned adapter
 
 Keep the **exact base model** used for training. The adapter folder includes its tokenizer:

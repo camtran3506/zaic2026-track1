@@ -39,7 +39,8 @@ def calls_match(pred, gold, catalog):
                else identical(p[k], g[k]) for k in p)
 
 
-def max_matches(preds, golds, catalog):
+def match_call_indices(preds, golds, catalog):
+    """Maximum one-to-one matching as (prediction index, gold index) pairs."""
     edges = [[j for j, gold in enumerate(golds) if calls_match(pred, gold, catalog)]
              for pred in preds]
     gold_to_pred = {}
@@ -54,7 +55,13 @@ def max_matches(preds, golds, catalog):
                 return True
         return False
 
-    return sum(augment(i, set()) for i in range(len(preds)))
+    for i in range(len(preds)):
+        augment(i, set())
+    return sorted((i, j) for j, i in gold_to_pred.items())
+
+
+def max_matches(preds, golds, catalog):
+    return len(match_call_indices(preds, golds, catalog))
 
 
 def call_f1(preds, golds, catalog):
