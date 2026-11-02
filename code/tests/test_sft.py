@@ -49,7 +49,7 @@ def test_terminal_missing_info_does_not_add_done():
     assert len(replay_sample(entry, CATALOG, FakeEnv(), Path('/unused'))) == 1
 
 
-def test_gold_tool_must_exist_in_final_prompt_after_pruning(monkeypatch):
+def test_gold_tool_must_exist_in_complete_prompt(monkeypatch):
     import lifemate.sft as sft
     monkeypatch.setattr(sft, 'build_step_prompt', lambda *args: (
         {'tool_schemas': [{'name': 'smart_home.get_status'}]},

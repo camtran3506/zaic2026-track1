@@ -8,6 +8,8 @@ from pathlib import Path
 
 from .context import DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_NEW_TOKENS, MAX_CONTEXT_TOKENS
 
+from .function_calling import JSON_PROTOCOL, NATIVE_PROTOCOL
+
 DEFAULT_LLM_DTYPE = "bfloat16"
 DEFAULT_SEED = 42
 RUNTIME_MANIFEST = "lifemate_runtime.json"
@@ -119,7 +121,7 @@ def make_runtime_manifest(model_path, tokenizer, seed=DEFAULT_SEED, policy=None)
             "chat_template_kwargs": dict(getattr(tokenizer, "lifemate_template_kwargs", {})),
             "prompt": {"add_generation_prompt": True, "add_special_tokens": False},
             "generation": deepcopy(policy) if policy else generation_policy(tokenizer, model_path, seed),
-            "output_protocol": "lifemate-decision-json-v1"}
+            "output_protocol": NATIVE_PROTOCOL if getattr(tokenizer, "lifemate_native_fc", False) is True else JSON_PROTOCOL}
 
 
 def save_runtime_manifest(output_dir, manifest):
@@ -150,8 +152,9 @@ def load_runtime_manifest(model_path, tokenizer, artifact_path=None):
         raise ValueError("Chat template kwargs differ from training/export")
     if manifest["prompt"] != {"add_generation_prompt": True, "add_special_tokens": False}:
         raise ValueError("Prompt tokenization policy differs from training/export")
-    if manifest["output_protocol"] != "lifemate-decision-json-v1":
-        raise ValueError("Output protocol differs from the LifeMate agent")
+    expected_protocol = NATIVE_PROTOCOL if getattr(tokenizer, "lifemate_native_fc", False) is True else JSON_PROTOCOL
+    if manifest["output_protocol"] != expected_protocol:
+        raise ValueError("Output protocol differs from the LifeMate agent; regenerate SFT and retrain the adapter")
     transformers_generation_config(manifest["generation"])
     return manifest
 

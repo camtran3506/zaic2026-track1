@@ -76,3 +76,24 @@ class DecisionJsonStoppingCriteria(StoppingCriteria):
         text = self.tokenizer.decode(generated, skip_special_tokens=False)
         self.completed_json = complete_decision_json(text)
         return self.completed_json is not None
+
+
+class NativeToolStoppingCriteria(StoppingCriteria):
+    """Wait for the entire native XML call, never a JSON object inside a parameter."""
+    def __init__(self, tokenizer, prompt_length):
+        self.tokenizer, self.prompt_length = tokenizer, prompt_length
+        self.completed_output = None
+
+    def __call__(self, input_ids, scores, **kwargs):
+        from .function_calling import complete_native_call, visible_output
+        if input_ids.shape[0] != 1:
+            raise ValueError('Native tool stopping supports one agent request at a time')
+        text = self.tokenizer.decode(input_ids[0, self.prompt_length:], skip_special_tokens=False)
+        visible = visible_output(text)
+        if '<tool_call>' in visible:
+            self.completed_output = complete_native_call(visible)
+        else:
+            # A native tool conversation still uses the explicit terminal done marker.
+            candidate = complete_decision_json(visible)
+            self.completed_output = candidate if candidate and json.loads(candidate) == {'action': 'done'} else None
+        return self.completed_output is not None

@@ -100,8 +100,62 @@ def test_tool_only_history_survives():
     assert resolved[0]['tool_results'] == HISTORY[0]['tool_results']
 
 
-def test_history_prompt_window():
-    history = HISTORY + [{'role': 'user', 'text': str(i)} for i in range(12)]
+def test_old_tool_only_history_is_retained_with_all_later_turns():
+    history = deepcopy(HISTORY) + [{'role': 'user', 'text': str(i)} for i in range(20)]
+    history[0].pop('text')
     resolved = prompt_history(resolve_history(history, None))
-    assert len(resolved) == 12
-    assert all('tool_results' not in turn for turn in resolved)
+    assert len(resolved) == 21
+    assert resolved[0]['tool_results'] == HISTORY[0]['tool_results']
+    assert resolved[-1]['text'] == '19'
+
+
+@pytest.mark.parametrize('result_kind', ['object', 'string', 'error'])
+def test_large_current_results_and_all_actions_match_sft_direct_and_cached_inference(tmp_path, result_kind):
+    entry = record()
+    entry['label']['tool_calls'] = [entry['label']['tool_calls'][0]] * 10
+    entry['history'] += [{'role': 'user', 'text': f'History {i}: ' + 'giữ! ' * 500}
+                         for i in range(20)]
+    result_text = 'Kết quả cần giữ nguyên: ' * 1000
+    class LargeEnv(Env):
+        def call(self, name, args):
+            super().call(name, args)
+            if result_kind == 'error':
+                raise RuntimeError(result_text)
+            if result_kind == 'string':
+                return result_text
+            return {'ok': True, 'rows': [{'id': 'target', 'text': result_text}],
+                    'tail': {'important': 'Không được mất'}}
+    prepared = prepare_train_transcript(entry, tmp_path)
+    examples = replay_sample(entry, CATALOG, LargeEnv(), tmp_path, prepared_transcript=prepared)
+    assert len(examples) == 11
+    final = json.loads(examples[-1]['messages'][1]['content'])
+    assert len(final['previous_actions_and_results']) == 10
+    for action in final['previous_actions_and_results']:
+        result = json.loads(action['result'])
+        if result_kind == 'error':
+            assert result == {'ok': False, 'error': repr(RuntimeError(result_text))}
+        elif result_kind == 'string':
+            assert result == result_text
+        else:
+            assert result == {'ok': True, 'rows': [{'id': 'target', 'text': result_text}],
+                              'tail': {'important': 'Không được mất'}}
+    (tmp_path / 'current.wav').write_bytes(b'fixture; ASR stubbed')
+    identity = dataset_identity([entry], tmp_path, 'train')
+    cache = tmp_path / 'cache.jsonl'
+    prepare_transcripts([entry], tmp_path, cache, identity, {}, ASR)
+    cached = load_transcripts(cache, identity)[0][0]
+    for transcript in (None, cached):
+        class LLM:
+            def __init__(self): self.steps = iter(examples); self.count = 0
+            def generate(self, system, user):
+                step = next(self.steps)
+                assert system == step['messages'][0]['content']
+                assert user == step['messages'][1]['content']
+                self.count += 1
+                return step['messages'][-1]['content']
+        llm, inference_env = LLM(), LargeEnv()
+        stats = LifeMateAgent(ASR(), llm, CATALOG, AgentConfig(max_calls=11)).run(
+            entry, inference_env, tmp_path, 'train', prepared_transcript=transcript)
+        assert llm.count == 11 and stats['executed'] == 10
+        assert stats['invalid_proposals'] == 0
+        assert inference_env.calls == entry['label']['tool_calls']

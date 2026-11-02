@@ -93,23 +93,27 @@ class LocalLLM:
     def generate(self, system: str, user: str) -> str:
         # Import lazily: Unsloth must be imported before Transformers during training.
         from transformers import StoppingCriteriaList
-        from .decoding import DecisionJsonStoppingCriteria
+        from .decoding import DecisionJsonStoppingCriteria, NativeToolStoppingCriteria
         tokenizer = self.tokenizer
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
         _, token_ids = render_prompt(tokenizer, messages)
         if len(token_ids) > self.max_input_tokens:
-            raise ValueError(f"Prompt exceeds --max-input-tokens={self.max_input_tokens}; "
-                             "increase the input budget instead of silently truncating tool schemas")
+            raise ValueError(f"Prompt has {len(token_ids)} tokens, exceeds "
+                             f"--max-input-tokens={self.max_input_tokens}; "
+                             "full schemas, history and tool results are never truncated")
         input_ids = self.torch.tensor([token_ids], dtype=self.torch.long, device=self.device)
         encoded = {"input_ids": input_ids, "attention_mask": self.torch.ones_like(input_ids)}
-        stop = DecisionJsonStoppingCriteria(tokenizer, encoded["input_ids"].shape[1])
+        native = getattr(tokenizer, "lifemate_native_fc", False) is True
+        stopping_class = NativeToolStoppingCriteria if native else DecisionJsonStoppingCriteria
+        stop = stopping_class(tokenizer, encoded["input_ids"].shape[1])
         with self.torch.inference_mode(), generation_context(
                 self.model, self.generation_policy, self.max_new_tokens) as config:
             ids = self.model.generate(
                 **encoded, generation_config=config,
                 stopping_criteria=StoppingCriteriaList([stop]),
             )
-        if stop.completed_json is not None:
-            return stop.completed_json
+        completed = stop.completed_output if native else stop.completed_json
+        if completed is not None:
+            return completed
         completion = ids[0, encoded["input_ids"].shape[1]:]
-        return tokenizer.decode(completion, skip_special_tokens=True).strip()
+        return tokenizer.decode(completion, skip_special_tokens=not native).strip()

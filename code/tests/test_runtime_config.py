@@ -181,3 +181,12 @@ def test_hf_does_not_fill_omitted_fields_from_base_model_and_restores_on_error(a
             raise RuntimeError('decode failed')
     assert base.generation_config is poisoned
     assert 'generation_config' not in vars(wrapper)
+
+
+def test_native_protocol_is_persisted_and_legacy_json_adapter_rejected(artifact):
+    base, adapter, tok, manifest = artifact
+    assert manifest['output_protocol'] == 'qwen35-native-fc-v1'
+    manifest['output_protocol'] = 'lifemate-decision-json-v1'
+    (adapter / RUNTIME_MANIFEST).write_text(json.dumps(manifest))
+    with pytest.raises(ValueError, match='regenerate SFT and retrain'):
+        load_runtime_manifest(base, tok, adapter)

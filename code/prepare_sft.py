@@ -7,7 +7,7 @@ import sys
 
 from main import resolve_data_layout
 from lifemate.catalog import load_catalog
-from lifemate.sft import UnexposedToolError, file_sha256, prepare_train_transcript, replay_sample, split_records
+from lifemate.sft import SFT_PROMPT_POLICY, UnexposedToolError, file_sha256, prepare_train_transcript, replay_sample, split_records
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
 
 
@@ -18,7 +18,6 @@ def main():
     p.add_argument("--output-dir", type=Path, required=True)
     p.add_argument("--validation-fraction", type=float, default=0.1)
     p.add_argument("--seed", type=int, default=42)
-    p.add_argument("--max-tool-details", type=int, default=35)
     p.add_argument("--missing-tool-policy", choices=["error", "skip"], default="error",
                    help="Skip/report whole samples whose gold tools are absent from prompts, or stop")
     p.add_argument("--asr-model", type=Path)
@@ -44,7 +43,7 @@ def main():
         asr = LocalASR(args.asr_model, precision=args.asr_precision, num_threads=args.asr_threads)
     metadata = dict(source=str(source), source_sha256=file_sha256(source),
                     catalog_sha256=file_sha256(catalog_path), seed=args.seed,
-                    max_tool_details=args.max_tool_details, missing_tool_policy=args.missing_tool_policy,
+                    prompt_policy=SFT_PROMPT_POLICY, missing_tool_policy=args.missing_tool_policy,
                     partitions={})
     rollout_rows = []
     for partition, rows in (("train", train), ("validation", validation)):
@@ -58,7 +57,7 @@ def main():
                 env = ToolEnv("train", record["id"], root=str(env_root))
                 try:
                     prepared = prepare_train_transcript(record, split_dir, asr)
-                    examples = replay_sample(record, catalog, env, split_dir, asr, args.max_tool_details,
+                    examples = replay_sample(record, catalog, env, split_dir, asr,
                                              prepared_transcript=prepared)
                 except UnexposedToolError as exc:
                     if args.missing_tool_policy == "error":

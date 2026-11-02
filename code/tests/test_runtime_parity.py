@@ -30,7 +30,7 @@ def assert_history_parity(tmp_path, history, expected):
 
     class LLM:
         def generate(self, system, user):
-            # Compare the complete prompt, including history-based schema selection.
+            # Compare the complete prompt, including every schema and history turn.
             assert user == sft_prompt
             return '{"action":"done"}'
 
@@ -57,12 +57,11 @@ def test_sft_requires_asr_for_audio_only_assistant_history(tmp_path):
         prepare_train_transcript(entry, tmp_path)
 
 
-def test_history_is_filtered_before_taking_last_twelve_turns(tmp_path):
+def test_all_usable_history_turns_and_long_text_reach_every_workflow(tmp_path):
     valid = [{'role': 'user', 'text': f' TURN-{i}! '} for i in range(15)]
     valid[-1]['text'] = ' A! ' * 500
     history = valid + [{'role': 'user'}, None, {'role': 'assistant', 'text': ''}]
-    expected = [{'role': 'user', 'text': f' TURN-{i}! '} for i in range(3, 14)]
-    expected.append({'role': 'user', 'text': valid[-1]['text'][:1700]})
+    expected = valid
     cached, prepared = assert_history_parity(tmp_path, history, expected)
     assert len(cached['history']) == 15  # Full history remains available on disk.
     assert cached['history'][-1]['text'] == valid[-1]['text']

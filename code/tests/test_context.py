@@ -47,3 +47,38 @@ def test_training_cannot_exceed_challenge_context():
         '--max-length', '16385'], capture_output=True, text=True)
     assert result.returncode != 0
     assert '--max-length must be between 1 and 16384' in result.stderr
+
+
+def test_complete_prompt_over_budget_fails_in_sft_and_inference_before_generation():
+    import torch
+    from types import SimpleNamespace
+    from tokenizers import Tokenizer, models, pre_tokenizers
+    from transformers import PreTrainedTokenizerFast
+    from lifemate.agent import SYSTEM_PROMPT, build_step_prompt
+    from lifemate.llm import chat_token_ids
+    from lifemate.sft import encode_example
+    from test_baseline import CATALOG
+
+    backend = Tokenizer(models.WordLevel({'[UNK]': 0, '[EOS]': 1}, unk_token='[UNK]'))
+    backend.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
+    tokenizer = PreTrainedTokenizerFast(tokenizer_object=backend, unk_token='[UNK]',
+                                       eos_token='[EOS]', pad_token='[EOS]')
+    tokenizer.chat_template = "{% for m in messages %}{{ m['role'] + ' ' + m['content'] + ' [EOS] ' }}{% endfor %}{% if add_generation_prompt %}{{ 'assistant ' }}{% endif %}"
+    history = [{'role': 'user', 'text': 'preserve all these words ' * 500}]
+    _, prompt = build_step_prompt('request', {}, history, CATALOG, [])
+    messages = [{'role': 'system', 'content': SYSTEM_PROMPT},
+                {'role': 'user', 'content': prompt},
+                {'role': 'assistant', 'content': '{"action":"done"}'}]
+    full_length = len(chat_token_ids(tokenizer, messages, add_generation_prompt=False))
+    example = {'sample_id': 'train_long', 'step': 0, 'messages': messages}
+    row = encode_example(example, tokenizer, full_length)
+    assert len(row['input_ids']) == full_length
+    with pytest.raises(ValueError, match='never truncate prompt or gold JSON'):
+        encode_example(example, tokenizer, full_length - 1)
+    model = Mock()
+    model.get_input_embeddings.return_value = SimpleNamespace(weight=torch.zeros(1))
+    model.lifemate_generation_policy = None
+    llm = LocalLLM.from_loaded_model(model, tokenizer, max_input_tokens=128, max_new_tokens=8)
+    with pytest.raises(ValueError, match='full schemas, history and tool results are never truncated'):
+        llm.generate(SYSTEM_PROMPT, prompt)
+    model.generate.assert_not_called()

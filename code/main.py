@@ -56,7 +56,6 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     p.add_argument("--max-calls", type=int, default=8)
     p.add_argument("--max-invalid", type=int, default=3)
-    p.add_argument("--max-tool-details", type=int, default=35)
     p.add_argument("--sample-seconds", type=float, default=float("inf"),
                    help="LLM agent time budget, default inf = no per-sample timeout")
     p.add_argument("--use-train-transcript", action="store_true", help="TRAIN ONLY: ablate ASR with train audio_text")
@@ -146,7 +145,7 @@ def run_llm_stage(args, items, transcript_rows, split_dir, env_root):
                    adapter_path=args.llm_adapter, device_map=args.llm_device_map,
                    max_memory_gib=args.llm_max_memory_gib, seed=args.seed)
     cfg = AgentConfig(max_calls=args.max_calls, max_invalid=args.max_invalid,
-                      max_tool_details=args.max_tool_details, sample_seconds=args.sample_seconds,
+                      sample_seconds=args.sample_seconds,
                       use_train_transcript=args.use_train_transcript)
     if args.use_train_transcript and args.split != "train":
         raise ValueError("--use-train-transcript is forbidden for test splits")

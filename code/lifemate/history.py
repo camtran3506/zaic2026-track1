@@ -54,11 +54,11 @@ def resolve_history(history, transcribe):
 
 
 def prompt_history(history):
-    """Filter first, then select twelve turns and apply the existing text limit."""
+    """Retain every usable turn and its complete text and paired tool evidence."""
     turns = [turn for turn in history if turn["text"] or history_tool_pairs(turn)]
     result = []
-    for turn in turns[-12:]:
-        row = {"role": turn["role"], "text": turn["text"][:1700]}
+    for turn in turns:
+        row = {"role": turn["role"], "text": turn["text"]}
         pairs = history_tool_pairs(turn)
         if pairs:
             row["tool_calls"] = deepcopy([call for call, _ in pairs])

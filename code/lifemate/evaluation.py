@@ -10,11 +10,12 @@ import sys
 from .agent import AgentConfig, LifeMateAgent
 from .catalog import load_catalog
 from .scoring import call_f1, state_tool_score
-from .sft import file_sha256
+from .sft import file_sha256, validate_prompt_policy
 
 
 class StateToolEvaluator:
     def __init__(self, sft_dir, manifest):
+        validate_prompt_policy(manifest)
         info = manifest.get("validation_rollouts")
         if not info:
             raise ValueError("Missing validation rollout data; rerun prepare_sft.py with the current code")
@@ -36,7 +37,7 @@ class StateToolEvaluator:
         if file_sha256(catalog_path) != manifest["catalog_sha256"]:
             raise ValueError("TRAIN catalog changed after preparation")
         self.catalog = load_catalog(catalog_path)
-        self.config = AgentConfig(max_tool_details=manifest["max_tool_details"])
+        self.config = AgentConfig()
         from main import resolve_data_layout
         _, self.env_root, self.holder = resolve_data_layout(self.split_dir, "train")
         sys.path.insert(0, str(self.split_dir))

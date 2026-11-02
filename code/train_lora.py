@@ -6,7 +6,7 @@ import logging
 import os
 from pathlib import Path
 
-from lifemate.sft import AssistantCollator, SupervisedDataset, file_sha256
+from lifemate.sft import AssistantCollator, SupervisedDataset, file_sha256, validate_prompt_policy
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
 from lifemate.context import MAX_CONTEXT_TOKENS, validate_training_length
 from lifemate.llm import is_qwen35, model_loader, lora_targets, configure_tokenizer
@@ -86,6 +86,7 @@ def main():
     if tokenizer.pad_token_id is None:
         raise ValueError("Tokenizer needs an existing pad/eos token")
     manifest = json.loads((args.sft_dir / "manifest.json").read_text())
+    validate_prompt_policy(manifest)
     data = {}
     ids = {}
     for part in ("train", "validation"):

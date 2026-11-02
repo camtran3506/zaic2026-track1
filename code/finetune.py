@@ -22,7 +22,6 @@ def main():
     p.add_argument("--asr-precision", choices=["int8", "fp32"], default="int8")
     p.add_argument("--asr-threads", type=int, default=4)
     p.add_argument("--validation-fraction", type=float, default=0.1)
-    p.add_argument("--max-tool-details", type=int, default=35)
     p.add_argument("--missing-tool-policy", choices=["error", "skip"], default="error")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--export-merged", action="store_true", help="Needs RAM/disk for full-precision base + adapter")
@@ -58,7 +57,7 @@ def main():
     env.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_DATASETS_OFFLINE="1")
     prepare = ["--data-root", args.data_root, "--output-dir", args.output_dir / "sft",
                "--validation-fraction", args.validation_fraction, "--seed", args.seed,
-               "--max-tool-details", args.max_tool_details, "--missing-tool-policy", args.missing_tool_policy]
+               "--missing-tool-policy", args.missing_tool_policy]
     if args.asr_model:
         prepare.extend(["--asr-model", args.asr_model, "--device", args.asr_device,
                         "--asr-precision", args.asr_precision, "--asr-threads", str(args.asr_threads)])

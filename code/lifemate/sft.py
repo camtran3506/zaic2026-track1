@@ -7,13 +7,22 @@ import random
 import time
 
 from .agent import (SYSTEM_PROMPT, _train_transcript, audio_path, build_step_prompt,
-                    history_text, short_json)
+                    full_json, history_text)
 from .catalog import allowed_tools
 from .llm import chat_token_ids
 
 
+SFT_PROMPT_POLICY = "full-context-native-fc-v2"
+
+
+def validate_prompt_policy(manifest):
+    if manifest.get("prompt_policy") != SFT_PROMPT_POLICY:
+        raise ValueError("Prepared SFT data uses an older schema/history/function-calling policy; "
+                         "rerun prepare_sft.py in a new output directory")
+
+
 class UnexposedToolError(ValueError):
-    """A valid gold tool is absent from the actual prompt's selected schemas."""
+    """A gold tool is absent from the actual prompt's complete schemas."""
 
 
 def split_records(records, validation_fraction=0.1, seed=42):
@@ -43,8 +52,7 @@ def prepare_train_transcript(item, split_dir, asr=None):
     return {"id": item["id"], "transcript": transcript, "history": history}
 
 
-def replay_sample(item, catalog, env, split_dir, asr=None, max_tool_details=35,
-                  prepared_transcript=None):
+def replay_sample(item, catalog, env, split_dir, asr=None, prepared_transcript=None):
     """Replay TRAIN gold in order; never expose future calls in earlier prompts."""
     calls = item.get("label", {}).get("tool_calls")
     if not isinstance(calls, list):
@@ -54,17 +62,14 @@ def replay_sample(item, catalog, env, split_dir, asr=None, max_tool_details=35,
     context = item.get("context", {})
     enabled = allowed_tools(catalog, context.get("installed_apps", {}))
     observations, examples = [], []
-    last_tool = None
-    inspected_tool = None
 
     def example(target, step):
-        tools, prompt = build_step_prompt(transcript, context, history, enabled, observations,
-                                          last_tool, max_tool_details, inspected_tool)
+        _, prompt = build_step_prompt(transcript, context, history, enabled, observations)
         exposed = json.loads(prompt)["available_tools"]["tool_schemas"]
         if target["action"] == "call" and target["name"] not in {t["name"] for t in exposed}:
             raise UnexposedToolError(
                 f"{item['id']} step {step}: target {target['name']} not exposed in prompt "
-                f"({len(exposed)} schemas) after schema inspection; check catalog prompt construction")
+                f"({len(exposed)} schemas); check catalog prompt construction")
         return {"sample_id": item["id"], "step": step, "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
@@ -81,22 +86,13 @@ def replay_sample(item, catalog, env, split_dir, asr=None, max_tool_details=35,
         validation = env.validate(name, args)
         if not isinstance(validation, dict) or not validation.get("ok"):
             raise ValueError(f"{item['id']} step {step}: gold schema invalid: {validation}")
-        _, prompt = build_step_prompt(transcript, context, history, enabled, observations,
-                                       last_tool, max_tool_details, inspected_tool)
-        exposed = {spec["name"] for spec in json.loads(prompt)["available_tools"]["tool_schemas"]}
-        if name not in exposed:
-            # Supervise an explicit schema request, just as inference can request it.
-            # The first prompt contains no gold args/schema injected from the label.
-            examples.append(example({"action": "inspect", "name": name}, len(examples)))
-            inspected_tool = name
         examples.append(example({"action": "call", "name": name, "arguments": args}, len(examples)))
         try:
             result = env.call(name, args)
         except Exception as exc:
             # Match the inference agent's observation exactly, including failed tool calls.
             result = {"ok": False, "error": repr(exc)}
-        observations.append({"name": name, "arguments": args, "result": short_json(result, 4500)})
-        last_tool = name
+        observations.append({"name": name, "arguments": args, "result": full_json(result)})
     if not calls or calls[-1]["name"] != "sys.ask_missing_info":
         examples.append(example({"action": "done"}, len(examples)))
     return examples
@@ -111,7 +107,7 @@ def encode_example(example, tokenizer, max_length):
     if full[:len(prefix)] != prefix or len(full) <= len(prefix):
         raise ValueError("Chat template cannot isolate assistant tokens safely")
     if len(full) > max_length:
-        raise ValueError(f"{example['sample_id']} step {example['step']}: {len(full)} tokens > max_length={max_length}; increase length, never truncate gold JSON")
+        raise ValueError(f"{example['sample_id']} step {example['step']}: {len(full)} tokens > max_length={max_length}; increase length, never truncate prompt or gold JSON")
     return {"input_ids": full, "attention_mask": [1] * len(full),
             "labels": [-100] * len(prefix) + full[len(prefix):]}
 

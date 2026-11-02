@@ -17,6 +17,8 @@ Bộ dữ liệu cần có `<split>.jsonl`, `<split>_tools_catalog.json`, audio 
 
 Chỉnh cấu hình bên dưới. `LIMIT=0` chạy **toàn bộ split**. Model tải từ Hugging Face trước khi suy luận; có thể dùng model gắn sẵn ở `/kaggle/input`. Model ASR mặc định là `g-group-ai-lab/gipformer1.5-68M-rnnt`, dùng trực tiếp định dạng ONNX.
 
+Qwen3.5 dùng function calling native từ chat template của checkpoint: `tools`, assistant `tool_calls` và tool responses; SFT/inference dùng chung template, không train JSON action call làm output model. Schema, lịch sử hội thoại và kết quả tool được giữ đầy đủ khi finetune và inference; không tự rút gọn khi prompt dài. Vượt giới hạn token sẽ báo lỗi rõ ràng.
+
 ASR chạy toàn bộ split (bao gồm audio lịch sử), lưu transcript rồi thoát tiến trình và giải phóng runtime CPU. LLM sau đó đọc cache; không nạp GIPformer cùng lúc. Mặc định không giới hạn thời gian mỗi mẫu (`float("inf")`); vẫn giữ giới hạn tool calls và token/context ≤16.384.
 
 Kết quả lưu trong `/kaggle/working/lifemate_runs/<RUN_NAME>/`: `transcripts.jsonl`, `transcripts.manifest.json`, `asr.log`, `submission.jsonl`, `diagnostics.jsonl`, `inference.log`, `setup.log`, `models.log`, `validation.json`, `run_config.json`, `environment.txt`, và `lifemate_artifacts.zip`. Transcript/logs có nội dung người dùng; kiểm tra trước khi chia sẻ. Đây không phải chế độ bảo đảm giới hạn 30 giây/mẫu của cuộc thi.''')
@@ -37,7 +39,7 @@ REFRESH_TRANSCRIPTS = False  # True: thay cache hoàn tất nếu đổi ASR/d�
 TRAIN_LLM = True
 TRAIN_BACKEND = "unsloth"  # backend mặc định; cần CUDA
 TRAIN_USE_ASR = False  # bật nếu train/history thiếu transcript
-TRAIN_MISSING_TOOL_POLICY = "error"  # schema thiếu sẽ được lấy qua action inspect; không mặc định bỏ mẫu
+TRAIN_MISSING_TOOL_POLICY = "error"  # toàn bộ schema được giữ; lỗi schema không mặc định bỏ mẫu
 TRAIN_DATA_ROOT = None  # None: tự tìm train/train.jsonl trong /kaggle/input
 LOCAL_ADAPTER = None   # TRAIN_LLM=False + đường dẫn adapter để dùng bản đã train
 TRAIN_EPOCHS = 3
@@ -62,7 +64,6 @@ MAX_INPUT_TOKENS = DEFAULT_MAX_INPUT_TOKENS
 MAX_NEW_TOKENS = DEFAULT_MAX_NEW_TOKENS
 MAX_CALLS = 8
 MAX_INVALID = 3
-MAX_TOOL_DETAILS = 35
 ASR_PRECISION = "int8"
 ASR_THREADS = 4
 SEED = 42
@@ -74,7 +75,7 @@ RUN_NAME = datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S_
 APP = Path("/kaggle/working/lifemate_app")
 MODEL_ROOT = Path("/kaggle/working/lifemate_models")
 OUT = Path("/kaggle/working/lifemate_runs") / RUN_NAME
-for folder in (APP / "lifemate", APP / "tests", MODEL_ROOT, OUT):
+for folder in (APP / "lifemate", APP / "tests", APP / "tests/fixtures", MODEL_ROOT, OUT):
     folder.mkdir(parents=True, exist_ok=True)
 
 def run_logged(command, log_path, *, env=None, cwd=None):
@@ -214,12 +215,13 @@ md('''## 3. Toàn bộ mã pipeline nhúng trong notebook
 
 Các cell dưới ghi mã vào `/kaggle/working/lifemate_app` để chạy trong subprocess, tách runtime tải model (online) khỏi suy luận (local-only). Logic baseline được giữ nguyên; không cần repository bên ngoài. Có cả mã fine-tune, bộ unit test và scorer train.''')
 for rel in ['lifemate/__init__.py', 'lifemate/catalog.py', 'lifemate/models.py', 'lifemate/agent.py', 'lifemate/transcripts.py', 'lifemate/decoding.py',
-            'lifemate/gpu.py', 'lifemate/context.py', 'lifemate/asr.py', 'lifemate/llm.py', 'lifemate/runtime.py', 'lifemate/history.py', 'lifemate/scoring.py', 'lifemate/evaluation.py',
+            'lifemate/gpu.py', 'lifemate/context.py', 'lifemate/function_calling.py', 'lifemate/asr.py', 'lifemate/llm.py', 'lifemate/runtime.py', 'lifemate/history.py', 'lifemate/scoring.py', 'lifemate/evaluation.py',
             'main.py', 'score_train.py', 'lifemate/sft.py', 'prepare_sft.py', 'train_lora.py',
             'merge_lora.py', 'finetune.py', 'tests/test_baseline.py', 'tests/test_sft.py',
             'tests/test_finetune_integration.py', 'tests/test_audio.py', 'tests/test_catalog_inspection.py',
             'tests/test_staged_pipeline.py', 'tests/test_decoding.py', 'tests/test_scoring.py', 'tests/test_evaluation.py',
-            'tests/test_raw_transcripts.py', 'tests/test_runtime_parity.py', 'tests/test_runtime_config.py']:
+            'tests/test_raw_transcripts.py', 'tests/test_runtime_parity.py', 'tests/test_runtime_config.py',
+            'tests/test_native_function_calling.py', 'tests/fixtures/qwen35_chat_template.jinja']:
     md(f'### `{rel}`')
     code(f'%%writefile /kaggle/working/lifemate_app/{rel}\n' + (ROOT/'code'/rel).read_text())
 
@@ -347,11 +349,11 @@ md('''## 6. Fine-tune tool calling trên TRAIN (LoRA/QLoRA)
 
 Mặc định `TRAIN_LLM=True`: huấn luyện LoRA/QLoRA, rồi tự chuyển sang **base model + adapter vừa train** cho task chính. Nhãn phải là `label.tool_calls` theo thứ tự thực thi. Replay dùng `ToolEnv` thật của train; kết quả tool trước được đưa vào prompt bước sau. Chỉ tính loss trên assistant JSON, split theo sample ID trước khi tạo các bước, không đọc nhãn test.
 
-Danh mục `tool_index` giữ toàn bộ tool được phép. Nếu gold tool chưa có schema chi tiết, dữ liệu SFT thêm action nội bộ `inspect` để yêu cầu schema trước khi gọi tool. Inference hỗ trợ cùng action; schema đã yêu cầu được giữ nguyên khi rút gọn prompt. Mặc định `TRAIN_MISSING_TOOL_POLICY="error"`, không bỏ mẫu do giới hạn top tool. `inspect` không phải tool call của BTC và không xuất vào submission.
+`tool_schemas` giữ toàn bộ schema của mọi tool được phép ngay từ bước đầu, gồm đầy đủ description, returns và metadata. History và mọi kết quả tool được giữ nguyên, không giới hạn lượt/ký tự hoặc giảm theo độ dài prompt. SFT tạo trực tiếp action call/done, không thêm bước inspect. Vượt giới hạn token sẽ báo lỗi, không tự cắt dữ liệu. Cần tạo lại SFT cũ trong thư mục mới; manifest phải có `prompt_policy=full-context-native-fc-v2`. Mặc định `TRAIN_MISSING_TOOL_POLICY="error"`, không tự bỏ mẫu lỗi schema.
 
 Muốn dùng adapter đã có: đặt `TRAIN_LLM=False`, `LOCAL_ADAPTER` tới thư mục adapter. Muốn dùng model đã merge: đặt `TRAIN_LLM=False`, `LOCAL_ADAPTER=None`, `LOCAL_LLM` tới model merged. Nếu thiếu train data khi bật training, cell sẽ dừng rõ ràng thay vì dùng model gốc âm thầm.
 
-Backend huấn luyện mặc định là **Unsloth FastVisionModel (text-only LoRA)** với LoRA không lượng tử hóa, max length 16.384 token, batch size 1, LoRA dropout=0 và gradient checkpointing `unsloth`. Import Unsloth trước Transformers/PEFT trong subprocess riêng. GPU phải hỗ trợ BF16; không tự chuyển sang FP16. Cấu hình batch 1 × 16K cần nhiều VRAM, chưa được xác nhận chạy vừa GPU Kaggle/T4. JSON target quá dài sẽ bị báo lỗi, không bị cắt âm thầm. Checkpoint tốt nhất được chọn bằng `eval_state_tool_score` (0–100) sau mỗi epoch: rollout agent trên toàn bộ validation tách từ TRAIN, gate bằng state hash rồi tính tool-call F1. Gold hash được lấy qua `ToolEnv.get_state_hash()` sau replay gold calls; dự đoán dùng môi trường mới. `eval_loss` chỉ để theo dõi. Đây là điểm validation với transcript train đã chuẩn bị; tokenizer fuzzy dùng lowercase + NFC + tách khoảng trắng, kết quả BTC vẫn là quyết định cuối cùng. Checkpoint/adapter nằm dưới `/kaggle/working/lifemate_finetunes`; không nhét model nhiều GB vào ZIP logs. Nếu mất session, gắn lại base weights + adapter hoặc dùng checkpoint để resume bằng `train_lora.py`.''')
+Backend huấn luyện mặc định là **Unsloth FastVisionModel (text-only LoRA)** với LoRA không lượng tử hóa, max length 16.384 token, batch size 1, LoRA dropout=0 và gradient checkpointing `unsloth`. Import Unsloth trước Transformers/PEFT trong subprocess riêng. GPU phải hỗ trợ BF16; không tự chuyển sang FP16. Cấu hình batch 1 × 16K cần nhiều VRAM, chưa được xác nhận chạy vừa GPU Kaggle/T4. Prompt hoặc JSON target quá dài sẽ bị báo lỗi, không bị cắt âm thầm. Checkpoint tốt nhất được chọn bằng `eval_state_tool_score` (0–100) sau mỗi epoch: rollout agent trên toàn bộ validation tách từ TRAIN, gate bằng state hash rồi tính tool-call F1. Gold hash được lấy qua `ToolEnv.get_state_hash()` sau replay gold calls; dự đoán dùng môi trường mới. `eval_loss` chỉ để theo dõi. Đây là điểm validation với transcript train đã chuẩn bị; tokenizer fuzzy dùng lowercase + NFC + tách khoảng trắng, kết quả BTC vẫn là quyết định cuối cùng. Checkpoint/adapter nằm dưới `/kaggle/working/lifemate_finetunes`; không nhét model nhiều GB vào ZIP logs. Nếu mất session, gắn lại base weights + adapter hoặc dùng checkpoint để resume bằng `train_lora.py`.''')
 code('''ADAPTER_PATH = Path(LOCAL_ADAPTER) if LOCAL_ADAPTER else None
 if TRAIN_LLM:
     if TRAIN_DATA_ROOT:
@@ -368,7 +370,7 @@ if TRAIN_LLM:
         "--data-root", training_data, "--base-model", LLM_PATH, "--output-dir", FT_RUN,
         "--backend", TRAIN_BACKEND,
         "--validation-fraction", str(TRAIN_VALIDATION_FRACTION),
-        "--max-tool-details", str(MAX_TOOL_DETAILS), "--seed", str(SEED),
+        "--seed", str(SEED),
         "--missing-tool-policy", TRAIN_MISSING_TOOL_POLICY,
         "--epochs", str(TRAIN_EPOCHS), "--max-steps", str(TRAIN_MAX_STEPS),
         "--max-length", str(TRAIN_MAX_LENGTH),
@@ -397,7 +399,7 @@ print("Inference LLM:", LLM_PATH, "adapter:", ADAPTER_PATH)
 
 md('''## 7. LLM từ transcript cache → kiểm chứng → lưu kết quả và logs
 
-Inference chỉ nạp LLM trên một GPU (`GPU_INDEX`, `--llm-device-map single`), không nạp ASR, và mặc định không giới hạn thời gian từng mẫu. Greedy decoding dừng ngay khi sinh xong JSON quyết định hoàn chỉnh (`call`, `inspect` hoặc `done`); vẫn giữ `MAX_NEW_TOKENS` làm giới hạn an toàn. JSON lồng nhau, dấu ngoặc trong chuỗi và khối thinking không gây dừng sớm. Một GPU vẫn cần đủ VRAM cho trọng số và context. stdout/stderr được ghi vào `inference.log`; `diagnostics.jsonl` có `sample_seconds` (LLM), `asr_seconds`, `total_sample_seconds` (tổng hai giai đoạn). Notebook kiểm tra đủ ID và schema output; không tự suy diễn tính đúng của state hash. Chạy lại cell dùng cache cũ và tạo thư mục kết quả mới.''')
+Inference chỉ nạp LLM trên một GPU (`GPU_INDEX`, `--llm-device-map single`), không nạp ASR, và mặc định không giới hạn thời gian từng mẫu. Qwen3.5 dùng function calling native của checkpoint: tools được đưa qua `tools`, assistant tool_calls và role tool được render bằng chat template. Greedy decoding chờ hết `</tool_call>`; JSON nằm trong parameter không gây dừng sớm. Khi hoàn tất, model trả marker `{"action":"done"}`. Model khác giữ protocol JSON. Vẫn giữ `MAX_NEW_TOKENS` làm giới hạn an toàn. Một GPU vẫn cần đủ VRAM cho trọng số và context. stdout/stderr được ghi vào `inference.log`; `diagnostics.jsonl` có `sample_seconds` (LLM), `asr_seconds`, `total_sample_seconds` (tổng hai giai đoạn). Notebook kiểm tra đủ ID và schema output; không tự suy diễn tính đúng của state hash. Chạy lại cell dùng cache cũ và tạo thư mục kết quả mới.''')
 code('''# Chạy lại cell này không ghi đè kết quả cũ.
 if (OUT / "inference.log").exists():
     previous_out = OUT
@@ -426,7 +428,7 @@ command = [sys.executable, "-u", APP / "main.py",
     "--limit", str(LIMIT), "--sample-seconds", str(SAMPLE_SECONDS),
     "--max-input-tokens", str(MAX_INPUT_TOKENS), "--max-new-tokens", str(MAX_NEW_TOKENS),
     "--max-calls", str(MAX_CALLS), "--max-invalid", str(MAX_INVALID),
-    "--max-tool-details", str(MAX_TOOL_DETAILS), "--seed", str(SEED)]
+    "--seed", str(SEED)]
 if ADAPTER_PATH is not None:
     command.extend(["--llm-adapter", ADAPTER_PATH])
 if FAIL_FAST:

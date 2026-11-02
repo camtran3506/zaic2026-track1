@@ -17,7 +17,7 @@ Defaults: `Qwen/Qwen3.5-4B` (~4.0B, Apache-2.0) and `g-group-ai-lab/gipformer1.5
 Qwen3.5 uses its native conditional-generation checkpoint through
 `AutoModelForImageTextToText`, with text-only prompts. The same loader is used for
 inference, Transformers fine-tuning and adapter merge. The chat template uses
-`enable_thinking=False` consistently in inference and SFT for direct JSON output
+`enable_thinking=False` consistently in inference and SFT for direct native tool calls
 within the existing token budget. Unsloth uses
 `FastVisionModel`; LoRA targets only language attention/MLP projections. Stage
 Qwen3.5 weights in a fresh directory and train a new adapter; Qwen3 adapters
@@ -55,9 +55,43 @@ recorded runtime identity cannot be resumed as verified runs; start a new run.
 
 The runtime remains Transformers/PyTorch. A future engine adapter must explicitly
 consume this sidecar, matching prompt IDs and sampling settings; placing the
-file beside a model does not automatically configure another engine. JSON
+file beside a model does not automatically configure another engine. Decision
 stopping callbacks, LoRA registration and native tool-call protocol mapping
 remain work for that migration.
+
+## Native function calling for Qwen3.5-4B
+
+For [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B), inference and SFT
+use the **checkpoint tokenizer's own chat template** with `tools=...` and
+`enable_thinking=False`. Each tool is passed as
+`{"type":"function","function": <complete catalog schema>}`; all schema fields
+are retained. Prior calls become assistant `tool_calls`, and their real results
+become `role="tool"` messages. The native template renders `<tools>`,
+`<tool_call>`, `<function=...>`, `<parameter=...>` and `<tool_response>`.
+This matches the `qwen3_coder` format used for Qwen3.5 tool serving; see also
+[Qwen-Agent's Qwen3.5 example](https://github.com/QwenLM/Qwen-Agent/blob/main/examples/assistant_qwen3.5.py).
+
+SFT JSONL still stores the portable LifeMate payload and action target. At
+**tokenization**, the shared adapter turns call targets into structured assistant
+`tool_calls`; it does not teach the model the custom action-call JSON format.
+Inference uses the same conversion, including every history turn and result.
+Historical text is wrapped in JSON to preserve boundary whitespace and literal
+reasoning markers through the native template. Only assistant target tokens
+(including native call delimiters and end-of-turn) receive training loss.
+
+Native output is parsed using the declared parameter types. Strings stay strings,
+including numeric-looking IDs; JSON objects/arrays and numeric/bool/null values
+are decoded without argument repair. `ToolEnv.validate` remains authoritative.
+Generation waits for the entire `</tool_call>` before stopping, so JSON inside
+parameters cannot prematurely stop a call. One tool is executed per decision;
+completion remains the explicit `{"action":"done"}` control marker.
+
+Other model families keep the portable JSON-decision protocol. Runtime manifests
+record `qwen35-native-fc-v1` for Qwen3.5; an old Qwen3.5 JSON-protocol adapter is
+rejected instead of silently mixing protocols. Regenerate SFT in a fresh directory
+and retrain that adapter. The current preparation policy is
+`full-context-native-fc-v2`. Production never replaces the checkpoint template;
+tests use a pinned upstream Qwen3.5 template fixture without downloading weights.
 
 ## 1. Install dependencies on the server
 
@@ -226,15 +260,16 @@ python main.py --stage llm --data-root /path/to/data --split public_test \
 ```
 
 The cache has one row per selected sample: `id`, full current `transcript`, full
-text `history`, and `asr_seconds`. All history audio is processed in advance;
-the agent retains the existing last-12-turn/1700-character prompt history limits.
+text `history`, and `asr_seconds`. All history audio is processed in advance.
 SFT and inference share the same history resolver: audio-only turns are
-transcribed for every role, empty turns are filtered first, and then the last
-12 usable turns are selected and their text clipped to 1700 characters each for
-the prompt. Paired assistant `tool_calls`/`tool_results` are preserved as structured
-history, including tool-only turns; tool results are not clipped to the text limit.
-The on-disk cache retains full history text and these tool results. Regenerate
-older SFT datasets to include the same history evidence used at inference.
+transcribed for every role, empty turns are filtered, and **all usable turns and
+full text** reach the prompt. There is no turn window or character limit. Paired
+assistant `tool_calls`/`tool_results` are preserved as structured history,
+including tool-only turns. Tool results are not clipped. The on-disk transcript
+cache retains this same full history, so compatible caches can be reused.
+Regenerate older SFT datasets in a new output directory: shortened data cannot
+be recovered by the trainer. Training and rollout evaluation reject manifests
+without the current `prompt_policy: full-context-native-fc-v2` marker.
 `--use-train-transcript` still requires `split=train`; test request audio is always
 transcribed rather than read from a possible `audio_text` field.
 
@@ -389,7 +424,6 @@ By default `docker run ... lifemate:baseline` targets **private_test** at `/data
 | `--max-new-tokens` | per-agent-step generated tokens | 384 |
 | `--max-calls` | maximum executed tools/sample | 8 |
 | `--max-invalid` | maximum invalid model plans | 3 |
-| `--max-tool-details` | number of detailed tools shown per step | 35 |
 | `--sample-seconds` | optional LLM cooperative budget; inf disables it | inf |
 | `--llm-device-map` | single / balanced across visible GPUs | single |
 | `--llm-max-memory-gib` | weight budget per GPU for balanced | 6 |
@@ -477,28 +511,36 @@ GPU by default; two T4 cards do not automatically combine VRAM.
 preventing a sample's trajectory from leaking into validation. It replays each gold
 call through the real train `ToolEnv.validate/call`; the next prompt contains only
 previous real tool results. It never opens environment state files. Gold lists must
-be in execution order. It uses the **same candidate ranking and prompt builder** as
-inference. `tool_index` retains all allowed tools; `--max-tool-details` only controls
-the initial detailed schemas. If a gold tool is absent from that initial selection,
-SFT adds an assistant `{"action":"inspect","name":"app.tool"}` decision before the
-call. Inference supports the same action: it reveals the requested allowed schema
-without calling ToolEnv or changing application state. Size fitting protects that
-schema's complete parameters/required/enum definitions; actual calls are validated
-against the schemas in the final prompt. Unavailable/schema-invalid gold labels
-still fail with the sample ID. Training transcripts are required; pass `--asr-model`
-for records/history that need ASR. No synthetic tool results or gold arguments are
-inserted into earlier prompts. Loss masks system/user/padding tokens and trains only
-the assistant JSON and its end-of-turn tokens.
+be in execution order. It uses the **same complete prompt builder** as inference.
+Every allowed tool is present in `tool_schemas` from the first step, with all
+catalog fields intact: full descriptions, structured returns, nested parameters,
+and extension metadata. `tool_index` also retains full descriptions. Tools not
+exposed by `installed_apps` remain unavailable.
 
-The notebook defaults to `TRAIN_MISSING_TOOL_POLICY="error"`: an out-of-ranking
-gold tool is recovered through a supervised inspection step, not filtered out.
-Gold arguments/schema are absent from the first prompt; the schema is provided
-only after the assistant requests it, using the same mechanism as inference.
-The old `--missing-tool-policy skip` remains an explicit diagnostic fallback for
-an unrecoverable missing-schema error, with skipped IDs/reasons in the manifest.
-Oversized inference prompts now fail explicitly instead of silently truncating
-schemas: raise `--max-input-tokens` within the model's supported context and available
-VRAM if necessary. The SFT `--max-length` budget includes prompt and target tokens.
+There is no schema ranking/subset, character-based size fitting, history window,
+text clipping, tool-result clipping, or limit on the number of past observations
+included in a prompt. Each step sees all earlier real calls, arguments, results
+and validation errors. JSON serialization still uses compact whitespace; it does
+not shorten field values or remove fields. SFT emits call/done examples directly;
+it no longer inserts schema-inspection examples. Inference accepts legacy
+`inspect` decisions for compatibility, but all schemas are already visible and
+inspection never changes the prompt or calls ToolEnv. `--max-tool-details` and the
+notebook's `MAX_TOOL_DETAILS` setting have been removed.
+
+Unavailable/schema-invalid gold labels still fail with the sample ID. Training
+transcripts are required; pass `--asr-model` for records/history that need ASR. No
+synthetic tool results or gold arguments are inserted into earlier prompts. Loss
+masks system/user/padding tokens and trains only the assistant JSON and its
+end-of-turn tokens. The notebook defaults to `TRAIN_MISSING_TOOL_POLICY="error"`;
+`--missing-tool-policy skip` remains an explicit diagnostic fallback for an
+unrecoverable missing-schema error, with skipped IDs/reasons in the manifest.
+
+Complete prompts can exceed the unchanged 16,384-token context limit. Inference
+checks the actual chat-template token count against `--max-input-tokens`; SFT
+checks prompt plus target against `--max-length`. Oversized inputs **fail
+explicitly**, with no automatic data reduction or token truncation. When needed,
+reallocate the input/output budgets within the supported context limit or handle
+the oversized sample explicitly. Larger prompts also require more memory.
 
 Outputs: `sft/{train,validation}.jsonl`, split/hash manifest, `training/adapter/`,
 checkpoints (optimizer/scheduler/RNG), `training/{train,eval}_results.json`,

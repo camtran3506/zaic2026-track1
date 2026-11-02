@@ -204,3 +204,15 @@ def test_callback_restores_training_mode_and_unsloth_state(tmp_path, fail):
         assert metrics['eval_state_tool_score'] == 75
     assert model.training and not model.config.use_cache
     assert calls == ['inference', 'training']
+
+
+@pytest.mark.parametrize('policy', [None, 'shortened-context-v0'])
+def test_old_prepared_data_requires_regeneration(prepared, policy):
+    out, _, _, _ = prepared
+    manifest = json.loads((out / 'manifest.json').read_text())
+    if policy is None:
+        manifest.pop('prompt_policy')
+    else:
+        manifest['prompt_policy'] = policy
+    with pytest.raises(ValueError, match='rerun prepare_sft.py'):
+        StateToolEvaluator(out, manifest)

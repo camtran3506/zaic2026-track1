@@ -41,6 +41,8 @@ def test_train_adapter_reload_and_merge(tmp_path, architecture):
     tokenizer = PreTrainedTokenizerFast(tokenizer_object=tok, unk_token='[UNK]',
         pad_token='[PAD]', eos_token='[EOS]', additional_special_tokens=['<s>', '</s>'])
     tokenizer.chat_template = "{% for m in messages %}{{ '<s>' + m['role'] + '\n' + m['content'] + '</s>\n' }}{% endfor %}{% if add_generation_prompt %}{{ '<s>assistant\n' }}{% endif %}"
+    if architecture == 'qwen3_5':
+        tokenizer.chat_template = (Path(__file__).parent / 'fixtures/qwen35_chat_template.jinja').read_text()
     tokenizer.model_input_names = ['input_ids', 'attention_mask']
     tokenizer.save_pretrained(base)
     torch.manual_seed(0)
@@ -98,6 +100,8 @@ def test_train_adapter_reload_and_merge(tmp_path, architecture):
     assert (adapter / 'adapter_model.safetensors').is_file()
     runtime = json.loads((adapter / 'lifemate_runtime.json').read_text())
     assert runtime['inference_dtype'] == 'bfloat16'
+    expected_protocol = 'qwen35-native-fc-v1' if architecture == 'qwen3_5' else 'lifemate-decision-json-v1'
+    assert runtime['output_protocol'] == expected_protocol
     assert runtime['generation']['temperature'] == 0
     assert runtime['generation']['max_new_tokens'] == 384
     assert (run / 'training/checkpoint-2/lifemate_runtime.json').is_file()
