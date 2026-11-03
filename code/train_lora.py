@@ -156,7 +156,7 @@ def main():
         num_train_epochs=args.epochs, max_steps=args.max_steps,
         per_device_train_batch_size=args.batch_size, per_device_eval_batch_size=1,
         gradient_accumulation_steps=args.gradient_accumulation,
-        learning_rate=args.learning_rate, lr_scheduler_type="cosine", warmup_ratio=0.03,
+        learning_rate=args.learning_rate, lr_scheduler_type="cosine", warmup_steps=0.03,
         weight_decay=0.01, max_grad_norm=1.0, optim="adamw_torch",
         bf16=bf16, fp16=False, use_cpu=not cuda,
         gradient_checkpointing=args.backend != "unsloth", gradient_checkpointing_kwargs={"use_reentrant": False},
