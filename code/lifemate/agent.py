@@ -10,6 +10,10 @@ from typing import Any
 from .catalog import allowed_tools, prompt_catalog
 from .eval_trace import exception_details
 from .history import prompt_history, resolve_history
+from .local_helpers import (DEFAULT_MAX_LOCAL_CALLS, execute_helper,
+                            helper_tool_schemas, with_local_tools)
+from .local_checks import inspect_call
+from .execution_policy import LoopMonitor
 from .text import normalize_transcript
 
 SYSTEM_PROMPT = """Bạn là AI Agent LifeMate. Chỉ xuất ĐÚNG MỘT JSON object, KHÔNG markdown hoặc diễn giải.
@@ -29,6 +33,16 @@ QUY TẮC BẮT BUỘC:
   nếu chưa có thì gọi read tool tương ứng để tìm ID thực; KHÔNG bịa ID.
 - Nếu cần kết hợp nhiều hành động, hoàn tất từng hành động theo thứ tự phụ thuộc.
 - Dùng user context (current_time/timezone/location/profile) và lịch sử để giải quyết tham chiếu.
+- local_time.* là các hàm Python nội bộ: dùng calendar_reference để tra ngày,
+  departure_time để trừ thời gian đi/đến sớm, duration_between để tính số phút.
+  Lấy toán hạng từ yêu cầu/context/kết quả đã có; đọc kết quả rồi mới gọi tool ứng dụng.
+  Các helper thời gian không đổi trạng thái ứng dụng, không cung cấp ID x-ref, không tự hoàn tất tác vụ.
+- local_context.lookup và local_entity.resolve chỉ tra context/history đã có; dùng nguồn
+  được trả về để đối chiếu đúng collection. Không tìm thấy không chứng minh entity không tồn tại.
+- local_text.normalize chuẩn hóa email/số điện thoại; local_checks.evaluate tính/so sánh
+  các toán hạng đã biết. local_schema.inspect chỉ góp ý schema, không thay thế ToolEnv.
+- Helper ambiguous/unsupported không cho phép tự bịa giá trị hoặc mặc định done.
+  Khi kết quả tool thất bại/rỗng, xem phản hồi, sửa kế hoạch; không lặp nguyên call vô ích.
 - Đừng thay đổi trạng thái ngoài mục tiêu của người dùng; đừng gọi read tools lặp vô ích.
 - Nếu thiếu thông tin bắt buộc không suy ra được qua context/read tools, gọi
   sys.ask_missing_info với {"tool_name":"tool dự kiến", "params":["tham số còn thiếu"]}, rồi dừng.
@@ -114,11 +128,13 @@ class AgentConfig:
     # Reserving time is best effort, not a hard CUDA generation timeout.
     reserve_seconds: float = 1.0
     use_train_transcript: bool = False
+    max_local_calls: int = DEFAULT_MAX_LOCAL_CALLS
+    max_total_steps: int = 32
 
 
 def build_step_prompt(transcript, context, history, enabled, observations):
     """Use the same complete catalog, history and observations in SFT/inference."""
-    tools = prompt_catalog(enabled)
+    tools = prompt_catalog(with_local_tools(enabled))
     info = {
         "request_transcript": normalize_transcript(transcript),
         "user_context": {k: v for k, v in context.items() if k != "installed_apps"},
@@ -148,10 +164,14 @@ class LifeMateAgent:
 
         context = item.get("context", {})
         enabled = allowed_tools(self.catalog, context.get("installed_apps", {}))
+        planner_tools = with_local_tools(enabled)
+        local_names = helper_tool_schemas().keys()
+        monitor = LoopMonitor()
         if len(enabled) == 1:  # only sys.ask_missing_info; no app can act
             emit("stop", reason="no_available_tools", executed=0, invalid_proposals=0)
             return {"transcript": normalize_transcript(prepared_transcript["transcript"]) if prepared_transcript else "",
                     "elapsed_seconds": 0, "executed": 0, "invalid_proposals": 0,
+                    "local_executed": 0,
                     "stop_reason": "no_available_tools"}
         if prepared_transcript is not None:
             if prepared_transcript.get("id") != item["id"]:
@@ -167,6 +187,7 @@ class LifeMateAgent:
         observations: list[dict] = []
         invalid = 0
         executed = 0
+        local_executed = 0
         stop_reason = None
 
         def reject(error, stage, **feedback):
@@ -179,7 +200,8 @@ class LifeMateAgent:
             observations.append(observation)
             emit("decision_rejected", **observation)
 
-        while executed < self.cfg.max_calls and invalid < self.cfg.max_invalid:
+        while (executed < self.cfg.max_calls and invalid < self.cfg.max_invalid
+               and step < self.cfg.max_total_steps):
             if time.monotonic() - t0 > self.cfg.sample_seconds - self.cfg.reserve_seconds:
                 stop_reason = "time_limit"
                 break
@@ -194,27 +216,60 @@ class LifeMateAgent:
                 raise
             emit("llm_output", output=raw)
             try:
-                decision = parse_decision(raw, enabled)
+                decision = parse_decision(raw, planner_tools)
             except ValueError as exc:
                 reject(str(exc), "parse", raw_output=raw,
                        instruction="Trả về quyết định đúng định dạng đã được hướng dẫn bởi system prompt và chat template; không markdown hoặc diễn giải.")
                 continue
             emit("decision_parsed", decision=decision)
             if decision["action"] == "done":
+                warnings = monitor.pending_warnings()
+                if warnings:
+                    emit("completion_advisory", warnings=warnings)
                 stop_reason = "done"
                 break
             name, args = decision.get("name"), decision.get("arguments")
-            if not isinstance(name, str) or name not in enabled or name not in {x["name"] for x in tools["tool_schemas"]}:
+            if not isinstance(name, str) or name not in planner_tools or name not in {x["name"] for x in tools["tool_schemas"]}:
                 reject(f"Tool {name!r} not exposed in tool_schemas; choose only from listed schemas.",
                        "precheck", name=name, arguments=args)
                 continue
             if not isinstance(args, dict):
                 reject("arguments must be a JSON object", "precheck", name=name, arguments=args)
                 continue
+            if name in local_names:
+                if local_executed >= self.cfg.max_local_calls:
+                    reject("Local helper budget exhausted; use existing results or an available application tool.",
+                           "local_budget", name=name, arguments=args)
+                    continue
+                local_executed += 1
+                emit("local_call_start", name=name, arguments=args, local_call_index=local_executed - 1)
+                try:
+                    result = execute_helper(name, args, context, history, enabled, observations)
+                    if result.get("status") == "invalid_request":
+                        reject(str(result.get("warnings", "Invalid helper request")),
+                               "local_validate", name=name, arguments=args)
+                except ValueError as exc:
+                    result = {"ok": False, "error": str(exc)}
+                    reject(str(exc), "local_validate", name=name, arguments=args)
+                emit("local_call_result", name=name, arguments=args, result=result,
+                     local_call_index=local_executed - 1)
+                observations.append({"name": name, "arguments": args,
+                                     "result": full_json(result), "scope": "local"})
+                # Helpers cannot call ToolEnv. Entity IDs only reference existing evidence.
+                continue
             if name == "sys.ask_missing_info":
                 if args.get("tool_name") not in enabled or args.get("tool_name") == name:
                     reject("Missing-info tool_name must be another available tool.",
                            "precheck", name=name, arguments=args)
+                    continue
+            advisory = inspect_call(name, args, enabled)
+            emit("schema_inspection", name=name, inspection=advisory)
+            feedback = monitor.check(name, args, enabled[name].get("kind", "unknown"))
+            if feedback:
+                emit("loop_advisory", name=name, arguments=args, feedback=feedback)
+                if feedback.get("block"):
+                    reject(feedback["instruction"], "loop_guard", name=name, arguments=args,
+                           feedback=feedback)
                     continue
             emit("validate_start", name=name, arguments=args)
             try:
@@ -226,6 +281,7 @@ class LifeMateAgent:
             accepted = isinstance(validation, dict) and bool(validation.get("ok"))
             emit("validate_result", name=name, arguments=args, result=validation, accepted=accepted)
             if not accepted:
+                monitor.record_validation_failure(name, args, validation)
                 reject(f"Schema invalid: {validation!r}", "validate", name=name,
                        arguments=args, validation=validation)
                 continue
@@ -240,17 +296,24 @@ class LifeMateAgent:
             else:
                 emit("call_result", name=name, arguments=args, call_index=executed, result=result)
             executed += 1
+            verification = monitor.record_result(name, args, result, enabled[name].get("kind", "unknown"))
+            emit("execution_verified", name=name, verification=verification)
             # Move on using actual calls/results once validation led to execution.
             # Executed failures remain evidence; only unexecuted feedback expires.
             # The debug trace and cumulative invalid counter retain earlier errors.
             observations[:] = [observation for observation in observations if "result" in observation]
-            observations.append({"name": name, "arguments": args, "result": full_json(result)})
+            observation = {"name": name, "arguments": args, "result": full_json(result)}
+            if verification["status"] in ("failure", "empty"):
+                observation["verification"] = verification
+            observations.append(observation)
             if name == "sys.ask_missing_info":
                 stop_reason = "ask_missing_info"
                 break
         if stop_reason is None:
-            stop_reason = "max_calls" if executed >= self.cfg.max_calls else "max_invalid"
-        emit("stop", reason=stop_reason, executed=executed, invalid_proposals=invalid)
+            stop_reason = ("max_calls" if executed >= self.cfg.max_calls else
+                           "max_invalid" if invalid >= self.cfg.max_invalid else "max_total_steps")
+        emit("stop", reason=stop_reason, executed=executed, local_executed=local_executed,
+             invalid_proposals=invalid)
         return {"transcript": transcript, "elapsed_seconds": round(time.monotonic() - t0, 3),
-                "executed": executed, "invalid_proposals": invalid,
+                "executed": executed, "local_executed": local_executed, "invalid_proposals": invalid,
                 "stop_reason": stop_reason}

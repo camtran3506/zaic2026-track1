@@ -134,13 +134,25 @@ def test_rejection_expires_after_execution_but_call_failure_remains_visible(outc
             if self.count == 2:
                 assert rejection_feedback(system, user)['arguments'] == proposed
             if self.count == 3:
-                assert json.loads(user)['previous_actions_and_results'] == [{
+                observations = json.loads(user)['previous_actions_and_results']
+                expected = {
                     'name': 'smart_home.light_set', 'arguments': corrected,
-                    'result': json.dumps(result, ensure_ascii=False, separators=(',', ':'))}]
+                    'result': json.dumps(result, ensure_ascii=False, separators=(',', ':'))}
+                assert len(observations) == 1
+                assert {key: observations[0][key] for key in expected} == expected
+                if outcome == 'ok':
+                    assert 'verification' not in observations[0]
+                else:
+                    assert observations[0]['verification']['status'] == 'failure'
+                    assert observations[0]['verification']['goal_completion'] == 'unknown'
                 chat, _ = native_chat([{'role': 'system', 'content': system},
                                       {'role': 'user', 'content': user}])
-                assert chat[-2]['tool_calls'][0]['function']['arguments'] == corrected
-                assert chat[-1]['role'] == 'tool' and json.loads(chat[-1]['content']) == result
+                call_index = -2 if outcome == 'ok' else -3
+                assert chat[call_index]['tool_calls'][0]['function']['arguments'] == corrected
+                assert chat[call_index + 1]['role'] == 'tool'
+                assert json.loads(chat[call_index + 1]['content']) == result
+                if outcome != 'ok':
+                    assert json.loads(chat[-1]['content'])['execution_feedback'] == observations[0]['verification']
                 assert not any('agent_feedback' in turn.get('content', '') for turn in chat)
                 return '{"action":"done"}'
             return json.dumps({'action': 'call', 'name': 'smart_home.light_set',

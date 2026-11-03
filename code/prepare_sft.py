@@ -12,6 +12,10 @@ from lifemate.sft import (DEFAULT_ASR_TRANSCRIPT_RATIO, SFT_PROMPT_POLICY, VALID
                          prepare_train_transcript, prepare_validation_transcripts, replay_sample, split_records)
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
 from lifemate.text import TEXT_NORMALIZATION
+from lifemate.local_time import LOCAL_TIME_POLICY
+from lifemate.local_helpers import LOCAL_HELPER_POLICY, helper_tool_schemas
+from lifemate.specialist_training import SPECIALIST_TRAINING_POLICY
+from lifemate.temporal_training import TEMPORAL_TRAINING_POLICY
 
 
 def main():
@@ -60,6 +64,10 @@ def main():
                     catalog_sha256=file_sha256(catalog_path), seed=args.seed,
                     prompt_policy=SFT_PROMPT_POLICY, missing_tool_policy=args.missing_tool_policy,
                     text_normalization=TEXT_NORMALIZATION,
+                    local_time_policy=LOCAL_TIME_POLICY,
+                    local_helper_policy=LOCAL_HELPER_POLICY,
+                    specialist_training_policy=SPECIALIST_TRAINING_POLICY,
+                    temporal_helper_training_policy=TEMPORAL_TRAINING_POLICY,
                     transcript_mixing={"policy": "seeded-sample-v1", "unit": "sample",
                                        "asr_ratio": args.asr_transcript_ratio, "seed": args.seed,
                                        "rounding": "nearest-total-and-train-validation-remainder"},
@@ -73,6 +81,8 @@ def main():
         print(f"{partition} transcript assignment: {requested_counts}", flush=True)
         path = args.output_dir / f"{partition}.jsonl"
         count = 0
+        helper_count = 0
+        helper_counts = {name: 0 for name in helper_tool_schemas()}
         retained_ids = []
         skipped = []
         # Partial preparations stay marked .partial and are never consumed by the trainer.
@@ -110,6 +120,10 @@ def main():
                     })
                 retained_ids.append(record["id"])
                 for example in examples:
+                    target = json.loads(example["messages"][-1]["content"])
+                    if target.get("name") in helper_counts:
+                        helper_count += 1
+                        helper_counts[target["name"]] += 1
                     example["transcript_source"] = prepared["transcript_source"]
                     f.write(json.dumps(example, ensure_ascii=False) + "\n")
                     count += 1
@@ -123,7 +137,8 @@ def main():
             transcript_source_counts={name: sum(sources[sample_id] == name for sample_id in retained_ids)
                                       for name in ("audio_text", "asr")},
             requested_transcript_source_counts=requested_counts,
-            examples=count, sha256=file_sha256(path))
+            examples=count, local_helper_examples=helper_count,
+            local_helper_examples_by_tool=helper_counts, sha256=file_sha256(path))
         print(f"{partition} summary: kept {len(retained_ids)}/{len(rows)}, skipped {len(skipped)}, {count} steps; "
               f"transcript sources: {metadata['partitions'][partition]['transcript_source_counts']}", flush=True)
     if metadata["partitions"]["validation"]["skipped_samples"]:

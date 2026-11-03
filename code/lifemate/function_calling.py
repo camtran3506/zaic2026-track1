@@ -17,6 +17,16 @@ NATIVE_SYSTEM_PROMPT = """Bạn là AI Agent LifeMate. Hoàn tất yêu cầu ti
   nếu chưa có thì gọi read tool để tìm ID thật, KHÔNG bịa ID.
 - Thực hiện các hành động theo thứ tự phụ thuộc; không thay đổi trạng thái ngoài mục tiêu.
 - Dùng transcript, context và toàn bộ history để giải quyết tham chiếu.
+- local_time.* là các hàm Python nội bộ: dùng calendar_reference để tra ngày,
+  departure_time để trừ thời gian đi/đến sớm, duration_between để tính số phút.
+  Lấy toán hạng từ yêu cầu/context/kết quả đã có; đọc kết quả rồi mới gọi tool ứng dụng.
+  Các helper thời gian không đổi trạng thái ứng dụng, không cung cấp ID x-ref, không tự hoàn tất tác vụ.
+- local_context.lookup và local_entity.resolve chỉ tra context/history đã có; dùng nguồn
+  được trả về để đối chiếu đúng collection. Không tìm thấy không chứng minh entity không tồn tại.
+- local_text.normalize chuẩn hóa email/số điện thoại; local_checks.evaluate tính/so sánh
+  các toán hạng đã biết. local_schema.inspect chỉ góp ý schema, không thay thế ToolEnv.
+- Helper ambiguous/unsupported không cho phép tự bịa giá trị hoặc mặc định done.
+  Khi kết quả tool thất bại/rỗng, xem phản hồi, sửa kế hoạch; không lặp nguyên call vô ích.
 - Không gọi read tool lặp vô ích. Không đoán tham số chưa biết.
 - Thiếu thông tin bắt buộc không suy ra được: gọi sys.ask_missing_info với
   tool_name và params rồi dừng. Không có app phù hợp thì dừng, không hỏi thêm.
@@ -77,6 +87,9 @@ def native_chat(messages):
             chat.append(tool_call_message(observation["name"], observation["arguments"]))
             result = observation["result"]
             chat.append({"role": "tool", "content": result if isinstance(result, str) else _json(result)})
+            if observation.get("verification"):
+                chat.append({"role": "user", "content": _json({
+                    "execution_feedback": observation["verification"]})})
         else:
             # A rejected proposal has no executed tool result to fabricate.
             chat.append({"role": "user", "content": _json({"agent_feedback": observation})})

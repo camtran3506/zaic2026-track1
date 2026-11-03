@@ -9,6 +9,8 @@ from pathlib import Path
 from .context import DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_NEW_TOKENS, MAX_CONTEXT_TOKENS
 
 from .function_calling import JSON_PROTOCOL, NATIVE_PROTOCOL
+from .local_time import LOCAL_TIME_POLICY
+from .local_helpers import LOCAL_HELPER_POLICY
 from .text import TEXT_NORMALIZATION
 
 DEFAULT_LLM_DTYPE = "bfloat16"
@@ -118,6 +120,8 @@ def select_tokenizer_path(model_path, adapter_path=None):
 def make_runtime_manifest(model_path, tokenizer, seed=DEFAULT_SEED, policy=None):
     return {"version": 1, "inference_dtype": DEFAULT_LLM_DTYPE,
             "text_normalization": TEXT_NORMALIZATION,
+            "local_time_policy": LOCAL_TIME_POLICY,
+            "local_helper_policy": LOCAL_HELPER_POLICY,
             "model_fingerprint": model_fingerprint(model_path),
             "tokenizer_fingerprint": tokenizer_fingerprint(tokenizer),
             "chat_template_kwargs": dict(getattr(tokenizer, "lifemate_template_kwargs", {})),
@@ -141,7 +145,8 @@ def load_runtime_manifest(model_path, tokenizer, artifact_path=None):
     path = Path(artifact_path if artifact_path is not None else model_path) / RUNTIME_MANIFEST
     if not path.is_file():
         if artifact_path is not None:
-            logging.warning("Legacy adapter has no %s; base/tokenizer identity cannot be verified", RUNTIME_MANIFEST)
+            logging.warning("Legacy adapter has no %s; base/tokenizer identity cannot be verified; "
+                            "local time tool training is unverified; Python specialist training is unverified", RUNTIME_MANIFEST)
         return None
     manifest = json.loads(path.read_text(encoding="utf-8"))
     if manifest.get("version") != 1:
@@ -156,6 +161,10 @@ def load_runtime_manifest(model_path, tokenizer, artifact_path=None):
         raise ValueError("Prompt tokenization policy differs from training/export")
     if manifest.get("text_normalization") != TEXT_NORMALIZATION:
         raise ValueError("Text normalization differs from training/export; regenerate SFT and retrain the adapter")
+    if manifest.get("local_time_policy") != LOCAL_TIME_POLICY:
+        raise ValueError("Local time tool policy differs from training/export; regenerate SFT and retrain the adapter")
+    if manifest.get("local_helper_policy") != LOCAL_HELPER_POLICY:
+        raise ValueError("Python specialist helper policy differs from training/export; regenerate SFT and retrain the adapter")
     expected_protocol = NATIVE_PROTOCOL if getattr(tokenizer, "lifemate_native_fc", False) is True else JSON_PROTOCOL
     if manifest["output_protocol"] != expected_protocol:
         raise ValueError("Output protocol differs from the LifeMate agent; regenerate SFT and retrain the adapter")

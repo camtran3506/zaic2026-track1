@@ -6,7 +6,7 @@ from .scoring import calls_match, match_call_indices
 
 ERROR_TYPES = ("state_hash_mismatch", "missing_calls", "extra_calls", "wrong_arguments", "early_stop")
 STOP_REASONS = ("done", "ask_missing_info", "max_calls", "max_invalid", "time_limit",
-                "no_available_tools", "unknown")
+                "max_total_steps", "no_available_tools", "unknown")
 
 
 def _argument_differences(predicted, gold, catalog):

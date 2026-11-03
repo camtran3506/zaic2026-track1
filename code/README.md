@@ -41,7 +41,7 @@ inherited. Request budget/seed overrides remain supported.
 New adapters, Trainer checkpoints and merged models include
 `lifemate_runtime.json` plus a neutral Transformers `generation_config.json`.
 The JSON sidecar records BF16 defaults, `enable_thinking=False` for Qwen3.5,
-prompt settings, decoding policy and SHA-256 fingerprints of the checkpoint
+the local date/time tool policy, prompt settings, decoding policy and SHA-256 fingerprints of the checkpoint
 (adapter base or exported merged model), tokenizer rules/vocabulary, special
 tokens and chat template. Inference
 and merge check these identities before loading model weights. Paths may change
@@ -50,7 +50,10 @@ startup/export; it does not run per token.
 
 An adapter must include its saved tokenizer: missing tokenizer files no longer
 fall back to the base tokenizer. Legacy adapters without the sidecar can still
-run, but emit a warning that identity is unverified. Old checkpoints without the
+run, but emit a warning that identity and local time tool training are unverified.
+An existing sidecar without the current local tool policy is rejected: regenerate
+SFT and retrain rather than silently mixing prompt/tool capabilities.
+Old checkpoints without the
 recorded runtime identity cannot be resumed as verified runs; start a new run.
 
 The runtime remains Transformers/PyTorch. A future engine adapter must explicitly
@@ -90,8 +93,95 @@ Other model families keep the portable JSON-decision protocol. Runtime manifests
 record `qwen35-native-fc-v1` for Qwen3.5; an old Qwen3.5 JSON-protocol adapter is
 rejected instead of silently mixing protocols. Regenerate SFT in a fresh directory
 and retrain that adapter. The current preparation policy is
-`full-context-native-fc-mix-asr-eval-v5`. Production never replaces the checkpoint template;
+`full-context-python-specialists-v7`. Production never replaces the checkpoint template;
 tests use a pinned upstream Qwen3.5 template fixture without downloading weights.
+
+## Internal date and time tools
+
+The agent exposes three additional pure Python tools alongside the tools allowed
+by each sample's `installed_apps`:
+
+| Internal tool | Inputs | Result |
+| --- | --- | --- |
+| `local_time.calendar_reference` | No arguments; uses the sample's `context.current_time` and optional `context.timezone` | Today/yesterday/tomorrow/day-after-tomorrow and Monday–Sunday dates for the previous, current and next weeks |
+| `local_time.departure_time` | Offset-aware ISO `arrival`, integer `travel_minutes` and `early_minutes` | Offset-aware `departure` timestamp |
+| `local_time.duration_between` | Offset-aware ISO `start` and `end` | Nonnegative whole-minute `minutes` |
+
+For a 09:00 appointment, 15 minutes of travel and arrival 15 minutes early,
+`departure_time` returns 08:30. `duration_between` returns 40 minutes between
+19:30 and 20:10. Time arithmetic uses elapsed time through UTC and converts the
+departure back to the supplied sample timezone when present. The calendar uses
+local calendar dates. It never reads the machine clock, guesses a missing date
+or timezone, or silently interprets a naive timestamp. Invalid input is reported
+to the agent; durations/offsets are bounded to seven days.
+
+These names belong to a separate local registry. Local calls are validated and
+executed in Python, not sent to `ToolEnv.validate` or `ToolEnv.call`. Their
+results return to the model as ordinary observations/native tool responses.
+Application calls retain their original sample whitelist, schema validation and
+ToolEnv execution. Submission and evaluation still use the unmodified
+`env.get_tool_calls()` and `env.get_state_hash()`; local calls do not appear in
+the official call list or alter application state. Local results do not provide
+application IDs or replace successful application reads for `x-ref` parameters.
+
+One model output calls one tool. A helper result therefore requires another
+generation before an application call can use it. Helpers have a separate
+default budget of eight calls per sample, with a total limit of 32 agent steps;
+the existing application-call and invalid-proposal limits still apply. Internal
+calls are recorded in diagnostic traces/stats so their latency and failure rates
+can be inspected even though they are absent from submission calls.
+
+SFT preparation can insert local call/result steps before a gold application
+action when temporal inputs can be extracted conservatively from the request,
+context, history and earlier actual tool observations. Helper inputs are not
+copied from future gold arguments/results. The original gold application calls
+and replayed final state remain unchanged. Unrecognized or ambiguous language
+does not produce a guessed arithmetic training target. The helper examples use
+the same assistant-only loss mask and native tool serialization as inference.
+Each partition's manifest reports `local_helper_examples` and
+`local_helper_examples_by_tool`; inspect these counts after preparation to check
+coverage for the chosen clean/ASR mixture. Helper demonstrations are conditional,
+so adding schemas does not guarantee that every input supplies all three targets.
+
+Regenerate prepared SFT in a fresh directory: the manifest must record
+`prompt_policy=full-context-python-specialists-v7` and
+`local_time_policy=local-time-tools-v1` and
+`local_helper_policy=python-specialists-v1`. Existing runtime artifacts must carry
+these same local policies; adding tool schemas alone does not establish that an old
+adapter learned to use them. Unit and fixture tests cover these paths; real
+Qwen3.5 GPU training/inference and accuracy improvements still require validation.
+
+## Python specialist helpers
+
+The same Qwen model remains the planner. All specialists are bounded standard-library
+Python functions; no additional model, framework package or remote API is required.
+See [HELPERS.md](HELPERS.md) for inputs, outputs, evidence rules, SFT coverage and
+links to the framework source code that informed this design.
+
+| Role | Implementation |
+| --- | --- |
+| Context/history retrieval | `local_context.lookup` |
+| Entity resolution with provenance | `local_entity.resolve` |
+| Calendar and time arithmetic | The three `local_time.*` tools above |
+| Spoken email/phone normalization | `local_text.normalize` |
+| Advisory tool/schema routing | `local_schema.inspect` and exposed-catalog checks |
+| Numeric conditions and result verification | `local_checks.evaluate` and automatic `verify_result` |
+| Retry/recovery feedback | Automatic `LoopMonitor` before/after application calls |
+
+Entity resolution only indexes context and historical successful read results.
+It cannot search ToolEnv or read hidden state. An unmatched name remains unresolved;
+ambiguous candidates keep their original names/IDs and evidence. Current-turn
+application read results remain visible to the planner through ordinary observations.
+No helper rewrites application arguments or deletes official calls.
+
+SFT adds conservative demonstrations from visible inputs and prior actual results,
+with the same local execution and assistant-only loss path used at inference.
+Schema-repair demonstrations require a prior rejected proposal; result verification
+and retry monitoring also run automatically. Rebuild prepared SFT and retrain an
+adapter for policy `full-context-python-specialists-v7`. Manifests with a different
+helper policy are rejected; legacy adapters without a manifest emit an explicit
+warning and have no verified helper training. Accuracy and added
+LLM-turn latency must be measured on held-out Qwen GPU evaluation.
 
 ## 1. Install dependencies on the server
 
@@ -269,7 +359,7 @@ including tool-only turns. Tool results are not clipped. The on-disk transcript
 cache retains this same full history, so compatible caches can be reused.
 Regenerate older SFT datasets in a new output directory: shortened data cannot
 be recovered by the trainer. Training and rollout evaluation reject manifests
-without the current `prompt_policy: full-context-native-fc-mix-asr-eval-v5` marker.
+without the current `prompt_policy: full-context-python-specialists-v7` marker.
 `--use-train-transcript` still requires `split=train`; test request audio is always
 transcribed rather than read from a possible `audio_text` field.
 

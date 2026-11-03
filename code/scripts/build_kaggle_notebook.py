@@ -219,6 +219,9 @@ md('''## 3. Toàn bộ mã pipeline nhúng trong notebook
 Các cell dưới ghi mã vào `/kaggle/working/lifemate_app` để chạy trong subprocess, tách runtime tải model (online) khỏi suy luận (local-only). Logic baseline được giữ nguyên; không cần repository bên ngoài. Có cả mã fine-tune, bộ unit test và scorer train.''')
 for rel in ['lifemate/__init__.py', 'lifemate/catalog.py', 'lifemate/models.py', 'lifemate/agent.py', 'lifemate/transcripts.py', 'lifemate/decoding.py',
             'lifemate/gpu.py', 'lifemate/context.py', 'lifemate/text.py', 'lifemate/function_calling.py', 'lifemate/asr.py', 'lifemate/llm.py', 'lifemate/runtime.py', 'lifemate/history.py', 'lifemate/scoring.py', 'lifemate/evaluation.py', 'lifemate/eval_diagnostics.py', 'lifemate/eval_trace.py',
+            'lifemate/local_time.py', 'lifemate/temporal_training.py',
+            'lifemate/local_helpers.py', 'lifemate/local_knowledge.py', 'lifemate/local_checks.py',
+            'lifemate/execution_policy.py', 'lifemate/specialist_training.py',
             'main.py', 'score_train.py', 'lifemate/sft.py', 'prepare_sft.py', 'train_lora.py',
             'merge_lora.py', 'finetune.py', 'tests/test_baseline.py', 'tests/test_sft.py',
             'tests/test_finetune_integration.py', 'tests/test_audio.py', 'tests/test_catalog.py',
@@ -226,6 +229,10 @@ for rel in ['lifemate/__init__.py', 'lifemate/catalog.py', 'lifemate/models.py',
             'tests/test_transcript_normalization.py', 'tests/test_text.py', 'tests/test_runtime_parity.py', 'tests/test_runtime_config.py',
             'tests/test_native_function_calling.py', 'tests/test_transcript_mixing.py', 'tests/test_eval_diagnostics.py', 'tests/test_eval_trace.py',
             'tests/test_tool_validation.py',
+            'tests/test_local_time.py', 'tests/test_local_time_runtime.py',
+            'tests/test_local_tools_agent.py', 'tests/test_temporal_training.py', 'tests/test_local_time_evaluation.py',
+            'tests/test_local_knowledge.py', 'tests/test_local_checks.py', 'tests/test_execution_policy.py',
+            'tests/test_specialist_training.py', 'tests/test_python_helpers_integration.py',
             'tests/fixtures/qwen35_chat_template.jinja']:
     md(f'### `{rel}`')
     code(f'%%writefile /kaggle/working/lifemate_app/{rel}\n' + (ROOT/'code'/rel).read_text())
@@ -354,7 +361,7 @@ md('''## 6. Fine-tune tool calling trên TRAIN (LoRA/QLoRA)
 
 Mặc định `TRAIN_LLM=True`, `TRAIN_ASR_TRANSCRIPT_RATIO=0.5`: chia train/validation theo sample ID trước, rồi trộn 50% sample dùng audio_text và 50% dùng ASR trong mỗi phần (số mẫu lẻ lệch tối đa một). SEED quyết định việc chọn nguồn cho loss SFT; mọi bước SFT của một sample dùng cùng transcript. Rollout chọn checkpoint luôn dùng transcript ASR cho toàn bộ held-out, độc lập với nguồn SFT. Dù TRAIN_ASR_TRANSCRIPT_RATIO=0 vẫn cần ASR cho eval. ASR không tự quay về audio_text khi lỗi; nguồn và số lượng được ghi trong manifest. Transcript của cả hai nguồn và text của mọi lượt history được chuẩn hóa chung: NFC, lowercase, gộp khoảng trắng, viết hoa chữ cái đầu lượt, thêm dấu chấm nếu chưa có dấu kết câu. History giữ đầy đủ theo resolver chung. Sau đó huấn luyện LoRA/QLoRA, rồi tự chuyển sang **base model + adapter vừa train** cho task chính. Nhãn phải là `label.tool_calls` theo thứ tự thực thi. Replay dùng `ToolEnv` thật của train; kết quả tool trước được đưa vào prompt bước sau. Chỉ tính loss trên assistant JSON, split theo sample ID trước khi tạo các bước, không đọc nhãn test.
 
-`tool_schemas` giữ toàn bộ schema của mọi tool được phép ngay từ bước đầu, gồm đầy đủ description, returns và metadata. History và mọi kết quả tool được giữ nguyên, không giới hạn lượt/ký tự hoặc giảm theo độ dài prompt. SFT tạo trực tiếp action call/done. Không còn thao tác nội bộ yêu cầu schema. Vượt giới hạn token sẽ báo lỗi, không tự cắt dữ liệu. Cần tạo lại SFT cũ trong thư mục mới; manifest phải có `prompt_policy=full-context-native-fc-mix-asr-eval-v5`. Mặc định `TRAIN_MISSING_TOOL_POLICY="error"`, không tự bỏ mẫu lỗi schema.
+`tool_schemas` giữ toàn bộ schema của mọi tool được phép ngay từ bước đầu, gồm đầy đủ description, returns và metadata. History và mọi kết quả tool được giữ nguyên, không giới hạn lượt/ký tự hoặc giảm theo độ dài prompt. SFT tạo trực tiếp action call/done. Mọi schema đều có sẵn; local_schema.inspect chỉ kiểm tra arguments và góp ý, không mở khóa tool. Vượt giới hạn token sẽ báo lỗi, không tự cắt dữ liệu. Cần tạo lại SFT cũ trong thư mục mới; manifest phải có `prompt_policy=full-context-python-specialists-v7`. Mặc định `TRAIN_MISSING_TOOL_POLICY="error"`, không tự bỏ mẫu lỗi schema.
 
 Muốn dùng adapter đã có: đặt `TRAIN_LLM=False`, `LOCAL_ADAPTER` tới thư mục adapter. Muốn dùng model đã merge: đặt `TRAIN_LLM=False`, `LOCAL_ADAPTER=None`, `LOCAL_LLM` tới model merged. Nếu thiếu train data khi bật training, cell sẽ dừng rõ ràng thay vì dùng model gốc âm thầm.
 

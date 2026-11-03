@@ -11,10 +11,15 @@ from .agent import (SYSTEM_PROMPT, _train_transcript, audio_path, build_step_pro
                     full_json, history_text)
 from .catalog import allowed_tools
 from .llm import chat_token_ids
+from .local_time import LOCAL_TIME_POLICY
+from .local_helpers import DEFAULT_MAX_LOCAL_CALLS, LOCAL_HELPER_POLICY, execute_helper
+from .execution_policy import verify_result
+from .specialist_training import specialist_demonstrations
+from .temporal_training import helper_demonstrations
 from .text import TEXT_NORMALIZATION, normalize_transcript
 
 
-SFT_PROMPT_POLICY = "full-context-native-fc-mix-asr-eval-v5"
+SFT_PROMPT_POLICY = "full-context-python-specialists-v7"
 VALIDATION_ROLLOUT_POLICY = "asr-only-paired-clean-v1"
 DEFAULT_ASR_TRANSCRIPT_RATIO = 0.5
 
@@ -42,7 +47,9 @@ def assign_transcript_sources(records, ratio=DEFAULT_ASR_TRANSCRIPT_RATIO, seed=
 
 def validate_prompt_policy(manifest):
     if (manifest.get("prompt_policy") != SFT_PROMPT_POLICY
-            or manifest.get("text_normalization") != TEXT_NORMALIZATION):
+            or manifest.get("text_normalization") != TEXT_NORMALIZATION
+            or manifest.get("local_time_policy") != LOCAL_TIME_POLICY
+            or manifest.get("local_helper_policy") != LOCAL_HELPER_POLICY):
         raise ValueError("Prepared SFT data uses an older prompt/text-normalization/evaluation policy; "
                          "rerun prepare_sft.py in a new output directory")
 
@@ -149,13 +156,26 @@ def replay_sample(item, catalog, env, split_dir, asr=None, prepared_transcript=N
         validation = env.validate(name, args)
         if not isinstance(validation, dict) or not validation.get("ok"):
             raise ValueError(f"{item['id']} step {step}: gold schema invalid: {validation}")
+        # Local demonstrations are derived exclusively from the visible request,
+        # history and previous results, never from this gold action's operands.
+        helpers = helper_demonstrations(transcript, context, history, enabled, observations)
+        helpers += specialist_demonstrations(transcript, context, history, enabled, observations, pending=helpers)
+        remaining = max(0, DEFAULT_MAX_LOCAL_CALLS - sum(row.get("scope") == "local" for row in observations))
+        for helper in helpers[:remaining]:
+            examples.append(example({"action": "call", **helper}, len(examples)))
+            local_result = execute_helper(helper["name"], helper["arguments"], context, history, enabled, observations)
+            observations.append({**helper, "scope": "local", "result": full_json(local_result)})
         examples.append(example({"action": "call", "name": name, "arguments": args}, len(examples)))
         try:
             result = env.call(name, args)
         except Exception as exc:
             # Match the inference agent's observation exactly, including failed tool calls.
             result = {"ok": False, "error": repr(exc)}
-        observations.append({"name": name, "arguments": args, "result": full_json(result)})
+        observation = {"name": name, "arguments": args, "result": full_json(result)}
+        verification = verify_result(name, result)
+        if verification["status"] in ("failure", "empty"):
+            observation["verification"] = verification
+        observations.append(observation)
     if not calls or calls[-1]["name"] != "sys.ask_missing_info":
         examples.append(example({"action": "done"}, len(examples)))
     return examples

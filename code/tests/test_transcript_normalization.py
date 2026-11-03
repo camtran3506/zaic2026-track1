@@ -175,7 +175,9 @@ def test_structured_tool_data_and_sources_are_unchanged_by_text_normalization(tm
     assert turn['text'] == 'Đã gửi.'
     assert turn['tool_calls'] == original['history'][0]['tool_calls']
     assert turn['tool_results'] == original['history'][0]['tool_results']
-    assert payload['available_tools']['tool_schemas'] == [CATALOG[name] for name in sorted(CATALOG)]
+    from lifemate.local_helpers import with_local_tools
+    expected_tools = with_local_tools(CATALOG)
+    assert payload['available_tools']['tool_schemas'] == [expected_tools[name] for name in sorted(expected_tools)]
     assert entry == original
     assert [json.loads(s['messages'][-1]['content'])['arguments'] for s in steps[:-1]] == [
         call['arguments'] for call in original['label']['tool_calls']]

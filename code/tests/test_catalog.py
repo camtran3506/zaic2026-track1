@@ -7,6 +7,7 @@ import pytest
 
 from lifemate.agent import AgentConfig, LifeMateAgent, build_step_prompt, parse_decision
 from lifemate.sft import replay_sample
+from lifemate.local_helpers import with_local_tools
 from test_baseline import CATALOG, FakeEnv, StubASR, item
 
 
@@ -45,8 +46,8 @@ def test_sft_exposes_every_schema_from_the_first_step():
                          {'action': 'done'}]
     for row in rows:
         available = json.loads(row['messages'][1]['content'])['available_tools']
-        assert {t['name']: t for t in available['tool_schemas']} == catalog
-        assert {t['name'] for t in available['tool_index']} == set(catalog)
+        assert {t['name']: t for t in available['tool_schemas']} == with_local_tools(catalog)
+        assert {t['name'] for t in available['tool_index']} == set(with_local_tools(catalog))
     assert env.calls == [{'name': target, 'arguments': {'mode': 'on'}}]
     assert [r['step'] for r in rows] == [0, 1]
 
@@ -59,7 +60,7 @@ def test_inference_can_execute_any_allowed_tool():
         def generate(self, system, user):
             self.prompts.append(user)
             available = json.loads(user)['available_tools']
-            assert {t['name']: t for t in available['tool_schemas']} == catalog
+            assert {t['name']: t for t in available['tool_schemas']} == with_local_tools(catalog)
             if len(self.prompts) == 1:
                 return json.dumps({'action': 'call', 'name': target, 'arguments': {'mode': 'on'}})
             return '{"action":"done"}'
@@ -89,7 +90,7 @@ def test_large_payload_preserves_all_fields_without_size_fitting():
     payload = json.loads(prompt)
     assert len(prompt) > 20000
     assert tools == payload['available_tools']
-    assert {t['name']: t for t in tools['tool_schemas']} == catalog
+    assert {t['name']: t for t in tools['tool_schemas']} == with_local_tools(catalog)
     assert next(t['description'] for t in tools['tool_index'] if t['name'] == target) == catalog[target]['description']
     assert payload['user_context'] == {'profile': {'notes': 'x' * 6000}}
     assert payload['conversation_history'] == [

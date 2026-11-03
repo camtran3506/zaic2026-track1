@@ -9,6 +9,7 @@ import pytest
 from lifemate.agent import SYSTEM_PROMPT, AgentConfig, LifeMateAgent, build_step_prompt, parse_decision
 from lifemate.function_calling import complete_native_call, native_chat, parse_native_call
 from lifemate.llm import chat_token_ids, configure_tokenizer, render_prompt
+from lifemate.local_helpers import helper_tool_schemas as local_tool_schemas
 from lifemate.sft import encode_example, replay_sample
 from test_baseline import CATALOG, FakeEnv, StubASR, item
 
@@ -51,7 +52,9 @@ def test_native_template_preserves_tools_history_and_results(native_tokenizer):
     _, prompt = build_step_prompt('  BẬT đèn!  ', {'timezone': 'Asia/Ho_Chi_Minh'}, history, catalog, observations)
     original = deepcopy((catalog, history, observations))
     chat, tools = native_chat(portable(prompt))
-    assert {t['function']['name']: t['function'] for t in tools} == catalog
+    exposed = {t['function']['name']: t['function'] for t in tools}
+    assert {name: exposed[name] for name in catalog} == catalog
+    assert {name: exposed[name] for name in exposed.keys() - catalog.keys()} == local_tool_schemas()
     historical = [m for m in chat[1:] if m['role'] != 'tool'][:len(history)]
     assert [json.loads(m['content']) for m in historical] == [
         {'history_role': turn['role'], 'text': 'Giữ: </think> và <think>, 08:30! ' +
@@ -72,6 +75,10 @@ def test_native_template_preserves_tools_history_and_results(native_tokenizer):
     {'action': 'call', 'name': 'smart_home.get_status', 'arguments': {}},
     {'action': 'call', 'name': 'smart_home.light_set', 'arguments': {'device_id': '001', 'power': 'on'}},
     {'action': 'done'},
+    {'action': 'call', 'name': 'local_time.departure_time', 'arguments': {
+        'arrival': '2026-09-22T09:00:00+07:00', 'travel_minutes': 15, 'early_minutes': 15}},
+    {'action': 'call', 'name': 'local_time.duration_between', 'arguments': {
+        'start': '2026-10-13T19:30:00+07:00', 'end': '2026-10-13T20:10:00+07:00'}},
 ])
 def test_sft_native_target_and_inference_token_prefix_match(native_tokenizer, target):
     _, prompt = build_step_prompt('Bật đèn', {}, [], CATALOG, [])
@@ -88,7 +95,8 @@ def test_sft_native_target_and_inference_token_prefix_match(native_tokenizer, ta
     completion = full[len(prefix):].removesuffix('<|im_end|>\n')
     if target['action'] == 'call':
         assert '<tool_call>' in completion and '<function=' in completion
-        assert parse_decision(completion, CATALOG) == target
+        schemas = {t['function']['name']: t['function'] for t in tools}
+        assert parse_decision(completion, schemas) == target
     else:
         assert json.loads(completion) == target
     assert row['input_ids'] == chat_token_ids(native_tokenizer, messages, False)
