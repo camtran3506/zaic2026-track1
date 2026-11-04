@@ -112,7 +112,12 @@ def test_old_tool_only_history_is_retained_with_all_later_turns():
 @pytest.mark.parametrize('result_kind', ['object', 'string', 'error'])
 def test_large_current_results_and_all_actions_match_sft_direct_and_cached_inference(tmp_path, result_kind):
     entry = record()
-    entry['label']['tool_calls'] = [entry['label']['tool_calls'][0]] * 10
+    template = entry['label']['tool_calls'][0]
+    # Distinct proposals exercise full retention without violating the bounded
+    # retry rule for an identical malformed/exception-producing call.
+    entry['label']['tool_calls'] = [
+        {**template, 'arguments': {**template['arguments'], 'content': f'20.600 #{i}'}}
+        for i in range(10)]
     entry['history'] += [{'role': 'user', 'text': f'History {i}: ' + 'giữ! ' * 500}
                          for i in range(20)]
     result_text = 'Kết quả cần giữ nguyên: ' * 1000
@@ -133,7 +138,8 @@ def test_large_current_results_and_all_actions_match_sft_direct_and_cached_infer
     for action in final['previous_actions_and_results']:
         result = json.loads(action['result'])
         if result_kind == 'error':
-            assert result == {'ok': False, 'error': repr(RuntimeError(result_text))}
+            assert result == {'execution_exception': {'type': 'RuntimeError', 'message': result_text,
+                                                      'repr': repr(RuntimeError(result_text))}}
         elif result_kind == 'string':
             assert result == result_text
         else:

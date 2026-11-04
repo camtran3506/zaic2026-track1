@@ -157,13 +157,13 @@ def test_local_calculation_does_not_reset_empty_read_guard():
     assert report["executed"] == 1 and report["local_executed"] == 1 and report["invalid_proposals"] == 1
 
 
-def test_successful_repeated_writes_and_read_refreshes_are_preserved():
+def test_successful_repeated_writes_are_preserved_and_duplicate_read_is_blocked():
     write, read = call("notes.append", text="same"), call("notes.search", query="same")
     env, report, _, _ = run([write, write, read, read, DONE])
     assert [entry["name"] for entry in env.get_tool_calls()] == [
-        "notes.append", "notes.append", "notes.search", "notes.search"]
+        "notes.append", "notes.append", "notes.search"]
     assert env.notes == [{"text": "same"}, {"text": "same"}]
-    assert report["executed"] == 4 and report["invalid_proposals"] == 0
+    assert report["executed"] == 3 and report["invalid_proposals"] == 1
 
 
 def test_write_between_empty_queries_allows_fresh_read():

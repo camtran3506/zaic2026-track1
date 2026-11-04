@@ -147,7 +147,8 @@ def test_validator_and_execution_exceptions_are_distinguished_from_returns(tmp_p
     assert len(env.calls) == stats['executed'] == (1 if phase == 'call' else 0)
     assert stats['invalid_proposals'] == (1 if phase == 'validate' else 0)
     if phase == 'call':
-        assert error['agent_result'] == {'ok': False, 'error': "ValueError('Call failed')"}
+        assert error['agent_result'] == {'execution_exception': error['exception']}
+        assert 'ok' not in error['agent_result']
 
 
 def test_execution_returning_ok_false_is_logged_as_a_return(tmp_path):

@@ -11,6 +11,7 @@ from lifemate.runtime import load_runtime_manifest, RUNTIME_MANIFEST
 from lifemate.sft import SFT_PROMPT_POLICY, replay_sample, validate_prompt_policy
 from lifemate.specialist_training import specialist_demonstrations
 from lifemate.text import TEXT_NORMALIZATION
+from lifemate.execution_policy import EXECUTION_POLICY
 from lifemate.itn import ITN_POLICY, detect_candidates
 from test_local_time_runtime import temporal_artifact
 
@@ -165,7 +166,7 @@ def test_sft_feedback_distinguishes_reported_failure_empty_and_success(result, s
 
 def test_old_specialist_manifest_is_rejected_without_guessing_compatibility():
     manifest = {"prompt_policy": SFT_PROMPT_POLICY, "text_normalization": TEXT_NORMALIZATION,
-                "local_time_policy": LOCAL_TIME_POLICY, "local_helper_policy": LOCAL_HELPER_POLICY, "itn_policy": ITN_POLICY}
+                "local_time_policy": LOCAL_TIME_POLICY, "local_helper_policy": LOCAL_HELPER_POLICY, "itn_policy": ITN_POLICY, "execution_policy": EXECUTION_POLICY}
     validate_prompt_policy(manifest)
     manifest.pop("local_helper_policy")
     with pytest.raises(ValueError, match="rerun prepare_sft"):

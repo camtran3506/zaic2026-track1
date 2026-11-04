@@ -90,7 +90,9 @@ def test_preparation_keeps_sft_mix_and_uses_asr_for_every_validation_rollout(
                for i in range(samples)]
     # Different trajectory lengths must not affect transcript assignments.
     for i, record in enumerate(records):
-        record['label']['tool_calls'] = record['label']['tool_calls'][:1] * (1 + i % 3)
+        record['label']['tool_calls'] = record['label']['tool_calls'][:1] + [
+            {'name': 'smart_home.light_set', 'arguments': {'device_id': 'light_living', 'power': 'on'}}
+            for _ in range(i % 3)]
         (source / record['audio']).write_bytes(b'fixture: recognizer is stubbed')
     manifest_path = source / 'train.jsonl'
     manifest_path.write_text(''.join(json.dumps(r) + '\n' for r in records))

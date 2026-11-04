@@ -7,6 +7,8 @@ from copy import deepcopy
 import json
 import re
 
+from .execution_policy import AUTOMATIC_GUARD_INSTRUCTIONS
+
 
 NATIVE_PROTOCOL = "qwen35-native-fc-v1"
 JSON_PROTOCOL = "lifemate-decision-json-v1"
@@ -37,6 +39,9 @@ NATIVE_SYSTEM_PROMPT = """Bạn là AI Agent LifeMate. Hoàn tất yêu cầu ti
 - Khi hoàn tất, không gọi tool nữa và trả đúng {"action":"done"}.
 - Không markdown, không diễn giải, không tự nói rằng tool đã được thực thi.
 """
+
+
+NATIVE_SYSTEM_PROMPT += AUTOMATIC_GUARD_INSTRUCTIONS
 
 
 def _json(value):
@@ -91,9 +96,13 @@ def native_chat(messages):
             chat.append(tool_call_message(observation["name"], observation["arguments"]))
             result = observation["result"]
             chat.append({"role": "tool", "content": result if isinstance(result, str) else _json(result)})
+            feedback = {}
             if observation.get("verification"):
-                chat.append({"role": "user", "content": _json({
-                    "execution_feedback": observation["verification"]})})
+                feedback["execution_feedback"] = observation["verification"]
+            if observation.get("automatic_execution_feedback"):
+                feedback["automatic_execution_feedback"] = observation["automatic_execution_feedback"]
+            if feedback:
+                chat.append({"role": "user", "content": _json(feedback)})
         else:
             # A rejected proposal has no executed tool result to fabricate.
             chat.append({"role": "user", "content": _json({"agent_feedback": observation})})

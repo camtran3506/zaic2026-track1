@@ -5,6 +5,7 @@ from pathlib import Path
 import pytest
 from lifemate.agent import AgentConfig, LifeMateAgent, build_step_prompt
 from lifemate.function_calling import native_chat
+from lifemate.execution_policy import EXECUTION_POLICY
 from lifemate.itn import ITN_POLICY, detect_candidates, normalize_span
 from lifemate.local_helpers import execute_helper, helper_tool_schemas
 from lifemate.runtime import RUNTIME_MANIFEST, load_runtime_manifest
@@ -134,7 +135,7 @@ def test_itn_manifest_incompatibility_requires_repreparation(temporal_artifact):
 def test_sft_manifest_requires_itn_policy():
     manifest = {"prompt_policy": SFT_PROMPT_POLICY, "text_normalization": TEXT_NORMALIZATION,
                 "local_helper_policy": LOCAL_HELPER_POLICY, "local_time_policy": LOCAL_TIME_POLICY,
-                "itn_policy": ITN_POLICY}
+                "itn_policy": ITN_POLICY, "execution_policy": EXECUTION_POLICY}
     validate_prompt_policy(manifest)
     manifest.pop("itn_policy")
     with pytest.raises(ValueError, match="rerun prepare_sft"):

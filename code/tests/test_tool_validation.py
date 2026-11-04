@@ -35,10 +35,11 @@ def rejection_feedback(system, user):
     return feedback
 
 
-def test_toolenv_accepted_ids_and_duplicate_reads_are_executed_in_both_paths():
+def test_toolenv_accepted_ids_and_read_after_write_are_executed_in_both_paths():
     calls = [
         {'name': 'smart_home.light_set', 'arguments': {'device_id': 'not_previously_read', 'power': 'on'}},
         {'name': 'smart_home.get_status', 'arguments': {}},
+        {'name': 'smart_home.light_set', 'arguments': {'device_id': 'not_previously_read', 'power': 'off'}},
         {'name': 'smart_home.get_status', 'arguments': {}},
     ]
     for runner in (run_agent, replay):
@@ -118,7 +119,7 @@ def test_rejection_expires_after_execution_but_call_failure_remains_visible(outc
     corrected = {'device_id': 'Device_A', 'power': 'on'}
     result = ({'ok': True} if outcome == 'ok' else
               {'ok': False, 'error': 'Call failed'} if outcome == 'error_return' else
-              {'ok': False, 'error': "RuntimeError('Call failed')"})
+              {'execution_exception': {'type': 'RuntimeError', 'message': 'Call failed', 'repr': "RuntimeError('Call failed')"}})
     class Env(FakeEnv):
         def validate(self, name, args):
             return {'ok': args == corrected, 'error': 'Wrong ID' if args == proposed else None}
@@ -143,16 +144,19 @@ def test_rejection_expires_after_execution_but_call_failure_remains_visible(outc
                 if outcome == 'ok':
                     assert 'verification' not in observations[0]
                 else:
-                    assert observations[0]['verification']['status'] == 'failure'
+                    assert observations[0]['verification']['status'] == ('unknown' if outcome == 'exception' else 'failure')
                     assert observations[0]['verification']['goal_completion'] == 'unknown'
                 chat, _ = native_chat([{'role': 'system', 'content': system},
                                       {'role': 'user', 'content': user}])
-                call_index = -2 if outcome == 'ok' else -3
-                assert chat[call_index]['tool_calls'][0]['function']['arguments'] == corrected
-                assert chat[call_index + 1]['role'] == 'tool'
-                assert json.loads(chat[call_index + 1]['content']) == result
+                tool_calls = [turn for turn in chat if turn.get('tool_calls')]
+                tool_results = [turn for turn in chat if turn['role'] == 'tool']
+                assert len(tool_calls) == len(tool_results) == 1
+                assert tool_calls[0]['tool_calls'][0]['function']['arguments'] == corrected
+                assert json.loads(tool_results[0]['content']) == result
+                automatic = json.loads(chat[-1]['content'])
+                assert automatic['automatic_execution_feedback'] == observations[0]['automatic_execution_feedback']
                 if outcome != 'ok':
-                    assert json.loads(chat[-1]['content'])['execution_feedback'] == observations[0]['verification']
+                    assert automatic['execution_feedback'] == observations[0]['verification']
                 assert not any('agent_feedback' in turn.get('content', '') for turn in chat)
                 return '{"action":"done"}'
             return json.dumps({'action': 'call', 'name': 'smart_home.light_set',

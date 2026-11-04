@@ -93,7 +93,7 @@ Other model families keep the portable JSON-decision protocol. Runtime manifests
 record `qwen35-native-fc-v1` for Qwen3.5; an old Qwen3.5 JSON-protocol adapter is
 rejected instead of silently mixing protocols. Regenerate SFT in a fresh directory
 and retrain that adapter. The current preparation policy is
-`full-context-python-specialists-itn-v8`. Production never replaces the checkpoint template;
+`full-context-python-automatic-guards-v9`. Production never replaces the checkpoint template;
 tests use a pinned upstream Qwen3.5 template fixture without downloading weights.
 
 ## Internal date and time tools
@@ -144,10 +144,11 @@ coverage for the chosen clean/ASR mixture. Helper demonstrations are conditional
 so adding schemas does not guarantee that every input supplies all three targets.
 
 Regenerate prepared SFT in a fresh directory: the manifest must record
-`prompt_policy=full-context-python-specialists-itn-v8` and
+`prompt_policy=full-context-python-automatic-guards-v9` and
 `local_time_policy=local-time-tools-v1` and
 `local_helper_policy=python-specialists-itn-v2` and
-`itn_policy=vi-explicit-spans-v1`. Existing runtime artifacts must carry
+`itn_policy=vi-explicit-spans-v1` and
+`execution_policy=automatic-tool-guards-v1`. Existing runtime artifacts must carry
 these same local policies; adding tool schemas alone does not establish that an old
 adapter learned to use them. Unit and fixture tests cover these paths; real
 Qwen3.5 GPU training/inference and accuracy improvements still require validation.
@@ -186,7 +187,7 @@ SFT adds conservative demonstrations from visible inputs and prior actual result
 with the same local execution and assistant-only loss path used at inference.
 Schema-repair demonstrations require a prior rejected proposal; result verification
 and retry monitoring also run automatically. Rebuild prepared SFT and retrain an
-adapter for policy `full-context-python-specialists-itn-v8`. Manifests with a different
+adapter for policy `full-context-python-automatic-guards-v9`. Manifests with a different
 helper policy are rejected; legacy adapters without a manifest emit an explicit
 warning and have no verified helper training. Accuracy and added
 LLM-turn latency must be measured on held-out Qwen GPU evaluation.
@@ -367,7 +368,7 @@ including tool-only turns. Tool results are not clipped. The on-disk transcript
 cache retains this same full history, so compatible caches can be reused.
 Regenerate older SFT datasets in a new output directory: shortened data cannot
 be recovered by the trainer. Training and rollout evaluation reject manifests
-without the current `prompt_policy: full-context-python-specialists-itn-v8` marker.
+without the current `prompt_policy: full-context-python-automatic-guards-v9` marker.
 `--use-train-transcript` still requires `split=train`; test request audio is always
 transcribed rather than read from a possible `audio_text` field.
 
@@ -550,7 +551,7 @@ By default `docker run ... lifemate:baseline` targets **private_test** at `/data
 ## Important limitations and compliance notes
 
 - **Timing**: there is no per-sample timeout by default. A finite `--sample-seconds` applies only to the LLM stage and is cooperative, not a hard interrupt. Offline ASR-precomputation experiments do NOT establish compliance with a competition's end-to-end 30-second rule.
-- `env.validate` catches schema-invalid arguments before they become logged calls; valid but semantically wrong IDs may still be rejected by `env.call`.
+- `env.validate` catches schema-invalid arguments before execution. Under the organizer contract, nonexistent IDs and insufficient resources are business no-ops (`ok:true, done:false`), not schema refusals. Every executed call remains in the official log.
 - The model's response is constrained by a JSON-only prompt and strict parser, not constrained decoder. Malformed generations consume retries.
 - No external API or online requests at inference. `state.json` is NEVER read directly.
 - Fine-tuning reads only `train/train.jsonl` labels. Public/private test labels are never used. See the training workflow below.
@@ -575,10 +576,24 @@ After validation succeeds and `env.call` is attempted and counted, all pending
 rejection feedback is removed from subsequent planner prompts. All executed
 calls/results remain, including `ok: false` returns and call exceptions. The
 cumulative invalid-proposal count and the full debug trace retain earlier errors.
-No local type coercion, temporal repair, ID provenance inference, collection alias
-mapping or duplicate-read blocking is applied. ToolEnv decides argument validity;
-`env.call` may still report execution errors, which are also returned to the model.
-Repeated reads remain subject to the existing call/time limits.
+The automatic Python guard first checks tool names/sample permissions and then
+blocks exact schema-rejected proposals for the entire sample. It reuses successful
+reads from the current ToolEnv (including empty results) and suppresses repeated
+no-op writes until a possible state change. Successful writes remain repeatable.
+Read/helper calls and known no-op writes never clear a block. Successful or
+uncertain writes invalidate transient read/no-op caches across apps, while schema
+rejections stay permanent. The program does not infer changes from state hashes
+or inspect hidden app state. See [HELPERS.md](HELPERS.md) for the complete rules.
+
+Both inference and gold SFT replay use the same `tool_execution` boundary and
+`automatic_execution_feedback`. These guards run automatically; the model does
+not call them as tools. Blocked reads report the original cached result/source
+without creating a fake executed call. A conflicting gold proposal fails SFT
+preparation rather than silently changing labels. Technical exceptions are
+separate from schema refusals and receive at most one retry per exact proposal.
+The existing call/invalid/step limits remain in force. No local type coercion,
+temporal repair, or automatic name/ID substitution is applied; organizer
+validation remains authoritative.
 
 SFT gold replay uses the same `env.validate` acceptance rule and preserves gold
 arguments verbatim. Gold rejected by ToolEnv stops preparation with a schema error.

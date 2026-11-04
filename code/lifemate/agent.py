@@ -13,7 +13,8 @@ from .history import prompt_history, resolve_history
 from .local_helpers import (DEFAULT_MAX_LOCAL_CALLS, execute_helper,
                             helper_tool_schemas, with_local_tools)
 from .local_checks import inspect_call
-from .execution_policy import LoopMonitor
+from .execution_policy import EXECUTION_POLICY, AUTOMATIC_GUARD_INSTRUCTIONS, LoopMonitor
+from .tool_execution import precheck_call, attempt_env_call, result_observation
 from .text import normalize_transcript
 from .itn import ITN_POLICY, detect_candidates
 
@@ -55,6 +56,9 @@ QUY TẮC BẮT BUỘC:
 - Nếu đã hoàn tất: {"action":"done"}. Không tự nói là đã gọi tool.
 - Arguments must be a JSON object. Output exactly one JSON object.
 """
+
+
+SYSTEM_PROMPT += AUTOMATIC_GUARD_INSTRUCTIONS
 
 
 def parse_decision(raw: str, catalog=None) -> dict:
@@ -145,6 +149,7 @@ def build_step_prompt(transcript, context, history, enabled, observations):
     info = {
         "request_transcript": transcript,
         "itn_policy": ITN_POLICY,
+        "automatic_execution_policy": EXECUTION_POLICY,
         "itn_candidates": detect_candidates(transcript),
         "itn_history_candidates": [
             {"history_index": i, "candidates": candidates}
@@ -242,12 +247,11 @@ class LifeMateAgent:
                 stop_reason = "done"
                 break
             name, args = decision.get("name"), decision.get("arguments")
-            if not isinstance(name, str) or name not in planner_tools or name not in {x["name"] for x in tools["tool_schemas"]}:
-                reject(f"Tool {name!r} not exposed in tool_schemas; choose only from listed schemas.",
-                       "precheck", name=name, arguments=args)
-                continue
-            if not isinstance(args, dict):
-                reject("arguments must be a JSON object", "precheck", name=name, arguments=args)
+            rejection = precheck_call(name, args, self.catalog, enabled, monitor, local_names)
+            if rejection:
+                if rejection["stage"] == "loop_guard":
+                    emit("loop_advisory", name=name, arguments=args, feedback=rejection["feedback"])
+                reject(**rejection)
                 continue
             if name in local_names:
                 if local_executed >= self.cfg.max_local_calls:
@@ -270,55 +274,19 @@ class LifeMateAgent:
                                      "result": full_json(result), "scope": "local"})
                 # Helpers cannot call ToolEnv. Entity IDs only reference existing evidence.
                 continue
-            if name == "sys.ask_missing_info":
-                if args.get("tool_name") not in enabled or args.get("tool_name") == name:
-                    reject("Missing-info tool_name must be another available tool.",
-                           "precheck", name=name, arguments=args)
-                    continue
             advisory = inspect_call(name, args, enabled)
             emit("schema_inspection", name=name, inspection=advisory)
-            feedback = monitor.check(name, args, enabled[name].get("kind", "unknown"))
-            if feedback:
-                emit("loop_advisory", name=name, arguments=args, feedback=feedback)
-                if feedback.get("block"):
-                    reject(feedback["instruction"], "loop_guard", name=name, arguments=args,
-                           feedback=feedback)
-                    continue
-            emit("validate_start", name=name, arguments=args)
-            try:
-                validation = env.validate(name, args)
-            except Exception as exc:
-                emit("validate_error", name=name, arguments=args, exception=exception_details(exc))
-                reject(str(exc), "validate", name=name, arguments=args, exception=exception_details(exc))
+            outcome = attempt_env_call(env, name, args, enabled[name].get("kind", "unknown"),
+                                       monitor, executed, emit=emit)
+            if not outcome["executed"]:
+                reject(**outcome["feedback"])
                 continue
-            accepted = isinstance(validation, dict) and bool(validation.get("ok"))
-            emit("validate_result", name=name, arguments=args, result=validation, accepted=accepted)
-            if not accepted:
-                monitor.record_validation_failure(name, args, validation)
-                reject(f"Schema invalid: {validation!r}", "validate", name=name,
-                       arguments=args, validation=validation)
-                continue
-            # This is the *only* place execution takes place. Calls that fail are logged by ToolEnv.
-            emit("call_start", name=name, arguments=args, call_index=executed)
-            try:
-                result = env.call(name, args)
-            except Exception as exc:
-                result = {"ok": False, "error": repr(exc)}
-                emit("call_error", name=name, arguments=args, call_index=executed,
-                     exception=exception_details(exc), agent_result=result)
-            else:
-                emit("call_result", name=name, arguments=args, call_index=executed, result=result)
             executed += 1
-            verification = monitor.record_result(name, args, result, enabled[name].get("kind", "unknown"))
-            emit("execution_verified", name=name, verification=verification)
             # Move on using actual calls/results once validation led to execution.
             # Executed failures remain evidence; only unexecuted feedback expires.
             # The debug trace and cumulative invalid counter retain earlier errors.
             observations[:] = [observation for observation in observations if "result" in observation]
-            observation = {"name": name, "arguments": args, "result": full_json(result)}
-            if verification["status"] in ("failure", "empty"):
-                observation["verification"] = verification
-            observations.append(observation)
+            observations.append(result_observation(name, args, outcome, full_json))
             if name == "sys.ask_missing_info":
                 stop_reason = "ask_missing_info"
                 break

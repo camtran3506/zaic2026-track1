@@ -13,14 +13,15 @@ from .catalog import allowed_tools
 from .llm import chat_token_ids
 from .local_time import LOCAL_TIME_POLICY
 from .local_helpers import DEFAULT_MAX_LOCAL_CALLS, LOCAL_HELPER_POLICY, execute_helper
-from .execution_policy import verify_result
+from .execution_policy import EXECUTION_POLICY, LoopMonitor
+from .tool_execution import precheck_call, attempt_env_call, result_observation
 from .specialist_training import specialist_demonstrations
 from .temporal_training import helper_demonstrations
 from .text import TEXT_NORMALIZATION, normalize_transcript
 from .itn import ITN_POLICY
 
 
-SFT_PROMPT_POLICY = "full-context-python-specialists-itn-v8"
+SFT_PROMPT_POLICY = "full-context-python-automatic-guards-v9"
 VALIDATION_ROLLOUT_POLICY = "asr-only-paired-clean-v1"
 DEFAULT_ASR_TRANSCRIPT_RATIO = 0.5
 
@@ -51,7 +52,8 @@ def validate_prompt_policy(manifest):
             or manifest.get("text_normalization") != TEXT_NORMALIZATION
             or manifest.get("local_time_policy") != LOCAL_TIME_POLICY
             or manifest.get("local_helper_policy") != LOCAL_HELPER_POLICY
-            or manifest.get("itn_policy") != ITN_POLICY):
+            or manifest.get("itn_policy") != ITN_POLICY
+            or manifest.get("execution_policy") != EXECUTION_POLICY):
         raise ValueError("Prepared SFT data uses an older prompt/text-normalization/evaluation policy; "
                          "rerun prepare_sft.py in a new output directory")
 
@@ -134,6 +136,7 @@ def replay_sample(item, catalog, env, split_dir, asr=None, prepared_transcript=N
     context = item.get("context", {})
     enabled = allowed_tools(catalog, context.get("installed_apps", {}))
     observations, examples = [], []
+    monitor = LoopMonitor()
 
     def example(target, step):
         _, prompt = build_step_prompt(transcript, context, history, enabled, observations)
@@ -150,14 +153,12 @@ def replay_sample(item, catalog, env, split_dir, asr=None, prepared_transcript=N
 
     for step, call in enumerate(calls):
         name, args = call.get("name"), call.get("arguments")
-        if name not in enabled or not isinstance(args, dict):
-            raise ValueError(f"{item['id']} step {step}: unavailable tool or non-object arguments")
-        if name == "sys.ask_missing_info":
-            if step != len(calls) - 1 or args.get("tool_name") not in enabled or args.get("tool_name") == name:
-                raise ValueError(f"{item['id']}: invalid or non-terminal ask_missing_info")
-        validation = env.validate(name, args)
-        if not isinstance(validation, dict) or not validation.get("ok"):
-            raise ValueError(f"{item['id']} step {step}: gold schema invalid: {validation}")
+        rejection = precheck_call(name, args, catalog, enabled, monitor)
+        if rejection:
+            reason = rejection.get("feedback", {}).get("reason", rejection.get("access", {}).get("status", rejection["stage"]))
+            raise ValueError(f"{item['id']} step {step}: gold blocked by automatic guard: {name!r}, {reason}")
+        if name == "sys.ask_missing_info" and step != len(calls) - 1:
+            raise ValueError(f"{item['id']}: invalid or non-terminal ask_missing_info")
         # Local demonstrations are derived exclusively from the visible request,
         # history and previous results, never from this gold action's operands.
         helpers = helper_demonstrations(transcript, context, history, enabled, observations)
@@ -168,16 +169,10 @@ def replay_sample(item, catalog, env, split_dir, asr=None, prepared_transcript=N
             local_result = execute_helper(helper["name"], helper["arguments"], context, history, enabled, observations)
             observations.append({**helper, "scope": "local", "result": full_json(local_result)})
         examples.append(example({"action": "call", "name": name, "arguments": args}, len(examples)))
-        try:
-            result = env.call(name, args)
-        except Exception as exc:
-            # Match the inference agent's observation exactly, including failed tool calls.
-            result = {"ok": False, "error": repr(exc)}
-        observation = {"name": name, "arguments": args, "result": full_json(result)}
-        verification = verify_result(name, result)
-        if verification["status"] in ("failure", "empty"):
-            observation["verification"] = verification
-        observations.append(observation)
+        outcome = attempt_env_call(env, name, args, enabled[name].get("kind", "unknown"), monitor, step)
+        if not outcome["executed"]:
+            raise ValueError(f"{item['id']} step {step}: gold schema invalid or validation failed: {outcome['feedback']}")
+        observations.append(result_observation(name, args, outcome, full_json))
     if not calls or calls[-1]["name"] != "sys.ask_missing_info":
         examples.append(example({"action": "done"}, len(examples)))
     return examples

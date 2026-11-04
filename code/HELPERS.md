@@ -15,7 +15,7 @@ execution hooks. They require no additional packages or services.
 | `local_schema.inspect` | `target_tool`, `arguments` | Advisory `valid`, `invalid` or `unsupported` plus errors. Checks the exposed schema; `env.validate` remains authoritative. |
 | `local_checks.evaluate` | `operation: sum/compare/minimum/filter`, corresponding numeric operands | Bounded decimal computation, comparisons or selected records. At most 100 items; verifies supplied operands, not their meaning or source. |
 | Automatic `verify_result` | Actual application result | `success`, `failure`, `empty` or `unknown`. Goal completion stays unknown. |
-| Automatic `LoopMonitor` | Proposed call, validation outcome, actual results and call kind | Feedback on an exact rejected call or failed/empty read without new relevant evidence; failed writes receive advice only. Successful calls are never deduplicated. |
+| Automatic `LoopMonitor` | Proposed call, validation outcome, actual results and call kind | Permanent schema blacklist, current-session read reuse and no-op write suppression. Successful writes remain repeatable. This middleware is automatic, never a model-selected tool. |
 
 The exact schemas in `local_helpers.helper_tool_schemas()` define required fields
 and bounds. All local names are reserved and rejected if they collide with an
@@ -42,12 +42,46 @@ questions, a different entity, or automatic argument replacement. The post-call
 verifier distinguishes a top-level `done:false` from nested lifecycle fields such
 as a reminder's `done:false`; it cannot establish the user's entire goal.
 
-Loop checks compare the whole tool name and typed JSON arguments. New relevant
-read evidence can permit a retry; executed writes and unknown-kind calls invalidate
-cached blocks because even a failure may have partial effects. No application
-call is erased or hidden. Submission remains the unmodified
-`env.get_tool_calls()` and `env.get_state_hash()`. Local calls only appear in model
-observations, diagnostic traces and local counters.
+Loop checks compare the full tool name and typed JSON arguments, ignoring dictionary
+key order. They have separate lifetimes:
+
+| Automatic check | Lifetime / action |
+| --- | --- |
+| `check_tool_access` | Before any env validation/call; distinguish unknown vs disallowed names using the catalog and sample whitelist. Suggestions only contain exposed tools. Registered local helpers route separately. |
+| Explicit `env.validate(...).ok == false` | Permanently block that exact proposal until the sample ends, for read/write/meta alike. No read, helper or write clears this blacklist. |
+| Actual read result with `ok:true` | Cache and block exact retries in the current state epoch, including nonempty, empty, nested-empty and top-level `done:false` results. `done:true` is not required. |
+| Actual write result with top-level `ok:true, done:false` | Block an exact retry in the current state epoch. New read evidence does not change this condition. |
+| Successful write | Never deduplicate it. Conservatively invalidate all read/no-op caches across apps, even if no mutation can be proven. Nested lifecycle fields such as a reminder's `done:false` do not mean failure. |
+| Execution exception or malformed write response | The state may be uncertain, so invalidate transient caches. Keep schema rejections. |
+| Technical error | At most two failed attempts per exact proposal (original plus one retry), then return a distinct retry-budget guard; do not label it a schema rejection. |
+
+Only explicit organizer `ok:false` validation results enter the schema blacklist;
+malformed validator returns and exceptions are technical errors. An actual
+`env.call` returning `ok:false` after successful validation is recorded as a
+contract anomaly and schema rejection, while retaining the executed call.
+Exceptions use an agent-generated `execution_exception` envelope, not a fabricated
+organizer `ok:false` response. Only top-level `done:false` is a business no-op.
+
+Every env call uses the shared `tool_execution.attempt_env_call` boundary, which
+requires explicit validation success before execution. A blocked proposal returns
+`agent_feedback`, including the original cached result and source call index for
+read reuse. It is never rendered as another executed native tool call/response.
+`automatic_execution_feedback` accompanies actual observations in both SFT and
+inference, identifying Python-managed rules, result origin and state epoch.
+The model does not request these guards or spend its local-helper budget on them.
+`local_schema.inspect` remains a separate optional, advisory model-callable helper.
+
+History is not seeded into the read cache, so it cannot suppress the first read
+in this ToolEnv. New reads/helpers, known no-op writes and schema refusals do not
+advance the state epoch. No `get_state()`, state hash or environment files are used
+to detect state changes. A canonical state hash could omit relevant data.
+
+No application call is erased or hidden. Submission remains the unmodified
+`env.get_tool_calls()` and `env.get_state_hash()`. Blocked proposals consume the
+existing invalid-proposal/step budget; empty/no-op feedback never forces done,
+a different entity or a missing-information question. Schema rejections are never
+evicted; the outer step limit bounds their per-sample size. Transient caches are
+bounded separately. All guard state is reset for each sample.
 
 ## Automatic ITN before the model
 
@@ -88,6 +122,14 @@ actual earlier rejected proposal. No helper arguments come from future gold
 actions, and no artificial failed application calls are inserted into gold replay.
 The original gold application call sequence and final state remain intact.
 
+SFT replay uses exactly the same access checks, validation/execution boundary,
+monitor and automatic feedback as inference. Gold is not silently rewritten:
+a blocked duplicate read/no-op gold proposal fails preparation with the sample
+and step. Successful duplicate writes remain intact. There are no artificial
+failed env calls, copied future-gold operands or new model-callable guard schemas.
+The next gold action learns from the program feedback accompanying prior actual
+results; no extra LLM or hidden-state read is involved.
+
 Only assistant target tokens receive loss, including helper calls. Tool results,
 execution feedback, history and prompts remain masked. Native Qwen serialization
 is shared with inference. Helper targets are conditional; the manifest reports
@@ -96,10 +138,11 @@ need a model-generated helper call. Retry/recovery behaviour is supplied through
 hooks and feedback, not claimed as a learned universal critic.
 
 Regenerate SFT in a fresh output directory and retrain an adapter. Prepared data
-requires `prompt_policy=full-context-python-specialists-itn-v8`,
+requires `prompt_policy=full-context-python-automatic-guards-v9`,
 `local_time_policy=local-time-tools-v1` and
 `local_helper_policy=python-specialists-itn-v2` and
-`itn_policy=vi-explicit-spans-v1`; runtime exports carry these policies.
+`itn_policy=vi-explicit-spans-v1` and
+`execution_policy=automatic-tool-guards-v1`; runtime exports carry these policies.
 ASR transcript normalization/cache format is unchanged; valid transcript caches
 can be reused because annotations are derived when building the prompt. Older adapters are not declared compatible by renaming their manifests.
 CPU fixtures cover replay, provenance, routing, masking and retry behaviour.

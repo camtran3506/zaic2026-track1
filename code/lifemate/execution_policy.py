@@ -1,31 +1,52 @@
-"""Bounded factual feedback around execution; no model, ToolEnv or gold access.
+"""Automatic Python guards over public catalog/proposals/results, per sample.
 
-Inspired by pre/post execution hooks and evaluator feedback loops. These checks
-describe observable outcomes, not whether the user's entire task is complete.
+No model, ToolEnv construction, hidden state or gold access. Schema rejections
+last for the sample; successful reads and no-op writes last for a state epoch.
 """
 from collections import OrderedDict
 from copy import deepcopy
+from difflib import get_close_matches
 import json
 
 
+EXECUTION_POLICY = "automatic-tool-guards-v1"
+AUTOMATIC_GUARD_INSTRUCTIONS = """- Chương trình tự kiểm tên/quyền tool, validate và chống lặp bằng Python; không cần gọi helper để bật các kiểm tra này.
+- Tool + arguments bị validate từ chối bị cấm suốt sample, kể cả sau read/write khác; sửa đề xuất theo lỗi thật.
+- Read đã trả ok:true (có dữ liệu, rỗng hoặc done:false) được giữ lại trong phiên hiện tại.
+  Không gọi lại cùng read + arguments khi chưa có write có thể đổi trạng thái; dùng kết quả/feedback đã có.
+- Write trả done:false ở cấp ngoài cùng cũng không được thử lại nguyên call khi trạng thái chưa đổi.
+  Read/helper không đổi trạng thái. Write thành công làm kết quả read cũ hết hiệu lực.
+- Write thành công có thể được lặp đúng số lần yêu cầu, ví dụ đổi hai voucher; không tự gộp các call cần thiết.
+- Phản hồi chặn và automatic_execution_feedback do chương trình tạo, không phải tool env mới thực thi.
+  Kết quả rỗng không ép đổi entity, hỏi lại hoặc done. Lỗi kỹ thuật không đồng nghĩa bị từ chối schema.
+"""
 _META_KEYS = {"ok", "done", "error", "message", "count", "total", "cursor", "next_cursor"}
 
 
 def _canonical(value):
-    """Preserve JSON scalar types and list order; uncertain inputs fail open."""
     try:
-        return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"),
-                          allow_nan=False)
-    except (TypeError, ValueError):
+        return json.dumps(value, sort_keys=True, ensure_ascii=False, separators=(",", ":"), allow_nan=False)
+    except (TypeError, ValueError, RecursionError):
         return None
 
 
-def verify_result(name, result):
-    """Classify a reported result, never infer goal completion from it.
+def check_tool_access(name, catalog, enabled, local_names=()):
+    """Automatic exact-name access check. Fuzzy results are suggestions only."""
+    if isinstance(name, str) and name in local_names:
+        return {"allowed": True, "status": "allowed_local_helper", "scope": "local"}
+    if isinstance(name, str) and name in enabled:
+        return {"allowed": True, "status": "allowed_env_tool", "scope": "env"}
+    status = ("invalid_tool_name" if not isinstance(name, str) else
+              "tool_not_allowed" if name in catalog else "unknown_tool")
+    exposed = sorted(set(enabled) | set(local_names))
+    suggestions = get_close_matches(name, exposed, n=3, cutoff=0.45) if isinstance(name, str) else []
+    return {"allowed": False, "status": status, "scope": "none", "suggested_tools": suggestions,
+            "instruction": "Tool không tồn tại hoặc không được sample cho phép. Chọn đúng tên trong tool_schemas; "
+                           "gợi ý chỉ để đối chiếu, không tự thay tool hoặc đoán mục tiêu."}
 
-    In particular, an empty search can be a valid answer, and nested `done:false`
-    on a newly-created reminder is its lifecycle state rather than call failure.
-    """
+
+def verify_result(name, result):
+    """Classify the response, never claim the user's entire goal is complete."""
     outcome = {"tool": name, "status": "unknown", "goal_completion": "unknown"}
     if not isinstance(result, dict):
         return {**outcome, "reason": "unrecognized_result_protocol"}
@@ -40,128 +61,140 @@ def verify_result(name, result):
         payload = [value for key, value in result.items() if key not in _META_KEYS]
         if payload and all(isinstance(value, list) and not value for value in payload):
             return {**outcome, "status": "empty", "reason": "empty_result",
-                    "instruction": "Kết quả rỗng có thể hợp lệ. Không lặp nguyên truy vấn khi chưa có dữ kiện mới; "
-                                   "không ép chọn một entity và không tự suy ra phải hỏi lại."}
+                    "instruction": "Kết quả rỗng có thể hợp lệ. Dùng kết quả đã có; không ép chọn entity, hỏi lại hoặc done."}
     return {**outcome, "status": "success", "reason": "reported_success"}
 
 
 class LoopMonitor:
-    """Reject only known non-progressing retries, with bounded per-sample memory.
+    """Automatically gate exact proposals; never execute or rewrite a call.
 
-    Relevant evidence is tracked by app namespace. An executed write may change
-    application state; new, distinct nonempty read evidence can justify a
-    retry in that same app. Helpers and unrelated reads never reset a block.
-    Successful calls are not deduplicated. Failed writes remain advisory because
-    this observer cannot establish transactional rollback or absent side effects.
+    max_entries bounds state-scoped caches. Schema rejections are NEVER evicted:
+    the outer agent's total-step budget bounds their per-sample size. No history
+    read is seeded into this cache. Only actual calls in this ToolEnv authorize
+    reuse. A successful/potentially mutating write invalidates all transient caches
+    conservatively across apps; reads and known no-op writes do not.
     """
-
     def __init__(self, max_entries=100):
         if type(max_entries) is not int or not 1 <= max_entries <= 100:
             raise ValueError("max_entries must be an integer between 1 and 100")
         self.max_entries = max_entries
         self.state_epoch = 0
-        self._serial = 0
-        self._versions = OrderedDict()
-        self._seen_evidence = OrderedDict()
+        self._schema_rejections = {}
         self._records = OrderedDict()
-
-    @staticmethod
-    def _domain(name):
-        return name.split(".", 1)[0]
+        self._technical_errors = {}
 
     def _key(self, name, arguments):
         if not isinstance(name, str) or not isinstance(arguments, dict):
             return None
-        arguments_json = _canonical(arguments)
-        return (name, arguments_json) if arguments_json is not None else None
+        encoded = _canonical(arguments)
+        return (name, encoded) if encoded is not None else None
 
-    def _version(self, name):
-        return self.state_epoch, self._versions.get(self._domain(name), 0)
-
-    def _trim(self, mapping):
-        while len(mapping) > self.max_entries:
-            mapping.popitem(last=False)
-
-    def _new_evidence(self, name, result):
-        encoded = _canonical(result)
-        if encoded is None:
-            return
-        domain = self._domain(name)
-        key = domain, encoded
-        if key in self._seen_evidence:
-            self._seen_evidence.move_to_end(key)
-            return
-        self._seen_evidence[key] = None
-        self._trim(self._seen_evidence)
-        self._serial += 1
-        self._versions[domain] = self._serial
-        self._versions.move_to_end(domain)
-        while len(self._versions) > self.max_entries:
-            retired, _ = self._versions.popitem(last=False)
-            # Evicted evidence must not make an old rejection appear current.
-            for record_key in list(self._records):
-                if self._domain(record_key[0]) == retired:
-                    del self._records[record_key]
-
-    def _remember(self, name, arguments, reason, *, block, detail=None):
-        key = self._key(name, arguments)
-        if key is None:
-            return
-        self._records[key] = {"name": name, "arguments": deepcopy(arguments),
-                              "reason": reason, "block": block,
-                              "version": self._version(name), "detail": deepcopy(detail)}
-        self._records.move_to_end(key)
-        self._trim(self._records)
+    def _advance_state(self):
+        self.state_epoch += 1
+        self._records.clear()
 
     def check(self, name, arguments, kind):
-        """Return a block/advisory for an exact retry, or None.
-
-        A caller must inspect `block`; an advisory is not permission to suppress
-        an otherwise valid call. Nothing here executes or rewrites arguments.
-        """
         if kind == "local":
             return None
         key = self._key(name, arguments)
-        record = self._records.get(key) if key is not None else None
-        if record is None or record["version"] != self._version(name):
+        if key is None:
+            return None
+        if key in self._schema_rejections:
+            return {"block": True, "reason": "repeated_rejected_call", "scope": "sample",
+                    "name": name, "arguments": deepcopy(arguments),
+                    "previous_error": deepcopy(self._schema_rejections[key]),
+                    "instruction": "Đúng tool + arguments này đã bị từ chối schema trong sample. "
+                                   "Read/write/helper không mở lại đề xuất này; sửa đúng arguments theo lỗi đã có."}
+        technical = self._technical_errors.get(key)
+        if technical and technical["count"] >= 2:
+            return {"block": True, "reason": "technical_retry_budget", "scope": "sample_retry_budget",
+                    "name": name, "arguments": deepcopy(arguments), "technical_error": deepcopy(technical),
+                    "instruction": "Đề xuất này đã gặp lỗi kỹ thuật hai lần; không thử lại nguyên call. "
+                                   "Đây không phải kết luận schema hay bằng chứng entity không tồn tại."}
+        record = self._records.get(key)
+        if record is None:
             return None
         self._records.move_to_end(key)
-        return {"block": record["block"], "reason": record["reason"],
-                "name": name, "arguments": deepcopy(arguments),
-                "previous_error": deepcopy(record["detail"]),
-                "instruction": "Call giống hệt đã bị từ chối hoặc chưa tạo tiến triển. "
-                               "Dùng lỗi/kết quả đã có để sửa đúng tham số hoặc kế hoạch; "
-                               "không bắt buộc đổi tên entity hay ép tìm được kết quả."}
+        return {"block": True, "reason": record["reason"], "scope": "current_state",
+                "name": name, "arguments": deepcopy(arguments), "state_epoch": self.state_epoch,
+                "cached_result": deepcopy(record["result"]),
+                "source_call_index": record["call_index"],
+                "previous_error": deepcopy(record["verification"]),
+                "instruction": "Call giống hệt đã có kết quả trong phiên hiện tại và chưa có write có thể đổi trạng thái. "
+                               "Dùng cached_result từ source_call_index; không có env call mới. "
+                               "Không tự đổi entity, hỏi lại hoặc done chỉ vì kết quả rỗng/chưa hoàn tất."}
 
     def record_validation_failure(self, name, arguments, reason):
-        """Remember the full call, not a permanent ban on a parameter/name."""
-        if isinstance(name, str) and name.startswith("local_"):
-            return
-        self._remember(name, arguments, "repeated_rejected_call", block=True, detail=reason)
-
-    def record_result(self, name, arguments, result, kind):
-        outcome = verify_result(name, result)
-        if kind == "local":
-            return outcome
+        """Only an explicit organizer rejection is a permanent schema rejection."""
         key = self._key(name, arguments)
-        if kind not in {"read", "meta"}:
-            # Missing kind metadata cannot prove read-only execution either.
-            # Even an error/unknown outcome does not prove the call rolled back.
-            self.state_epoch += 1
-        if outcome["status"] == "success":
-            if kind == "read":
-                self._new_evidence(name, result)
-            if key is not None:
-                self._records.pop(key, None)
-        elif outcome["status"] in {"empty", "failure"}:
-            self._remember(name, arguments,
-                           "repeated_empty_read" if outcome["status"] == "empty" else "repeated_failed_call",
-                           block=kind == "read", detail=outcome)
+        if key is not None and isinstance(reason, dict) and reason.get("ok") is False:
+            self._schema_rejections.setdefault(key, deepcopy(reason))
+
+    def record_technical_failure(self, name, arguments, error, *, stage):
+        key = self._key(name, arguments)
+        if key is not None:
+            count = self._technical_errors.get(key, {}).get("count", 0) + 1
+            self._technical_errors[key] = {"count": count, "stage": stage, "error": deepcopy(error)}
+
+    def record_result(self, name, arguments, result, kind, *, call_index=None, execution_exception=None):
+        key = self._key(name, arguments)
+        if kind == "local":
+            return verify_result(name, result)
+        may_write = kind not in {"read", "meta"}
+        if execution_exception is not None:
+            if may_write:
+                self._advance_state()
+            self.record_technical_failure(name, arguments, execution_exception, stage="call")
+            return {"tool": name, "status": "unknown", "goal_completion": "unknown",
+                    "reason": "execution_exception", "origin": "agent_exception",
+                    "exception": deepcopy(execution_exception),
+                    "instruction": "Tool call đã được thử nhưng ném exception; không coi đây là lỗi schema hay kết quả nghiệp vụ."}
+        if not isinstance(result, dict) or type(result.get("ok")) is not bool:
+            if may_write:
+                self._advance_state()
+            self.record_technical_failure(name, arguments, result, stage="call_protocol")
+            return {"tool": name, "status": "unknown", "goal_completion": "unknown",
+                    "reason": "unrecognized_result_protocol", "origin": "env.call"}
+        if result["ok"] is False:
+            # Under the organizer contract this can only be a schema rejection.
+            # Actual exception envelopes are handled above, never put here.
+            self.record_validation_failure(name, arguments, result)
+            return {**verify_result(name, result), "origin": "env.call",
+                    "reason": "schema_rejected_at_call", "contract_violation": True}
+        if key is not None:
+            self._technical_errors.pop(key, None)
+        outcome = verify_result(name, result)
+        if may_write and result.get("done") is not False:
+            self._advance_state()
+        elif key is not None and (kind == "read" or (may_write and result.get("done") is False)):
+            reason = ("repeated_empty_read" if outcome["status"] == "empty" else
+                      "repeated_failed_read" if kind == "read" and outcome["status"] == "failure" else
+                      "repeated_successful_read" if kind == "read" else "repeated_no_progress_write")
+            self._records[key] = {"name": name, "arguments": deepcopy(arguments), "reason": reason,
+                                  "result": deepcopy(result), "verification": deepcopy(outcome),
+                                  "call_index": call_index}
+            self._records.move_to_end(key)
+            while len(self._records) > self.max_entries:
+                self._records.popitem(last=False)
         return outcome
 
+    def automatic_feedback(self, kind, verification, call_index):
+        """Same factual post-call feedback for SFT and inference, no model tool."""
+        return {"policy": EXECUTION_POLICY, "managed_by": "python", "state_epoch": self.state_epoch,
+                "source_call_index": call_index, "origin": verification.get("origin", "env.call"),
+                "repeat_policy": ("blocked_for_sample" if verification.get("contract_violation") else
+                                  "technical_retry_budget" if verification["status"] == "unknown" else
+                                  "reuse_read_until_state_change" if kind == "read" else
+                                  "blocked_until_state_change" if verification["status"] == "failure" else
+                                  "allowed"),
+                "instruction": "Các chặn được chương trình quản lý tự động. Read/helper không làm kết quả cũ hết hiệu lực; "
+                               "write thành công có thể đổi trạng thái. Write thành công được phép lặp đúng mục tiêu."}
+
     def pending_warnings(self):
-        """Facts still current enough to surface before done; never veto done."""
-        return [{"name": row["name"], "arguments": deepcopy(row["arguments"]),
-                 "reason": row["reason"], "block": row["block"]}
-                for row in self._records.values()
-                if row["version"] == self._version(row["name"])]
+        warnings = [{"name": key[0], "arguments": json.loads(key[1]),
+                     "reason": "repeated_rejected_call", "block": True}
+                    for key in self._schema_rejections]
+        warnings += [{"name": row["name"], "arguments": deepcopy(row["arguments"]),
+                      "reason": row["reason"], "block": True}
+                     for row in self._records.values() if row["verification"]["status"] != "success"]
+        return warnings
