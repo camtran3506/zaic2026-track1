@@ -1,7 +1,7 @@
 """Specialists-as-tools registry: bounded Python functions, no nested LLM/env."""
 from . import local_checks, local_knowledge, local_time
 
-LOCAL_HELPER_POLICY = "python-specialists-v1"
+LOCAL_HELPER_POLICY = "python-specialists-itn-v2"
 DEFAULT_MAX_LOCAL_CALLS = 8
 _PREFIXES = ("local_time.", "local_context.", "local_entity.", "local_text.",
              "local_checks.", "local_schema.")

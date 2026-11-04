@@ -11,7 +11,7 @@ execution hooks. They require no additional packages or services.
 | `local_time.calendar_reference` | `{}` | Dates derived from the sample's current time/timezone, never the machine clock. |
 | `local_time.departure_time` | Offset-aware `arrival`, integer `travel_minutes`, `early_minutes` | Calculated `departure`. |
 | `local_time.duration_between` | Offset-aware `start`, `end` | Nonnegative whole-minute `minutes`. |
-| `local_text.normalize` | `kind: email/phone`, `text` | Conservative normalized value or ambiguity/unsupported feedback; preserves leading zeroes and does not invent missing digits. |
+| `local_text.normalize` | `kind: email/phone/money`, `text` | Conservative normalized value or ambiguity/unsupported feedback; preserves leading zeroes and does not invent missing digits. |
 | `local_schema.inspect` | `target_tool`, `arguments` | Advisory `valid`, `invalid` or `unsupported` plus errors. Checks the exposed schema; `env.validate` remains authoritative. |
 | `local_checks.evaluate` | `operation: sum/compare/minimum/filter`, corresponding numeric operands | Bounded decimal computation, comparisons or selected records. At most 100 items; verifies supplied operands, not their meaning or source. |
 | Automatic `verify_result` | Actual application result | `success`, `failure`, `empty` or `unknown`. Goal completion stays unknown. |
@@ -49,12 +49,41 @@ call is erased or hidden. Submission remains the unmodified
 `env.get_tool_calls()` and `env.get_state_hash()`. Local calls only appear in model
 observations, diagnostic traces and local counters.
 
+## Automatic ITN before the model
+
+After the shared transcript normalization, `build_step_prompt` adds
+`itn_candidates` for the current request and `itn_history_candidates` with history
+indices for text turns. It preserves the transcript and structured tool evidence.
+Each candidate has `kind`, `value`, exact `source_text` and start/end Unicode
+code-point offsets into that normalized text (end exclusive). Money includes
+`currency: VND`. No automatic candidate is an executed helper/application call.
+The original pre-normalization ASR text is not newly stored by this feature.
+
+Detection uses explicit phone markers (`số điện thoại`, `số máy`, `gọi số`,
+`nhắn tin đến số`), literal or supported spoken email syntax, and Vietnamese
+amounts ending in `đồng`, `VND` or `₫`. Examples: spoken digits become
+`"0912345678"`; `hai triệu rưỡi đồng` becomes integer `2500000` VND;
+`1,5 triệu đồng` becomes `1500000` VND. Vietnamese dotted thousand groups are
+supported. Ambiguous comma grouping, fractional VND, negative amounts, unsupported
+currencies and unclear shorthand remain untouched. This is a limited rule grammar,
+not a complete Vietnamese ITN engine. The planner still interprets negation,
+selects recipients and decides whether a mentioned amount should be used.
+
+The same `normalize_span` implementation serves automatic detection and
+`local_text.normalize`. The model may call it for an unmarked span, including
+`kind: money`; omitted currency returns `currency: null`, never an invented unit.
+Unclear/unsupported input can remain unresolved after a manual call as well.
+A bounded LRU caches detection across prompt steps; returned annotations are copied.
+No extra LLM or runtime dependency is added.
+
 ## Training and inference parity
 
 SFT preparation executes the same helpers with source-derived operands: temporal
 phrases with sufficient anchors, spoken phone/email text, explicit historical
 entity mentions with schema-compatible targets, short anaphoric requests,
-literal sums and known historical bike prices. Schema-repair targets require an
+literal sums and known historical bike prices. Already-annotated normalization
+spans do not produce redundant helper-call targets; fallback phone/money targets
+remain source-derived when automatic detection lacks a clear marker. Schema-repair targets require an
 actual earlier rejected proposal. No helper arguments come from future gold
 actions, and no artificial failed application calls are inserted into gold replay.
 The original gold application call sequence and final state remain intact.
@@ -67,10 +96,12 @@ need a model-generated helper call. Retry/recovery behaviour is supplied through
 hooks and feedback, not claimed as a learned universal critic.
 
 Regenerate SFT in a fresh output directory and retrain an adapter. Prepared data
-requires `prompt_policy=full-context-python-specialists-v7`,
+requires `prompt_policy=full-context-python-specialists-itn-v8`,
 `local_time_policy=local-time-tools-v1` and
-`local_helper_policy=python-specialists-v1`; runtime exports carry both local
-policies. Older adapters are not declared compatible by renaming their manifests.
+`local_helper_policy=python-specialists-itn-v2` and
+`itn_policy=vi-explicit-spans-v1`; runtime exports carry these policies.
+ASR transcript normalization/cache format is unchanged; valid transcript caches
+can be reused because annotations are derived when building the prompt. Older adapters are not declared compatible by renaming their manifests.
 CPU fixtures cover replay, provenance, routing, masking and retry behaviour.
 Held-out Qwen GPU evaluation is needed to establish accuracy gains and latency.
 

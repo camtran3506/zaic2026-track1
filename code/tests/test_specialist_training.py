@@ -11,6 +11,7 @@ from lifemate.runtime import load_runtime_manifest, RUNTIME_MANIFEST
 from lifemate.sft import SFT_PROMPT_POLICY, replay_sample, validate_prompt_policy
 from lifemate.specialist_training import specialist_demonstrations
 from lifemate.text import TEXT_NORMALIZATION
+from lifemate.itn import ITN_POLICY, detect_candidates
 from test_local_time_runtime import temporal_artifact
 
 
@@ -48,14 +49,18 @@ def test_historical_entity_demonstration_keeps_collection_and_original_identity(
 @pytest.mark.parametrize("text,kind,value", [
     ("Soạn nháp gửi team chấm data a còng example chấm test, báo dừng gói.", "email", "team.data@example.test"),
     ("Soạn nháp gửi Team chấm Data a còng example chấm test.", "email", "Team.Data@example.test"),
+    ("Soạn nháp gửi o'connor@example.com.", "email", "o'connor@example.com"),
+    ("Soạn nháp gửi Lan chấm Data@example.com.", "email", "Lan.Data@example.com"),
     ("Gọi số không chín tám bảy không không một một hai hai không.", "phone", "09870011220"),
 ])
 def test_normalizer_demonstrations_copy_only_the_observable_span(text, kind, value):
     helpers = specialist_demonstrations(text, CONTEXT, [], TOOLS, [])
-    call = next(h for h in helpers if h["name"] == "local_text.normalize")
-    assert call["arguments"]["kind"] == kind
-    assert call["arguments"]["text"] in text
-    assert execute_helper(call["name"], call["arguments"], CONTEXT, [], TOOLS)["value"] == value
+    assert "local_text.normalize" not in names(helpers)
+    row = next(row for row in detect_candidates(text) if row["kind"] == kind)
+    assert row["source_text"] in text
+    assert row["value"] == value
+    assert execute_helper("local_text.normalize", {"kind": kind, "text": row["source_text"]}, CONTEXT, [], TOOLS)["value"] == value
+
 
 
 @pytest.mark.parametrize("text", [
@@ -160,7 +165,7 @@ def test_sft_feedback_distinguishes_reported_failure_empty_and_success(result, s
 
 def test_old_specialist_manifest_is_rejected_without_guessing_compatibility():
     manifest = {"prompt_policy": SFT_PROMPT_POLICY, "text_normalization": TEXT_NORMALIZATION,
-                "local_time_policy": LOCAL_TIME_POLICY, "local_helper_policy": LOCAL_HELPER_POLICY}
+                "local_time_policy": LOCAL_TIME_POLICY, "local_helper_policy": LOCAL_HELPER_POLICY, "itn_policy": ITN_POLICY}
     validate_prompt_policy(manifest)
     manifest.pop("local_helper_policy")
     with pytest.raises(ValueError, match="rerun prepare_sft"):
@@ -174,3 +179,22 @@ def test_runtime_manifest_requires_specialist_capability(temporal_artifact):
     (artifact / RUNTIME_MANIFEST).write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match="Python specialist helper policy.*regenerate SFT"):
         load_runtime_manifest(base, tokenizer, artifact)
+
+
+@pytest.mark.parametrize("text,kind,value", [
+    ("Đó là số không chín một hai ba bốn năm sáu bảy tám.", "phone", "0912345678"),
+    ("Chuyển hai triệu rưỡi cho bà Hồng.", "money", 2500000),
+])
+def test_manual_fallback_demonstrations_remain_when_auto_itn_has_no_clear_marker(text, kind, value):
+    assert detect_candidates(text) == []
+    calls = specialist_demonstrations(text, CONTEXT, [], TOOLS, [])
+    call = next(row for row in calls if row["name"] == "local_text.normalize")
+    assert call["arguments"]["kind"] == kind
+    assert call["arguments"]["text"] in text
+    assert execute_helper(call["name"], call["arguments"], CONTEXT, [], TOOLS)["value"] == value
+
+
+@pytest.mark.parametrize("text", ["Chuyển một kênh.", "Trả hai quyển sách."])
+def test_fallback_does_not_treat_generic_counts_as_money(text):
+    calls = specialist_demonstrations(text, CONTEXT, [], TOOLS, [])
+    assert "local_text.normalize" not in names(calls)

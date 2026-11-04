@@ -9,7 +9,7 @@ from decimal import Decimal, localcontext
 import json
 import math
 import re
-import unicodedata
+from .itn import normalize_span
 
 
 _LIMIT = 100
@@ -26,9 +26,10 @@ _COMPARISON = {"type": "string", "enum": ["lt", "le", "eq", "ge", "gt"]}
 _TOOLS = {
     "local_text.normalize": _spec(
         "local_text.normalize",
-        "Chuẩn hóa đúng một email hoặc số điện thoại đọc bằng lời. Không đoán ký tự hay chữ số bị mất; "
-        "trả ambiguous/unsupported khi chưa rõ. Không sửa trực tiếp arguments của tool ứng dụng.",
-        {"kind": {"type": "string", "enum": ["email", "phone"]},
+        "Chuẩn hóa đúng một email, số điện thoại hoặc số tiền đọc bằng lời. Không đoán ký tự hay chữ số bị mất; "
+        "trả ambiguous/unsupported khi chưa rõ. money trả số nguyên, dùng nghìn/triệu/tỷ và định dạng số Việt; "
+        "thiếu đơn vị thì currency=null. Không sửa trực tiếp arguments của tool ứng dụng.",
+        {"kind": {"type": "string", "enum": ["email", "phone", "money"]},
          "text": {"type": "string", "minLength": 1, "maxLength": 1024}}, ["kind", "text"]),
     "local_checks.evaluate": _spec(
         "local_checks.evaluate",
@@ -258,51 +259,6 @@ def _arguments(name, args):
         raise ValueError(f"Invalid helper arguments: {errors or unsupported}")
 
 
-_DIGITS = {"không": "0", "một": "1", "hai": "2", "ba": "3", "bốn": "4",
-           "năm": "5", "sáu": "6", "bảy": "7", "tám": "8", "chín": "9"}
-_EMAIL = re.compile(r"[A-Za-z0-9.!#$%&'*+/=?^_{}|~\-]+@[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?(?:\.[A-Za-z0-9](?:[A-Za-z0-9\-]*[A-Za-z0-9])?)+")
-
-
-def _supported_email(value):
-    if not _EMAIL.fullmatch(value) or len(value) > 254:
-        return False
-    local, domain = value.rsplit("@", 1)
-    return (len(local) <= 64 and not local.startswith(".") and not local.endswith(".")
-            and ".." not in local and all(len(label) <= 63 for label in domain.split(".")))
-
-
-def _normalize(kind, text):
-    original = text
-    text = unicodedata.normalize("NFC", text).strip()
-    if kind == "email":
-        if _supported_email(text):
-            return {"status": "matched", "value": text, "evidence": {"input": original}}
-        if len(re.findall(r"@|a\s+còng", text, re.I)) > 1:
-            return {"status": "ambiguous", "candidates": [], "evidence": {"input": original}}
-        converted = re.sub(r"\ba\s+còng\b", "@", text, flags=re.I)
-        converted = re.sub(r"\bchấm\b", ".", converted, flags=re.I)
-        converted = re.sub(r"\bgạch\s+dưới\b", "_", converted, flags=re.I)
-        converted = re.sub(r"\bgạch\s+ngang\b", "-", converted, flags=re.I)
-        converted = re.sub(r"\s*([@._\-])\s*", r"\1", converted)
-        # Spaces elsewhere remain: never silently turn a full sentence into an email.
-        if _supported_email(converted):
-            return {"status": "matched", "value": converted, "evidence": {"input": original}}
-        return {"status": "unsupported", "evidence": {"input": original},
-                "reason": "Input is not one unambiguous supported email expression."}
-    if re.search(r"\b(?:hoặc|hay)\b|[/;]", text, re.I):
-        return {"status": "ambiguous", "candidates": [], "evidence": {"input": original}}
-    literal = re.sub(r"[\s().,\-]", "", text)
-    if re.fullmatch(r"\+?\d{7,15}", literal):
-        return {"status": "matched", "value": literal, "evidence": {"input": original}}
-    words = re.sub(r"[,.\-()]", " ", text.lower()).split()
-    if words and all(word in _DIGITS or word.isascii() and word.isdigit() for word in words):
-        digits = "".join(_DIGITS.get(word, word) for word in words)
-        if re.fullmatch(r"\d{7,15}", digits):
-            return {"status": "matched", "value": digits, "evidence": {"input": original}}
-    return {"status": "unsupported", "evidence": {"input": original},
-            "reason": "Input contains unsupported words or an incomplete phone number; no digits were guessed."}
-
-
 def _decimal(value):
     if type(value) not in (int, float) or (type(value) is float and not math.isfinite(value)):
         raise ValueError("Expected a finite JSON number, not a string or boolean.")
@@ -356,7 +312,7 @@ def _evaluate(args):
 def execute(name, args, env_tools):
     _arguments(name, args)
     if name == "local_text.normalize":
-        return _normalize(args["kind"], args["text"])
+        return normalize_span(args["kind"], args["text"])
     if name == "local_schema.inspect":
         return inspect_call(args["target_tool"], args["arguments"], env_tools)
     return _evaluate(args)

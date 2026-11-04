@@ -12,6 +12,7 @@ from .function_calling import JSON_PROTOCOL, NATIVE_PROTOCOL
 from .local_time import LOCAL_TIME_POLICY
 from .local_helpers import LOCAL_HELPER_POLICY
 from .text import TEXT_NORMALIZATION
+from .itn import ITN_POLICY
 
 DEFAULT_LLM_DTYPE = "bfloat16"
 DEFAULT_SEED = 42
@@ -120,6 +121,7 @@ def select_tokenizer_path(model_path, adapter_path=None):
 def make_runtime_manifest(model_path, tokenizer, seed=DEFAULT_SEED, policy=None):
     return {"version": 1, "inference_dtype": DEFAULT_LLM_DTYPE,
             "text_normalization": TEXT_NORMALIZATION,
+            "itn_policy": ITN_POLICY,
             "local_time_policy": LOCAL_TIME_POLICY,
             "local_helper_policy": LOCAL_HELPER_POLICY,
             "model_fingerprint": model_fingerprint(model_path),
@@ -165,6 +167,8 @@ def load_runtime_manifest(model_path, tokenizer, artifact_path=None):
         raise ValueError("Local time tool policy differs from training/export; regenerate SFT and retrain the adapter")
     if manifest.get("local_helper_policy") != LOCAL_HELPER_POLICY:
         raise ValueError("Python specialist helper policy differs from training/export; regenerate SFT and retrain the adapter")
+    if manifest.get("itn_policy") != ITN_POLICY:
+        raise ValueError("ITN policy differs from training/export; regenerate SFT and retrain the adapter")
     expected_protocol = NATIVE_PROTOCOL if getattr(tokenizer, "lifemate_native_fc", False) is True else JSON_PROTOCOL
     if manifest["output_protocol"] != expected_protocol:
         raise ValueError("Output protocol differs from the LifeMate agent; regenerate SFT and retrain the adapter")

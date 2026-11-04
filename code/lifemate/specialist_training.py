@@ -10,9 +10,10 @@ import unicodedata
 
 from .local_helpers import DEFAULT_MAX_LOCAL_CALLS, execute_helper
 from .local_knowledge import knowledge_records
+from .itn import detect_candidates, fallback_money_requests
 
 
-SPECIALIST_TRAINING_POLICY = "observable-python-specialists-v1"
+SPECIALIST_TRAINING_POLICY = "observable-python-specialists-itn-v2"
 MAX_TRAINING_HELPERS = DEFAULT_MAX_LOCAL_CALLS
 _ANAPHORA = re.compile(r"^(?:ừ|ờ|rồi|thế|đúng rồi)|\b(?:lúc nãy|hồi nãy|vừa rồi|cái đó|người đó|bác ấy|quán đó)\b")
 _EMAIL = re.compile(
@@ -81,10 +82,22 @@ def specialist_demonstrations(transcript, context, history, enabled, observation
     """
     text = transcript.casefold()
     candidates = []
+    automatic = detect_candidates(transcript)
+
+    def covered(kind, span):
+        start, end = span
+        return any(row["kind"] == kind and row["start"] <= start and row["end"] >= end
+                   for row in automatic)
+
     for match in _EMAIL.finditer(transcript):
+        if covered("email", match.span()):
+            continue
         candidates.append({"name": "local_text.normalize", "arguments": {"kind": "email", "text": match.group()}})
     for match in _PHONE.finditer(transcript):
+        if covered("phone", match.span("phone")):
+            continue
         candidates.append({"name": "local_text.normalize", "arguments": {"kind": "phone", "text": match["phone"]}})
+    candidates.extend(fallback_money_requests(transcript))
     candidates.extend(_known_entity_targets(text, context, history, enabled))
     if history and len(text) <= 160 and _ANAPHORA.search(text):
         candidates.append({"name": "local_context.lookup", "arguments": {"query": transcript, "max_results": 3}})

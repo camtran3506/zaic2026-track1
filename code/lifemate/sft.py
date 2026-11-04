@@ -17,9 +17,10 @@ from .execution_policy import verify_result
 from .specialist_training import specialist_demonstrations
 from .temporal_training import helper_demonstrations
 from .text import TEXT_NORMALIZATION, normalize_transcript
+from .itn import ITN_POLICY
 
 
-SFT_PROMPT_POLICY = "full-context-python-specialists-v7"
+SFT_PROMPT_POLICY = "full-context-python-specialists-itn-v8"
 VALIDATION_ROLLOUT_POLICY = "asr-only-paired-clean-v1"
 DEFAULT_ASR_TRANSCRIPT_RATIO = 0.5
 
@@ -49,7 +50,8 @@ def validate_prompt_policy(manifest):
     if (manifest.get("prompt_policy") != SFT_PROMPT_POLICY
             or manifest.get("text_normalization") != TEXT_NORMALIZATION
             or manifest.get("local_time_policy") != LOCAL_TIME_POLICY
-            or manifest.get("local_helper_policy") != LOCAL_HELPER_POLICY):
+            or manifest.get("local_helper_policy") != LOCAL_HELPER_POLICY
+            or manifest.get("itn_policy") != ITN_POLICY):
         raise ValueError("Prepared SFT data uses an older prompt/text-normalization/evaluation policy; "
                          "rerun prepare_sft.py in a new output directory")
 

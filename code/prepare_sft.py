@@ -12,6 +12,7 @@ from lifemate.sft import (DEFAULT_ASR_TRANSCRIPT_RATIO, SFT_PROMPT_POLICY, VALID
                          prepare_train_transcript, prepare_validation_transcripts, replay_sample, split_records)
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
 from lifemate.text import TEXT_NORMALIZATION
+from lifemate.itn import ITN_POLICY
 from lifemate.local_time import LOCAL_TIME_POLICY
 from lifemate.local_helpers import LOCAL_HELPER_POLICY, helper_tool_schemas
 from lifemate.specialist_training import SPECIALIST_TRAINING_POLICY
@@ -64,6 +65,7 @@ def main():
                     catalog_sha256=file_sha256(catalog_path), seed=args.seed,
                     prompt_policy=SFT_PROMPT_POLICY, missing_tool_policy=args.missing_tool_policy,
                     text_normalization=TEXT_NORMALIZATION,
+                    itn_policy=ITN_POLICY,
                     local_time_policy=LOCAL_TIME_POLICY,
                     local_helper_policy=LOCAL_HELPER_POLICY,
                     specialist_training_policy=SPECIALIST_TRAINING_POLICY,

@@ -93,7 +93,7 @@ Other model families keep the portable JSON-decision protocol. Runtime manifests
 record `qwen35-native-fc-v1` for Qwen3.5; an old Qwen3.5 JSON-protocol adapter is
 rejected instead of silently mixing protocols. Regenerate SFT in a fresh directory
 and retrain that adapter. The current preparation policy is
-`full-context-python-specialists-v7`. Production never replaces the checkpoint template;
+`full-context-python-specialists-itn-v8`. Production never replaces the checkpoint template;
 tests use a pinned upstream Qwen3.5 template fixture without downloading weights.
 
 ## Internal date and time tools
@@ -144,14 +144,22 @@ coverage for the chosen clean/ASR mixture. Helper demonstrations are conditional
 so adding schemas does not guarantee that every input supplies all three targets.
 
 Regenerate prepared SFT in a fresh directory: the manifest must record
-`prompt_policy=full-context-python-specialists-v7` and
+`prompt_policy=full-context-python-specialists-itn-v8` and
 `local_time_policy=local-time-tools-v1` and
-`local_helper_policy=python-specialists-v1`. Existing runtime artifacts must carry
+`local_helper_policy=python-specialists-itn-v2` and
+`itn_policy=vi-explicit-spans-v1`. Existing runtime artifacts must carry
 these same local policies; adding tool schemas alone does not establish that an old
 adapter learned to use them. Unit and fixture tests cover these paths; real
 Qwen3.5 GPU training/inference and accuracy improvements still require validation.
 
 ## Python specialist helpers
+
+Before each model request, shared SFT/inference preprocessing supplies rule-based
+ITN candidates for explicit phone/email/VND expressions, including text history.
+The normalized transcript stays intact; annotations retain exact source spans.
+The model can use them without a helper turn, or call `local_text.normalize`
+(`email`, `phone`, `money`) for an unmarked span. Detection is cached across steps.
+Rebuild prepared SFT and retrain for the new policy; valid ASR caches can be reused.
 
 The same Qwen model remains the planner. All specialists are bounded standard-library
 Python functions; no additional model, framework package or remote API is required.
@@ -163,7 +171,7 @@ links to the framework source code that informed this design.
 | Context/history retrieval | `local_context.lookup` |
 | Entity resolution with provenance | `local_entity.resolve` |
 | Calendar and time arithmetic | The three `local_time.*` tools above |
-| Spoken email/phone normalization | `local_text.normalize` |
+| Spoken email/phone/money normalization | `local_text.normalize` |
 | Advisory tool/schema routing | `local_schema.inspect` and exposed-catalog checks |
 | Numeric conditions and result verification | `local_checks.evaluate` and automatic `verify_result` |
 | Retry/recovery feedback | Automatic `LoopMonitor` before/after application calls |
@@ -178,7 +186,7 @@ SFT adds conservative demonstrations from visible inputs and prior actual result
 with the same local execution and assistant-only loss path used at inference.
 Schema-repair demonstrations require a prior rejected proposal; result verification
 and retry monitoring also run automatically. Rebuild prepared SFT and retrain an
-adapter for policy `full-context-python-specialists-v7`. Manifests with a different
+adapter for policy `full-context-python-specialists-itn-v8`. Manifests with a different
 helper policy are rejected; legacy adapters without a manifest emit an explicit
 warning and have no verified helper training. Accuracy and added
 LLM-turn latency must be measured on held-out Qwen GPU evaluation.
@@ -359,7 +367,7 @@ including tool-only turns. Tool results are not clipped. The on-disk transcript
 cache retains this same full history, so compatible caches can be reused.
 Regenerate older SFT datasets in a new output directory: shortened data cannot
 be recovered by the trainer. Training and rollout evaluation reject manifests
-without the current `prompt_policy: full-context-python-specialists-v7` marker.
+without the current `prompt_policy: full-context-python-specialists-itn-v8` marker.
 `--use-train-transcript` still requires `split=train`; test request audio is always
 transcribed rather than read from a possible `audio_text` field.
 

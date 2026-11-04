@@ -15,6 +15,7 @@ from .local_helpers import (DEFAULT_MAX_LOCAL_CALLS, execute_helper,
 from .local_checks import inspect_call
 from .execution_policy import LoopMonitor
 from .text import normalize_transcript
+from .itn import ITN_POLICY, detect_candidates
 
 SYSTEM_PROMPT = """Bạn là AI Agent LifeMate. Chỉ xuất ĐÚNG MỘT JSON object, KHÔNG markdown hoặc diễn giải.
 Bạn có transcript yêu cầu nói tiếng Việt, context, history, các tool được cài và kết quả các calls trước.
@@ -39,8 +40,12 @@ QUY TẮC BẮT BUỘC:
   Các helper thời gian không đổi trạng thái ứng dụng, không cung cấp ID x-ref, không tự hoàn tất tác vụ.
 - local_context.lookup và local_entity.resolve chỉ tra context/history đã có; dùng nguồn
   được trả về để đối chiếu đúng collection. Không tìm thấy không chứng minh entity không tồn tại.
-- local_text.normalize chuẩn hóa email/số điện thoại; local_checks.evaluate tính/so sánh
+- local_text.normalize chuẩn hóa email/số điện thoại/số tiền; local_checks.evaluate tính/so sánh
   các toán hạng đã biết. local_schema.inspect chỉ góp ý schema, không thay thế ToolEnv.
+- itn_candidates và itn_history_candidates là các giá trị Python đã chuẩn hóa, kèm đoạn nguồn và vị trí.
+  Dùng ngay khi phù hợp, không gọi lại helper cho cùng chuyển đổi đã có. Transcript vẫn quyết định
+  ý định/phủ định và chọn người nhận; ITN không cấp phép thực thi. Với đoạn chưa được ITN xử lý,
+  có thể gọi local_text.normalize theo kind email/phone/money; không tự đoán phần còn thiếu.
 - Helper ambiguous/unsupported không cho phép tự bịa giá trị hoặc mặc định done.
   Khi kết quả tool thất bại/rỗng, xem phản hồi, sửa kế hoạch; không lặp nguyên call vô ích.
 - Đừng thay đổi trạng thái ngoài mục tiêu của người dùng; đừng gọi read tools lặp vô ích.
@@ -135,10 +140,18 @@ class AgentConfig:
 def build_step_prompt(transcript, context, history, enabled, observations):
     """Use the same complete catalog, history and observations in SFT/inference."""
     tools = prompt_catalog(with_local_tools(enabled))
+    transcript = normalize_transcript(transcript)
+    history = prompt_history(history)
     info = {
-        "request_transcript": normalize_transcript(transcript),
+        "request_transcript": transcript,
+        "itn_policy": ITN_POLICY,
+        "itn_candidates": detect_candidates(transcript),
+        "itn_history_candidates": [
+            {"history_index": i, "candidates": candidates}
+            for i, turn in enumerate(history)
+            if (candidates := detect_candidates(turn["text"]))],
         "user_context": {k: v for k, v in context.items() if k != "installed_apps"},
-        "conversation_history": prompt_history(history),
+        "conversation_history": history,
         "available_tools": tools,
         "previous_actions_and_results": observations,
     }
