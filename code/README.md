@@ -486,6 +486,32 @@ validation still happen in the agent; this is not constrained decoding.
 `--max-new-tokens` remains a safety limit for incomplete/invalid output. No model
 weights, precision, prompt or tool-call limits are changed by early stopping.
 
+Stopping callbacks first inspect only newly appended token IDs. A cached,
+per-tokenizer vocabulary table marks every piece that can contain ASCII `}` or
+`>`; all other pieces can skip decoding and parsing. This does not assume that
+`</tool_call>` has a single encoding or fits a fixed token-tail window. A candidate
+token triggers a full decode of the generated output and the structural parser;
+the filter itself never declares completion. Closers in quoted JSON, nested
+objects or a parameter value do not bypass that parser. Native matching is
+anchored at the first visible `<tool_call>` so an incomplete outer call cannot be
+skipped in favor of an inner literal call. JSON fallback output (including JSON
+code fences) is not searched for executable native markup inside argument strings.
+Native wire delimiters retain their
+existing meaning; this optimization adds no new escaping or serialization rules.
+
+The filter is enabled only for standard Hugging Face fast BPE/WordLevel decoders
+using ByteLevel or the default space-join path, with cleanup disabled. Unknown or
+custom decoders fall back to checking the complete output on every callback.
+The table is shared through weak tokenizer references and rebuilt for vocabulary
+size/decoder changes between generations. Tokenizers stay immutable during one
+greedy generation. Repeated/rewound sequence lengths get a full check; callbacks
+that see multiple new tokens inspect all of them. Only generated IDs are inspected,
+and `max_new_tokens`/EOS still bound incomplete output. Both stopping classes
+accept `fast_check=False` for differential checks; `full_decodes` and
+`skipped_checks` expose CPU-work counters. Tests compare the first stopping step
+and returned output against full checks across byte/BPE splits, merged markers,
+literal/inner markers, Unicode, malformed output and real tiny Qwen3.5 generation.
+
 ### Train evaluation (ASR ablation, NO test labels used)
 
 ```bash

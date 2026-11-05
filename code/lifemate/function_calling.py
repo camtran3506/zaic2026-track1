@@ -157,8 +157,29 @@ _PARAMETER = re.compile(r"<parameter=([^>\n]+)>(.*?)</parameter>\s*(?=<parameter
 
 
 def complete_native_call(text):
-    match = _CALL.search(visible_output(text))
+    match = _first_native_match(visible_output(text))
     return match.group(0) if match else None
+
+
+def _first_native_match(visible):
+    # JSON fallback responses can contain literal native markup in arguments.
+    # Never execute that markup as a standalone native call. parse_decision
+    # handles the complete JSON response itself after generation finishes.
+    head = visible.lstrip('\ufeff \t\r\n')
+    if head.startswith('```'):
+        head = head.partition('\n')[2].lstrip()
+    if head.startswith(('{', '[', '"')):
+        try:
+            _, end = json.JSONDecoder().raw_decode(head)
+        except ValueError:
+            return None
+        inner = head.find('<tool_call>')
+        if 0 <= inner < end:
+            return None
+    # Do not skip an incomplete outer call to match a literal inner call in a
+    # parameter value. With one-call-per-decision, only the first opener counts.
+    start = visible.find('<tool_call>')
+    return _CALL.match(visible, start) if start >= 0 else None
 
 
 def _parameter_value(text, schema):
@@ -188,7 +209,7 @@ def _parameter_value(text, schema):
 
 def parse_native_call(text, catalog):
     visible = visible_output(text)
-    match = _CALL.search(visible)
+    match = _first_native_match(visible)
     if not match or visible[match.end():].strip().removesuffix("<|im_end|>").strip():
         raise ValueError("Expected exactly one complete native tool call with no suffix")
     name, body = match.group(1), match.group(2)
