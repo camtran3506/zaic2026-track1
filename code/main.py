@@ -42,9 +42,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--refresh-transcripts", action="store_true", help="Replace completed ASR cache; resume matching partial work")
     p.add_argument("--asr-model", type=Path, help="Local GIPformer ONNX directory; not required for --stage llm")
     p.add_argument("--llm-model", type=Path, help="Local HF Transformers LLM directory; not required for --stage asr")
-    p.add_argument("--llm-device-map", choices=["single", "balanced"], default="single")
-    p.add_argument("--llm-max-memory-gib", type=float, default=6,
-                   help="Weight budget per GPU for balanced sharding (reserve activation/KV memory)")
+    p.add_argument("--llm-device-map", choices=["single"], default="single",
+                   help="Place the whole LLM on the selected device; insufficient VRAM raises OOM")
     p.add_argument("--llm-adapter", type=Path, default=None, help="Optional local fine-tuned LoRA adapter")
     p.add_argument("--prefix-cache", choices=["auto", "off"], default="auto",
                    help="Reuse an exact native-chat prefix per sample on verified runtimes; off for A/B checks")
@@ -137,6 +136,7 @@ def run_asr_stage(args, items, split_dir, identity):
 
 
 def run_llm_stage(args, items, transcript_rows, split_dir, env_root):
+    import torch
     # Import only the zaic_tools version shipped with this exact split.
     sys.path.insert(0, str(split_dir))
     from zaic_tools import ToolEnv
@@ -147,7 +147,7 @@ def run_llm_stage(args, items, transcript_rows, split_dir, env_root):
     llm = LocalLLM(args.llm_model, device=args.device, dtype=args.llm_dtype,
                    max_input_tokens=args.max_input_tokens, max_new_tokens=args.max_new_tokens,
                    adapter_path=args.llm_adapter, device_map=args.llm_device_map,
-                   max_memory_gib=args.llm_max_memory_gib, seed=args.seed,
+                   seed=args.seed,
                    prefix_cache=args.prefix_cache, prompt_cache=args.prompt_cache)
     cfg = AgentConfig(max_calls=args.max_calls, max_invalid=args.max_invalid,
                       sample_seconds=args.sample_seconds,
@@ -169,6 +169,9 @@ def run_llm_stage(args, items, transcript_rows, split_dir, env_root):
                 env = ToolEnv(args.split, item["id"], root=str(env_root))
                 try:
                     report = agent.run(item, env, split_dir, args.split, prepared_transcript=prepared)
+                except torch.OutOfMemoryError:
+                    LOG.exception('LLM out of memory on sample %s; aborting without CPU/disk fallback', item['id'])
+                    raise
                 except Exception as exc:
                     LOG.exception("Sample %s encountered an error", item["id"])
                     report = {"error": repr(exc), "transcript": prepared["transcript"]}

@@ -63,6 +63,28 @@ runpy.run_path('train_lora.py', run_name='__main__')
     assert 'GPU selected before Unsloth' in result.stdout
 
 
+def test_unsloth_receives_explicit_gpu_map_and_does_not_retry_oom(tmp_path, monkeypatch):
+    from types import SimpleNamespace
+    from unittest.mock import Mock
+    import torch
+    import train_lora
+    base = tmp_path/'base'; base.mkdir()
+    oom = torch.cuda.OutOfMemoryError('simulated training VRAM exhaustion')
+    loader = Mock(side_effect=oom)
+    fast = SimpleNamespace(from_pretrained=loader)
+    monkeypatch.setitem(sys.modules, 'unsloth', SimpleNamespace(FastLanguageModel=fast, FastVisionModel=fast))
+    monkeypatch.setattr(torch.cuda, 'is_available', lambda: True)
+    monkeypatch.setattr(train_lora, 'training_dtype', lambda torch: torch.float32)
+    monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '2')
+    monkeypatch.setattr(sys, 'argv', ['train_lora.py', '--base-model', str(base), '--sft-dir', str(tmp_path/'sft'),
+        '--output-dir', str(tmp_path/'training'), '--backend', 'unsloth'])
+    with pytest.raises(torch.cuda.OutOfMemoryError) as error:
+        train_lora.main()
+    assert error.value is oom and loader.call_count == 1
+    assert loader.call_args.kwargs['device_map'] == {'': 0}  # Physical GPU 2 is local 0.
+    assert loader.call_args.kwargs['fast_inference'] is False
+
+
 @pytest.mark.parametrize('pipeline', ['inference', 'finetune'])
 def test_child_processes_inherit_single_gpu(monkeypatch, tmp_path, pipeline):
     import main

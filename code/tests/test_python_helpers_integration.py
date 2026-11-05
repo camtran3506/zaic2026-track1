@@ -200,7 +200,8 @@ def test_registry_rejects_malformed_inputs(name, arguments, context, history, to
         execute_helper(name, arguments, context, history, tools)
 
 
-def test_llm_submission_uses_only_env_calls_and_env_hash(tmp_path, monkeypatch):
+@pytest.mark.parametrize('oom', [False, True])
+def test_llm_submission_uses_only_env_calls_and_env_hash(tmp_path, monkeypatch, oom):
     import main
 
     planner = Planner([call("local_checks.evaluate", operation="sum", values=[2, 3]),
@@ -226,9 +227,21 @@ def test_llm_submission_uses_only_env_calls_and_env_hash(tmp_path, monkeypatch):
     args = SimpleNamespace(
         split="public_test", seed=42, llm_model=tmp_path / "unused", device="cpu", llm_dtype="float32",
         max_input_tokens=65536, max_new_tokens=512, llm_adapter=None, llm_device_map="single",
-        llm_max_memory_gib=6, prefix_cache="auto", prompt_cache="auto", max_calls=8, max_invalid=3, sample_seconds=float("inf"),
+        prefix_cache="auto", prompt_cache="auto", max_calls=8, max_invalid=3, sample_seconds=float("inf"),
         use_train_transcript=False, output=tmp_path / "submission.jsonl", log_path=tmp_path / "log.jsonl",
         fail_fast=True)
+    if oom:
+        import torch
+        error = torch.cuda.OutOfMemoryError('simulated generation OOM')
+        def fail(*args):
+            raise error
+        monkeypatch.setattr(planner, 'generate', fail)
+        args.fail_fast = False  # OOM must still abort, rather than submitting an empty answer.
+        with pytest.raises(torch.cuda.OutOfMemoryError) as raised:
+            main.run_llm_stage(args, [sample(), sample()], [prepared(), prepared()], tmp_path, tmp_path)
+        assert raised.value is error and len(envs) == 1
+        assert args.output.read_text() == ''
+        return
     main.run_llm_stage(args, [sample()], [prepared()], tmp_path, tmp_path)
     row = json.loads(args.output.read_text())
     assert len(envs) == 1

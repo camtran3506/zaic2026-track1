@@ -94,6 +94,47 @@ def test_inference_rejects_wrong_model_before_loading_weights(artifact, monkeypa
         LocalLLM(base, adapter_path=adapter, device='cpu')
 
 
+@pytest.mark.parametrize('device,placement', [('cuda', {'': 0}), ('cuda:2', {'': 2}), ('cpu', {'': 'cpu'})])
+def test_base_and_adapter_load_on_the_same_explicit_device(artifact, monkeypatch, device, placement):
+    from unittest.mock import Mock
+    import torch
+    import peft
+    import lifemate.models as module
+    base, adapter, _, _ = artifact
+    (adapter/'adapter_config.json').write_text('{}')
+    model = Mock()
+    model.get_input_embeddings.return_value.weight.device = torch.device('cpu')
+    loader = Mock(return_value=model)
+    adapter_loader = Mock(return_value=model)
+    monkeypatch.setattr(module, 'model_loader', lambda path: SimpleNamespace(from_pretrained=loader))
+    monkeypatch.setattr(peft.PeftModel, 'from_pretrained', adapter_loader)
+    module.LocalLLM(base, adapter_path=adapter, device=device)
+    assert loader.call_args.kwargs['device_map'] == placement
+    assert adapter_loader.call_args.kwargs['device_map'] == placement
+    assert 'max_memory' not in loader.call_args.kwargs
+    model.to.assert_not_called()  # Placement already happened in the loaders.
+
+
+@pytest.mark.parametrize('stage', ['base', 'adapter'])
+def test_inference_oom_propagates_without_cpu_retry(artifact, monkeypatch, stage):
+    from unittest.mock import Mock
+    import torch
+    import peft
+    import lifemate.models as module
+    base, adapter, _, _ = artifact
+    (adapter/'adapter_config.json').write_text('{}')
+    oom = torch.cuda.OutOfMemoryError('simulated VRAM exhaustion')
+    loader = Mock(side_effect=oom) if stage == 'base' else Mock(return_value=Mock())
+    adapter_loader = Mock(side_effect=oom)
+    monkeypatch.setattr(module, 'model_loader', lambda path: SimpleNamespace(from_pretrained=loader))
+    monkeypatch.setattr(peft.PeftModel, 'from_pretrained', adapter_loader)
+    with pytest.raises(torch.cuda.OutOfMemoryError) as error:
+        module.LocalLLM(base, adapter_path=adapter, device='cuda')
+    assert error.value is oom
+    assert loader.call_count == 1 and loader.call_args.kwargs['device_map'] == {'': 0}
+    assert adapter_loader.call_count == (stage == 'adapter')
+
+
 def test_missing_adapter_tokenizer_never_falls_back_to_base(artifact):
     base, adapter, _, _ = artifact
     (adapter / 'tokenizer_config.json').unlink()

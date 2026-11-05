@@ -209,27 +209,8 @@ def test_llm_stage_rejects_whisper_cache_before_loading_llm(dataset, tmp_path, m
         main.main()
 
 
-def test_balanced_llm_routes_input_without_moving_entire_model(tmp_path, monkeypatch):
-    from types import SimpleNamespace
-    from unittest.mock import Mock
-    import torch
-    from transformers import AutoModelForCausalLM, AutoTokenizer
+@pytest.mark.parametrize('device_map', ['auto', 'balanced', 'sequential'])
+def test_automatic_llm_placement_is_rejected_before_loading(tmp_path, device_map):
     from lifemate.models import LocalLLM
-    model = Mock()
-    model.hf_device_map = {'model.embed_tokens': 0, 'model.layers.0': 0, 'model.layers.1': 1, 'lm_head': 1}
-    model.get_input_embeddings.return_value = SimpleNamespace(weight=SimpleNamespace(device=torch.device('cpu')))
-    model.to.side_effect = AssertionError('Do not move a sharded model wholesale')
-    loader = Mock(return_value=model)
-    monkeypatch.setattr(AutoModelForCausalLM, 'from_pretrained', loader)
-    monkeypatch.setattr(AutoTokenizer, 'from_pretrained', Mock())
-    monkeypatch.setattr(torch.cuda, 'device_count', lambda: 2)
-    monkeypatch.setattr(torch.cuda, 'mem_get_info', lambda index: (14*1024**3, 15*1024**3))
-    monkeypatch.setattr(torch.cuda, 'get_device_name', lambda index: 'simulated T4')
-    llm = LocalLLM(tmp_path, device_map='balanced', dtype='float16')
-    assert loader.call_args.kwargs['device_map'] == 'balanced'
-    assert loader.call_args.kwargs['max_memory'] == {0: 6*1024**3, 1: 6*1024**3}
-    assert llm.device == torch.device('cpu')  # mocked embedding placement used for input routing
-    model.to.assert_not_called()
-    model.hf_device_map = {'': 0}
-    with pytest.raises(RuntimeError, match='multiple GPUs'):
-        LocalLLM(tmp_path, device_map='balanced')
+    with pytest.raises(ValueError, match='explicit single-device'):
+        LocalLLM(tmp_path, device_map=device_map)

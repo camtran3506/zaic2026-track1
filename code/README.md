@@ -448,8 +448,15 @@ python finetune.py --cuda-visible-devices 2 \
 The chosen physical GPU is remapped to local CUDA device 0 in each process. Do
 not change model placement to `cuda:2` after selecting GPU 2. Selection does not
 reserve the GPU; choose one with sufficient free VRAM. `--llm-device-map single`
-is the inference default. The legacy `balanced` option is limited to the one
-selected GPU through these entrypoints. ASR exits before the LLM loads.
+is the inference default and the only supported placement mode. Training loaders
+(Unsloth and Transformers) and inference base/adapter loaders receive an explicit
+whole-model map `{"": 0}` for CUDA, never `auto`/`balanced`. Insufficient VRAM
+raises OOM and stops the process; no CPU/disk placement retry is attempted. An
+OOM during inference generation also stops the run, even without `--fail-fast`.
+The old `balanced` mode and `--llm-max-memory-gib` option have been removed.
+Explicit CPU inference/test training and CPU adapter merging remain supported.
+This policy concerns model placement, not Unsloth's activation checkpointing.
+ASR exits before the LLM loads.
 The Kaggle notebook retains its `GPU_INDEX` setting and passes that selection
 through the environment to all subprocesses.
 
@@ -569,8 +576,7 @@ By default `docker run ... lifemate:baseline` targets **private_test** at `/data
 | `--max-calls` | maximum executed tools/sample | 8 |
 | `--max-invalid` | maximum invalid model plans | 3 |
 | `--sample-seconds` | optional LLM cooperative budget; inf disables it | inf |
-| `--llm-device-map` | single / balanced across visible GPUs | single |
-| `--llm-max-memory-gib` | weight budget per GPU for balanced | 6 |
+| `--llm-device-map` | whole LLM on the selected device; no automatic offload | single |
 | `--log-path` | diagnostics, separate from submission | output stem + .diagnostics.jsonl |
 | `--limit` | debug: process only first N | 0 (all) |
 

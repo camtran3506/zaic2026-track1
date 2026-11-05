@@ -29,7 +29,7 @@ def main():
         torch_dtype=getattr(torch, args.dtype), device_map="cpu", local_files_only=True,
         trust_remote_code=False, low_cpu_mem_usage=True)
     model = PeftModel.from_pretrained(model, str(args.adapter), local_files_only=True,
-                                     autocast_adapter_dtype=False)
+                                     autocast_adapter_dtype=False, device_map={'': 'cpu'})
     model = model.merge_and_unload(safe_merge=True)
     model.save_pretrained(str(args.output_dir), safe_serialization=True, max_shard_size="4GB")
     tokenizer.save_pretrained(str(args.output_dir))

@@ -6,6 +6,7 @@ from pathlib import Path
 
 from .context import DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_NEW_TOKENS, validate_inference_budget
 from .asr import LocalASR
+from .gpu import model_device_map
 from .llm import model_loader, configure_tokenizer, render_prompt
 from .prefix_cache import PrefixCache, stable_prefix_ids
 from .prompt_session import PreparedPrompt
@@ -17,9 +18,11 @@ class LocalLLM:
     def __init__(self, model_path: Path, device: str = "cuda", dtype: str = DEFAULT_LLM_DTYPE,
                  max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS, max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
                  adapter_path: Path | None = None, device_map: str = "single",
-                 max_memory_gib: float = 6, seed: int = DEFAULT_SEED,
+                 seed: int = DEFAULT_SEED,
                  prefix_cache: str = "auto", prompt_cache: str = "auto"):
         validate_inference_budget(max_input_tokens, max_new_tokens)
+        if device_map != 'single':
+            raise ValueError('Only explicit single-device placement is supported; auto/balanced offload is disabled')
         if prompt_cache not in {"auto", "off"}:
             raise ValueError("prompt_cache must be auto or off")
         self.prompt_cache_mode = prompt_cache
@@ -38,47 +41,24 @@ class LocalLLM:
         self.generation_policy.update(seed=seed, max_input_tokens=max_input_tokens,
                                       max_new_tokens=max_new_tokens)
         torch_dtype = {"float16": torch.float16, "bfloat16": torch.bfloat16, "float32": torch.float32}[dtype]
-        sharding = {}
-        if device_map == "balanced":
-            if device != "cuda" or torch.cuda.device_count() < 2:
-                raise RuntimeError("balanced inference requires at least two visible CUDA GPUs")
-            if max_memory_gib <= 0:
-                raise ValueError("--llm-max-memory-gib must be positive")
-            budgets = {}
-            for gpu in range(torch.cuda.device_count()):
-                free, total = torch.cuda.mem_get_info(gpu)
-                budgets[gpu] = min(int(max_memory_gib * 1024**3), free - 4 * 1024**3)
-                if budgets[gpu] <= 0:
-                    raise RuntimeError(f"Insufficient free VRAM on GPU {gpu}")
-                logging.info("LLM GPU %d %s: free %.2f/%.2f GiB; weight budget %.2f GiB",
-                    gpu, torch.cuda.get_device_name(gpu), free/1024**3, total/1024**3, budgets[gpu]/1024**3)
-            sharding = {"device_map": "balanced", "max_memory": budgets}
-        elif device_map != "single":
-            raise ValueError(f"Unknown LLM device map: {device_map}")
+        placement = model_device_map(device)
+        logging.info('Explicit model device map (no CPU/disk fallback): %s', placement)
         self.model = model_loader(model_path).from_pretrained(
             str(model_path), torch_dtype=torch_dtype,
             local_files_only=True, trust_remote_code=False,
             low_cpu_mem_usage=True,
             attn_implementation="sdpa",
-            **sharding,
+            device_map=placement,
         )
-        if sharding:
-            placements = getattr(self.model, "hf_device_map", {})
-            gpu_ids = {str(v).removeprefix("cuda:") for v in placements.values()}
-            if not gpu_ids <= {str(i) for i in range(torch.cuda.device_count())} or len(gpu_ids) < 2:
-                raise RuntimeError(f"Expected LLM weights on multiple GPUs without CPU/disk offload: {placements}")
-            logging.info("LLM device map: %s", placements)
         if adapter_path is not None:
             if not (adapter_path / "adapter_config.json").is_file():
                 raise FileNotFoundError(f"LoRA adapter not found: {adapter_path}")
             from peft import PeftModel
             self.model = PeftModel.from_pretrained(self.model, str(adapter_path),
                                                  local_files_only=True, is_trainable=False,
-                                                 autocast_adapter_dtype=False)
-        if not sharding:
-            self.model.to(device)
+                                                 autocast_adapter_dtype=False, device_map=placement)
         self.model.eval()
-        self.device = self.model.get_input_embeddings().weight.device if sharding else device
+        self.device = self.model.get_input_embeddings().weight.device
         self.max_input_tokens = max_input_tokens
         self.max_new_tokens = max_new_tokens
 

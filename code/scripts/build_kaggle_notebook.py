@@ -40,6 +40,7 @@ REFRESH_TRANSCRIPTS = False  # True: thay cache hoàn tất nếu đổi ASR/d�
 # Fine-tune trước rồi tự nạp adapter cho inference.
 TRAIN_LLM = True
 TRAIN_BACKEND = "unsloth"  # backend mặc định; cần CUDA
+# Loader đặt toàn bộ model trên GPU đã chọn; thiếu VRAM dừng bằng OOM, không auto offload.
 TRAIN_ASR_TRANSCRIPT_RATIO = 0.5  # 50% sample dùng audio_text, 50% dùng ASR; chọn theo SEED
 TRAIN_EVAL_CLEAN_TRANSCRIPTS = False  # True: eval thêm text gốc; checkpoint luôn chọn bằng ASR
 TRAIN_RENAME_VARIANTS = 2  # giữ mẫu gốc + tối đa 2 biến thể đổi tên app/tool

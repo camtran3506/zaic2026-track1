@@ -30,3 +30,18 @@ def configure_cuda_device(args):
     selection = args.cuda_visible_devices
     detail = "CUDA disabled" if selection in ("", "-1") else "single GPU; local CUDA device 0"
     print(f"CUDA_VISIBLE_DEVICES={selection!r} ({detail})", flush=True)
+
+
+def model_device_map(device):
+    """Place the entire model explicitly; never ask Accelerate to infer a map.
+
+    Call only after configure_cuda_device. A selected physical GPU is local 0.
+    CPU is an explicit testing/inference option, never an OOM fallback.
+    """
+    import torch
+    target = torch.device(device)
+    if target.type == 'cuda':
+        return {'': target.index if target.index is not None else 0}
+    if target.type == 'cpu':
+        return {'': 'cpu'}
+    raise ValueError(f'Unsupported model device: {device}')

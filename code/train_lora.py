@@ -3,11 +3,10 @@
 import argparse
 import json
 import logging
-import os
 from pathlib import Path
 
 from lifemate.sft import AssistantCollator, SupervisedDataset, file_sha256, validate_prompt_policy
-from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
+from lifemate.gpu import add_cuda_device_argument, configure_cuda_device, model_device_map
 from lifemate.context import MAX_CONTEXT_TOKENS, validate_training_length
 from lifemate.llm import is_qwen35, model_loader, lora_targets, configure_tokenizer
 from lifemate.runtime import (make_runtime_manifest, runtime_save_callback,
@@ -75,12 +74,15 @@ def main():
         raise RuntimeError("QLoRA requires CUDA; use --quantization none for a CPU smoke test")
     dtype = training_dtype(torch)
     bf16 = cuda and dtype == torch.bfloat16
+    placement = model_device_map('cuda' if cuda else 'cpu')
+    logging.info('Explicit model device map (no CPU/disk fallback): %s', placement)
     if args.backend == "unsloth":
         model, tokenizer = FastLanguageModel.from_pretrained(
             model_name=str(args.base_model.resolve()), max_seq_length=args.max_length,
             dtype=dtype, load_in_4bit=args.quantization == "4bit",
             local_files_only=True, trust_remote_code=False,
             fast_inference=False,
+            device_map=placement,
             **({"auto_model": model_loader(args.base_model)} if is_qwen35(args.base_model)
                else {"use_exact_model_name": True}),
         )
@@ -156,11 +158,11 @@ def main():
             **({"finetune_vision_layers": False} if is_qwen35(args.base_model) else {}))
     else:
         kwargs = dict(local_files_only=True, trust_remote_code=False, torch_dtype=dtype,
-                      attn_implementation="sdpa")
+                      attn_implementation="sdpa", device_map=placement)
         if args.quantization == "4bit":
             kwargs.update(quantization_config=BitsAndBytesConfig(load_in_4bit=True,
                 bnb_4bit_quant_type="nf4", bnb_4bit_use_double_quant=True,
-                bnb_4bit_compute_dtype=dtype), device_map={"": int(os.environ.get("LOCAL_RANK", 0))})
+                bnb_4bit_compute_dtype=dtype))
         model = model_loader(args.base_model).from_pretrained(str(args.base_model), **kwargs)
         if args.quantization == "4bit":
             model = prepare_model_for_kbit_training(model, gradient_checkpointing_kwargs={"use_reentrant": False})
