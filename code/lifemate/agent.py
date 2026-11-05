@@ -7,16 +7,16 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
-from .catalog import allowed_tools, prompt_catalog
+from .catalog import allowed_tools
 from .eval_trace import exception_details
 from .history import prompt_history, resolve_history
 from .local_helpers import (DEFAULT_MAX_LOCAL_CALLS, execute_helper,
                             helper_tool_schemas, with_local_tools)
 from .local_checks import inspect_call
-from .execution_policy import EXECUTION_POLICY, AUTOMATIC_GUARD_INSTRUCTIONS, LoopMonitor
+from .execution_policy import AUTOMATIC_GUARD_INSTRUCTIONS, LoopMonitor
 from .tool_execution import precheck_call, attempt_env_call, result_observation
 from .text import normalize_transcript
-from .itn import ITN_POLICY, detect_candidates
+from .prompt_session import InferenceSession, fixed_prompt_payload
 
 SYSTEM_PROMPT = """Bạn là AI Agent LifeMate. Chỉ xuất ĐÚNG MỘT JSON object, KHÔNG markdown hoặc diễn giải.
 Bạn có transcript yêu cầu nói tiếng Việt, context, history, các tool được cài và kết quả các calls trước.
@@ -143,23 +143,8 @@ class AgentConfig:
 
 def build_step_prompt(transcript, context, history, enabled, observations):
     """Use the same complete catalog, history and observations in SFT/inference."""
-    tools = prompt_catalog(with_local_tools(enabled))
-    transcript = normalize_transcript(transcript)
-    history = prompt_history(history)
-    info = {
-        "request_transcript": transcript,
-        "itn_policy": ITN_POLICY,
-        "automatic_execution_policy": EXECUTION_POLICY,
-        "itn_candidates": detect_candidates(transcript),
-        "itn_history_candidates": [
-            {"history_index": i, "candidates": candidates}
-            for i, turn in enumerate(history)
-            if (candidates := detect_candidates(turn["text"]))],
-        "user_context": {k: v for k, v in context.items() if k != "installed_apps"},
-        "conversation_history": history,
-        "available_tools": tools,
-        "previous_actions_and_results": observations,
-    }
+    tools, info = fixed_prompt_payload(transcript, context, history, enabled)
+    info["previous_actions_and_results"] = observations
     # Token limits are checked by LocalLLM/encode_example, never by dropping data.
     return tools, full_json(info)
 
@@ -176,20 +161,25 @@ class LifeMateAgent:
         """env is created exactly once by caller; never instantiate another here."""
         begin = getattr(self.llm, "begin_sample", None)
         end = getattr(self.llm, "end_sample", None)
+        session = InferenceSession() if getattr(self.llm, "prompt_cache_mode", "auto") == "auto" else None
         if callable(begin):
             begin()
         try:
-            report = self._run(item, env, split_dir, split, prepared_transcript, trace=trace)
+            report = self._run(item, env, split_dir, split, prepared_transcript, trace=trace, session=session)
             stats = getattr(self.llm, "prefix_cache_stats", None)
             if callable(stats):
                 report["prefix_cache"] = stats()
+            if session is not None:
+                report["prompt_cache"] = session.report()
             return report
         finally:
+            if session is not None:
+                session.close()
             if callable(end):
                 end()
 
     def _run(self, item: dict, env: Any, split_dir: Path, split: str,
-             prepared_transcript: dict | None = None, *, trace=None) -> dict:
+             prepared_transcript: dict | None = None, *, trace=None, session=None) -> dict:
         t0 = time.monotonic()
         step = 0
         def emit(event, **data):
@@ -218,6 +208,8 @@ class LifeMateAgent:
                 transcript = self.asr.transcribe(audio_path(split_dir, item["audio"]))
             history = history_text(item.get("history", []), split_dir, self.asr, t0, self.cfg.sample_seconds)
         transcript = normalize_transcript(transcript)
+        if session is not None:
+            session.prepare(transcript, context, history, enabled)
         observations: list[dict] = []
         invalid = 0
         executed = 0
@@ -239,8 +231,10 @@ class LifeMateAgent:
             if time.monotonic() - t0 > self.cfg.sample_seconds - self.cfg.reserve_seconds:
                 stop_reason = "time_limit"
                 break
-            tools, user_prompt = build_step_prompt(
-                transcript, context, history, enabled, observations)
+            if session is not None:
+                user_prompt = session.prompt(observations)
+            else:
+                _, user_prompt = build_step_prompt(transcript, context, history, enabled, observations)
             step += 1
             emit("llm_start", request={"system": SYSTEM_PROMPT, "user": user_prompt})
             try:

@@ -54,6 +54,27 @@ def tool_call_message(name, arguments, content=""):
                 "name": name, "arguments": deepcopy(arguments)}}]}
 
 
+def native_observation_messages(observations):
+    """Render all current observations, including guards, without retaining old ones."""
+    chat = []
+    for observation in observations:
+        if all(key in observation for key in ("name", "arguments", "result")):
+            chat.append(tool_call_message(observation["name"], observation["arguments"]))
+            result = observation["result"]
+            chat.append({"role": "tool", "content": result if isinstance(result, str) else _json(result)})
+            feedback = {}
+            if observation.get("verification"):
+                feedback["execution_feedback"] = observation["verification"]
+            if observation.get("automatic_execution_feedback"):
+                feedback["automatic_execution_feedback"] = observation["automatic_execution_feedback"]
+            if feedback:
+                chat.append({"role": "user", "content": _json(feedback)})
+        else:
+            # A rejected proposal has no executed tool result to fabricate.
+            chat.append({"role": "user", "content": _json({"agent_feedback": observation})})
+    return chat
+
+
 def native_chat(messages):
     """Convert the portable LifeMate payload/target without losing input data.
 
@@ -91,21 +112,7 @@ def native_chat(messages):
     request = {key: deepcopy(value) for key, value in payload.items()
                if key not in {"available_tools", "conversation_history", "previous_actions_and_results"}}
     chat.append({"role": "user", "content": _json(request)})
-    for observation in payload["previous_actions_and_results"]:
-        if all(key in observation for key in ("name", "arguments", "result")):
-            chat.append(tool_call_message(observation["name"], observation["arguments"]))
-            result = observation["result"]
-            chat.append({"role": "tool", "content": result if isinstance(result, str) else _json(result)})
-            feedback = {}
-            if observation.get("verification"):
-                feedback["execution_feedback"] = observation["verification"]
-            if observation.get("automatic_execution_feedback"):
-                feedback["automatic_execution_feedback"] = observation["automatic_execution_feedback"]
-            if feedback:
-                chat.append({"role": "user", "content": _json(feedback)})
-        else:
-            # A rejected proposal has no executed tool result to fabricate.
-            chat.append({"role": "user", "content": _json({"agent_feedback": observation})})
+    chat.extend(native_observation_messages(payload["previous_actions_and_results"]))
     if len(messages) > 2:
         if len(messages) != 3 or messages[2]["role"] != "assistant":
             raise ValueError("Expected one portable assistant target")

@@ -705,8 +705,8 @@ Standalone inference defaults to `--prefix-cache auto`. On the pinned
 Transformers 5.4.0 Qwen3.5 text-only runtime, it snapshots the closed native-chat
 prefix (system/tools, history and current request) on the first step of each
 sample. Later steps clone that snapshot and prefill only the suffix. The complete
-prompt is still rendered, tokenized and checked against the token budget; reuse
-requires an **exact token-prefix match**, not a character or semantic match.
+token sequence is checked against the token budget; reuse requires an **exact
+token-prefix match**, not a character or semantic match.
 Results, helper calls and rejection feedback remain in the suffix, so removing a
 rejected proposal does not leave stale recurrent state in the next request.
 
@@ -731,6 +731,39 @@ on the target GPU. No prompt, SFT target, adapter manifest or dependency pin is
 changed. Training and the live-model validation callback retain the original
 full-prefill path; `LocalLLM.from_loaded_model(..., prefix_cache="auto")` is an
 explicit opt-in for compatible, unpatched evaluation models.
+
+CPU prompt preparation separately defaults to `--prompt-cache auto`. One
+`InferenceSession` per sample normalizes/freezes the request, context, history,
+ITN candidates and complete schemas once, retaining their compact JSON and native
+message representations. Every step serializes and converts **all currently
+present observations** again. Nothing assumes that observations are append-only:
+guards can remove rejected feedback, results can change, and Qwen's rendering of
+earlier assistant turns can change when a later user-feedback turn appears.
+
+For the verified Qwen3.5 checkpoint-template body and deterministic byte-BPE
+tokenizers with an isolated `<|im_end|>` special-token boundary, the session also
+caches the rendered/tokenized fixed prefix. It renders the entire observation
+suffix using the checkpoint's own template, including its generation header,
+and tokenizes that suffix in full each step. The split is **after** the special
+token, with the following newline in the suffix, so no BPE piece crosses it.
+The first step compares complete text and token IDs against full rendering before
+allowing reuse. The GPU snapshot keeps its previous closed-request boundary,
+including the newline. Changed tokenizer identity/settings, vocabulary size, system or
+template kwargs rebuild the renderer. Unverified templates/tokenizer boundaries
+use full rendering/tokenization with prepared native messages. Closed sessions or
+ordinary strings use the original rendering path. Both CPU and GPU caches are
+released at sample boundaries, including exceptions and `ask_missing_info`.
+
+Use `--prompt-cache off` to disable CPU session preparation independently of
+`--prefix-cache off`; pass both for the original baseline. Diagnostic JSONL adds
+`prompt_cache` preparation/render/reused-token counts and fallback reasons. No
+prompt contents, loss masks, gold targets, tool execution rules or dependency
+versions change. Live training/evaluation wrappers default to both caches off;
+compatible callers can explicitly opt into `prompt_cache="auto"`. CPU preparation
+tests compare every token with full rendering using merged BPE, Unicode, tool
+history, helper results, validation/read-cache feedback, repeated writes and
+changed/removed observations. Speed on a full GPU pipeline still needs a target
+machine measurement; the first-step verification has a CPU warm-up cost.
 
 Unavailable/schema-invalid gold labels still fail with the sample ID. Training
 transcripts and ASR weights for held-out evaluation are required at every mix ratio. No

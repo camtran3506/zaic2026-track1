@@ -8,6 +8,7 @@ from .context import DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_NEW_TOKENS, validate_
 from .asr import LocalASR
 from .llm import model_loader, configure_tokenizer, render_prompt
 from .prefix_cache import PrefixCache, stable_prefix_ids
+from .prompt_session import PreparedPrompt
 from .runtime import (DEFAULT_LLM_DTYPE, DEFAULT_SEED, generation_policy,
                       load_runtime_manifest, select_tokenizer_path, generation_context)
 
@@ -17,8 +18,11 @@ class LocalLLM:
                  max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS, max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
                  adapter_path: Path | None = None, device_map: str = "single",
                  max_memory_gib: float = 6, seed: int = DEFAULT_SEED,
-                 prefix_cache: str = "auto"):
+                 prefix_cache: str = "auto", prompt_cache: str = "auto"):
         validate_inference_budget(max_input_tokens, max_new_tokens)
+        if prompt_cache not in {"auto", "off"}:
+            raise ValueError("prompt_cache must be auto or off")
+        self.prompt_cache_mode = prompt_cache
         self.prefix_cache = PrefixCache(prefix_cache)
         import torch
         from transformers import AutoTokenizer
@@ -80,12 +84,15 @@ class LocalLLM:
 
     @classmethod
     def from_loaded_model(cls, model, tokenizer, max_input_tokens=DEFAULT_MAX_INPUT_TOKENS,
-                          max_new_tokens=DEFAULT_MAX_NEW_TOKENS, *, prefix_cache="off"):
+                          max_new_tokens=DEFAULT_MAX_NEW_TOKENS, *, prefix_cache="off", prompt_cache="off"):
         """Run identical agent decoding on current training weights without a second model."""
         validate_inference_budget(max_input_tokens, max_new_tokens)
+        if prompt_cache not in {"auto", "off"}:
+            raise ValueError("prompt_cache must be auto or off")
         import torch
         obj = cls.__new__(cls)
         obj.torch, obj.model, obj.tokenizer = torch, model, tokenizer
+        obj.prompt_cache_mode = prompt_cache
         # Training callbacks may patch forwards/change weights. Leave their
         # existing rollout path intact unless explicitly requested by a caller.
         obj.prefix_cache = PrefixCache(prefix_cache)
@@ -111,7 +118,13 @@ class LocalLLM:
         from .decoding import DecisionJsonStoppingCriteria, NativeToolStoppingCriteria
         tokenizer = self.tokenizer
         messages = [{"role": "system", "content": system}, {"role": "user", "content": user}]
-        _, token_ids = render_prompt(tokenizer, messages)
+        prepared = (user.session.render(tokenizer, system, user)
+                    if self.prompt_cache_mode == "auto" and isinstance(user, PreparedPrompt) else None)
+        if prepared is None:
+            _, token_ids = render_prompt(tokenizer, messages)
+            prepared_prefix = None
+        else:
+            _, token_ids, prepared_prefix = prepared
         if len(token_ids) > self.max_input_tokens:
             raise ValueError(f"Prompt has {len(token_ids)} tokens, exceeds "
                              f"--max-input-tokens={self.max_input_tokens}; "
@@ -126,7 +139,8 @@ class LocalLLM:
             ids = None
             if self.prefix_cache.eligible(self.model):
                 try:
-                    prefix = stable_prefix_ids(tokenizer, messages, token_ids, memo=self.prefix_cache.prefix_memo)
+                    prefix = prepared_prefix or stable_prefix_ids(
+                        tokenizer, messages, token_ids, memo=self.prefix_cache.prefix_memo)
                     if prefix:
                         with self.prefix_cache.restore(self.model, input_ids, prefix) as cached:
                             ids = self.model.generate(
