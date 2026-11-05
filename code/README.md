@@ -634,12 +634,12 @@ The training schema is the same as inference: `audio_text`, `context`, `history`
 entrypoint. Keep the organizer's train-specific `zaic_tools` next to `train.jsonl`.
 
 Fine-tuning now defaults to **50% provided `audio_text` + 50% ASR transcripts**
-(`--asr-transcript-ratio 0.5`). Train/validation are split by original sample ID
-first; each partition then gets a deterministic seeded selection of transcript
+(`--asr-transcript-ratio 0.5`). App-held-out, train and regular validation are split
+by original sample ID first; each partition then gets a deterministic seeded selection of transcript
 sources. The ASR count is rounded to the nearest integer for the full source
 dataset and for the training partition (ties round up); validation receives the
-remainder. Thus 50:50 stays exact for an even total, and an odd partition differs
-by at most one sample between sources. The ratio is by sample,
+remainder (shared with app-held-out when enabled). The requested total is preserved;
+individual partitions can differ slightly due to rounding. The ratio is by sample,
 not by expanded tool-call steps. Each SFT sample keeps the same selected transcript
 throughout its trajectory; samples are not duplicated across partitions. History
 uses the existing full text/audio resolver unchanged. Checkpoint-selection
@@ -662,6 +662,72 @@ these ASR transcripts without loading ASR alongside the LLM. If the
 explicit diagnostic skip policy removes samples, retained counts may differ from
 the requested ratio; both counts are reported. Create a new SFT/run directory to
 apply the mix; older prepared data is rejected by the current preparation policy.
+
+### Schema generalization: renamed tools, unrelated apps and unseen-app evaluation
+
+`finetune.py` enables all three features by default:
+
+| Option | Default | Behavior |
+|---|---|---|
+| `--rename-variants` | `2` | Keep canonical TRAIN dialogues and add up to two consistent app/tool-name variants per source sample. |
+| `--distractor-probability` | `0.5` | Each additional variant has a 50% chance of including 1–3 unrelated apps, when eligible apps exist. |
+| `--heldout-apps` | `auto` | Reserve every sample exposed to one selected app, before making the regular train/validation split. |
+| `--heldout-fraction` | `0.1` | Auto selection targets 10% of original source IDs by app exposure; it does not reserve 10% of app names. |
+
+Names use deterministic opaque aliases such as `app_<hash>.tool_<hash>`, forcing
+the model to use descriptions and parameter schemas. Tool references in targets,
+history calls, observations, schema references and `sys.ask_missing_info.tool_name`
+are renamed together. Parameter names/types, entity IDs, free-form user text and
+ordinary argument values stay unchanged. `sys.*` and local helper names stay fixed.
+Variants containing literal tool references in transcript/history text or ordinary
+arguments are skipped instead of editing that data. Generated `local_context.lookup`
+and `local_entity.resolve` demonstrations are kept in canonical data and omitted
+from renamed trajectories: those helpers have name-bound collection mappings.
+Their generated observations are omitted from the same variants; other helper
+demonstrations are retained.
+
+Distractors use only the TRAIN catalog and apps exposed in the training partition.
+They exclude installed apps, app families related to the gold intent and all held-out
+apps or schemas referencing them. Functional families live in
+`lifemate/data_generalization.py`; `--app-groups-file groups.json` can extend or
+override them using a JSON object such as `{"communication": ["contacts", "phone", "sms"]}`.
+Unknown intent families and empty-gold requests receive no distractors. Adding apps
+never changes the canonical gold target or simulates calls to those apps.
+
+Splitting counts unused installed tool schemas, qualified references in context/history
+and schema dependencies as exposure. Such samples cannot remain in train or regular
+validation for a claimed unseen app. The augmentation pool also excludes that app,
+including when names are aliased. Explicit app/group choices fail if they leave no
+usable held-out targets or insufficient train/validation data. Auto mode reports
+`unavailable` on an infeasible dataset, such as one containing only one app; it does
+not claim an unseen-app result. The manifest records the chosen apps, source-ID
+partitions, exposure audit, alias maps, distractors and augmentation/drop counts.
+Training and rollout loading recheck these partitions against the unchanged public
+TRAIN manifest and catalog.
+
+Use `--heldout-apps library,learning` for specific app IDs, or
+`--heldout-groups learning --heldout-apps none` for a functional group present in
+your TRAIN catalog. Group selection may reserve substantially more data because
+every exposed sample moves together. Normal validation is still 10% of the
+remaining source IDs by default. App-held-out rollouts use the original names and
+real ToolEnv, with ASR for every ID. Their `eval_app_heldout_*` metrics are diagnostic;
+**only regular ASR `eval_state_tool_score` selects the checkpoint**.
+`--eval-clean-transcripts` also adds `eval_app_heldout_clean_*` metrics.
+
+Augmentation happens after each source sample's single canonical gold replay;
+aliases and distractors never reach ToolEnv or a submission log. Both prompt and
+target are measured using the actual configured chat template/tokenizer. An
+oversized augmented trajectory is dropped as a whole; fields and targets are never
+clipped. Canonical examples still fail training if oversized. Retaining two variants
+can roughly triple SFT steps, and app-held-out rollouts add evaluation time. No new
+inference step or runtime dependency is introduced.
+
+Standalone `prepare_sft.py` preserves the earlier defaults (`0`, `0`, `none`). To
+enable the same features explicitly, pass `--tokenizer ./models/llm
+--rename-variants 2 --distractor-probability 0.5 --heldout-apps auto`; the tokenizer is
+required to check token budgets. Create a new SFT/run directory to use the new data.
+To disable the features in `finetune.py`, pass `--rename-variants 0
+--distractor-probability 0 --heldout-apps none`.
 
 The default training backend is **Unsloth** (`FastVisionModel` for Qwen3.5 with
 vision layers frozen and text-only LoRA), imported before
@@ -715,7 +781,8 @@ be in execution order. It uses the **same complete prompt builder** as inference
 Every allowed tool is present in `tool_schemas` from the first step, with all
 catalog fields intact: full descriptions, structured returns, nested parameters,
 and extension metadata. `tool_index` also retains full descriptions. Tools not
-exposed by `installed_apps` remain unavailable.
+exposed by `installed_apps` remain unavailable in canonical data and rollouts.
+Only the additional TRAIN augmentation views expose distractor schemas as described above.
 
 There is no schema ranking/subset, character-based size fitting, history window,
 text clipping, tool-result clipping, or limit on the number of past observations
@@ -835,8 +902,9 @@ and logs for every stage.
 
 The default selection metric is **`eval_state_tool_score` (0–100), higher is better**,
 not teacher-forced `eval_loss`. After each epoch, the current model runs the same
-agent decoding used for inference on every held-out TRAIN sample ID (10% by
-default, split before SFT expansion), using **ASR transcripts for all IDs**.
+agent decoding used for inference on every regular validation sample ID (10% of
+the source IDs remaining after app holdout by default, split before SFT expansion),
+using **ASR transcripts for all IDs**. App-held-out diagnostics run separately.
 The training mixture remains 50:50 by default; teacher-forced validation loss
 still uses the assigned SFT sources. ASR runs during preparation and is not
 loaded during LLM rollouts, so selection measures the agent on cached ASR input

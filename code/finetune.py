@@ -9,6 +9,8 @@ import sys
 
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
 from lifemate.sft import DEFAULT_ASR_TRANSCRIPT_RATIO, asr_transcript_ratio
+from lifemate.data_generalization import add_arguments, validate_options
+from lifemate.context import MAX_CONTEXT_TOKENS, validate_training_length
 
 
 def main():
@@ -30,9 +32,13 @@ def main():
     p.add_argument("--missing-tool-policy", choices=["error", "skip"], default="error")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--export-merged", action="store_true", help="Needs RAM/disk for full-precision base + adapter")
+    add_arguments(p, enabled=True)
+    p.add_argument('--max-length', type=int, default=MAX_CONTEXT_TOKENS)
     # Remaining args are forwarded to train_lora.py, e.g. --max-steps or --quantization.
     args, training_options = p.parse_known_args()
     configure_cuda_device(args)
+    validate_options(args)
+    validate_training_length(args.max_length)
     if args.asr_model is None:
         p.error("--asr-model is required for ASR-only checkpoint evaluation, including --asr-transcript-ratio 0")
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
@@ -66,6 +72,12 @@ def main():
                "--validation-fraction", args.validation_fraction, "--seed", args.seed,
                "--asr-transcript-ratio", args.asr_transcript_ratio,
                "--missing-tool-policy", args.missing_tool_policy]
+    prepare.extend(['--tokenizer', base, '--max-length', args.max_length,
+        '--rename-variants', args.rename_variants, '--distractor-probability', args.distractor_probability,
+        '--heldout-apps', args.heldout_apps, '--heldout-fraction', args.heldout_fraction,
+        '--heldout-groups', args.heldout_groups])
+    if args.app_groups_file:
+        prepare.extend(['--app-groups-file', args.app_groups_file])
     if args.asr_model:
         prepare.extend(["--asr-model", args.asr_model, "--device", args.asr_device,
                         "--asr-precision", args.asr_precision, "--asr-threads", str(args.asr_threads)])
@@ -73,7 +85,7 @@ def main():
     if args.eval_clean_transcripts:
         training_options.append("--eval-clean-transcripts")
     run("train_lora.py", [*training_options, "--base-model", base, "--sft-dir", args.output_dir / "sft",
-                          "--output-dir", args.output_dir / "training", "--seed", args.seed])
+                          "--output-dir", args.output_dir / "training", "--seed", args.seed, '--max-length', args.max_length])
     if args.export_merged:
         run("merge_lora.py", ["--base-model", base, "--adapter", args.output_dir / "training/adapter",
                               "--output-dir", args.output_dir / "merged"])

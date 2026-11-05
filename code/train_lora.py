@@ -93,6 +93,10 @@ def main():
         raise ValueError("Tokenizer needs an existing pad/eos token")
     manifest = json.loads((args.sft_dir / "manifest.json").read_text())
     validate_prompt_policy(manifest)
+    if manifest.get('app_holdout', {}).get('status') == 'enabled':
+        from lifemate.data_generalization import validate_split_manifest
+        from lifemate.catalog import load_catalog
+        validate_split_manifest(manifest, load_catalog(Path(manifest['source']).parent / 'train_tools_catalog.json'))
     data = {}
     ids = {}
     for part in ("train", "validation"):
@@ -100,6 +104,10 @@ def main():
         if file_sha256(path) != manifest["partitions"][part]["sha256"]:
             raise ValueError(f"Prepared {part} data changed after preparation")
         examples = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
+        if part == 'train':
+            from lifemate.data_generalization import assert_no_heldout
+            for example in examples:
+                assert_no_heldout(example, manifest.get('app_holdout', {}).get('apps', []))
         ids[part] = {e["sample_id"] for e in examples}
         if ids[part] != set(manifest["partitions"][part]["sample_ids"]):
             raise ValueError(f"{part} sample IDs disagree with manifest")
@@ -108,6 +116,14 @@ def main():
         raise ValueError("Train/validation sample leakage")
     from lifemate.evaluation import StateToolEvaluator, score_callback
     evaluator = StateToolEvaluator(args.sft_dir, manifest, require_clean_transcripts=args.eval_clean_transcripts)
+    app_evaluator = None
+    if manifest.get('app_heldout_rollouts'):
+        try:
+            app_evaluator = StateToolEvaluator(args.sft_dir, manifest,
+                require_clean_transcripts=args.eval_clean_transcripts, partition='app_heldout')
+        except Exception:
+            evaluator.close()
+            raise
     runtime = make_runtime_manifest(args.base_model, tokenizer, seed=args.seed)
     run_config = {
         **{k: str(v.resolve()) if isinstance(v, Path) else v for k, v in vars(args).items()},
@@ -175,7 +191,7 @@ def main():
         callbacks=[score_callback(evaluator, tokenizer, args.output_dir, FastLanguageModel,
                                   eval_clean_transcripts=args.eval_clean_transcripts,
                                   eval_prefix_cache=args.eval_prefix_cache,
-                                  eval_prompt_cache=args.eval_prompt_cache),
+                                  eval_prompt_cache=args.eval_prompt_cache, app_evaluator=app_evaluator),
                    runtime_save_callback(runtime)])
     try:
         train_result = trainer.train(resume_from_checkpoint=str(args.resume_from_checkpoint) if args.resume_from_checkpoint else None)
@@ -189,6 +205,8 @@ def main():
         save_runtime_manifest(adapter, runtime)
     finally:
         evaluator.close()
+        if app_evaluator is not None:
+            app_evaluator.close()
     run_config["best_checkpoint"] = trainer.state.best_model_checkpoint
     run_config["best_state_tool_score"] = trainer.state.best_metric
     run_config["selection_metric"] = "eval_state_tool_score"

@@ -9,7 +9,7 @@ from main import resolve_data_layout
 from lifemate.catalog import load_catalog
 from lifemate.sft import (DEFAULT_ASR_TRANSCRIPT_RATIO, SFT_PROMPT_POLICY, VALIDATION_ROLLOUT_POLICY, UnexposedToolError,
                          asr_transcript_ratio, assign_transcript_sources, file_sha256,
-                         prepare_train_transcript, prepare_validation_transcripts, replay_sample, split_records)
+                         prepare_train_transcript, prepare_validation_transcripts, replay_sample)
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
 from lifemate.text import TEXT_NORMALIZATION
 from lifemate.itn import ITN_POLICY
@@ -18,6 +18,9 @@ from lifemate.local_time import LOCAL_TIME_POLICY
 from lifemate.local_helpers import LOCAL_HELPER_POLICY, helper_tool_schemas
 from lifemate.specialist_training import SPECIALIST_TRAINING_POLICY
 from lifemate.temporal_training import TEMPORAL_TRAINING_POLICY
+from lifemate.data_generalization import (POLICY as GENERALIZATION_POLICY, AppAugmenter, add_arguments,
+    load_groups, split_generalization, assert_no_heldout, validate_options)
+from lifemate.context import MAX_CONTEXT_TOKENS, validate_training_length
 
 
 def main():
@@ -35,26 +38,48 @@ def main():
     p.add_argument("--device", choices=["cpu"], default="cpu", help="ASR is CPU-only")
     p.add_argument("--asr-precision", choices=["int8", "fp32"], default="int8")
     p.add_argument("--asr-threads", type=int, default=4)
+    add_arguments(p)
+    p.add_argument("--tokenizer", type=Path, help="Local base model/tokenizer, required for augmentation token-budget checks")
+    p.add_argument("--max-length", type=int, default=MAX_CONTEXT_TOKENS)
     args = p.parse_args()
     configure_cuda_device(args)
+    validate_options(args)
+    validate_training_length(args.max_length)
+    if (args.rename_variants or args.distractor_probability) and args.tokenizer is None:
+        p.error("--tokenizer is required for app/tool augmentation")
     if args.asr_model is None:
         p.error("--asr-model is required for ASR validation rollouts, even when --asr-transcript-ratio is 0")
     split_dir, env_root, holder = resolve_data_layout(args.data_root, "train")
     source = split_dir / "train.jsonl"
     records = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line.strip()]
-    train, validation = split_records(records, args.validation_fraction, args.seed)
+    catalog_path = split_dir / "train_tools_catalog.json"
+    catalog = load_catalog(catalog_path)
+    groups = load_groups(args.app_groups_file, catalog)
+    partitions, holdout = split_generalization(records, catalog, args, groups)
+    train, validation = partitions['train'], partitions['validation']
+    print('App-held-out split:', json.dumps({k: v for k, v in holdout.items() if k != 'exposed_apps_by_id'}), flush=True)
     # Round once for the whole source dataset and for the training partition;
-    # validation takes the remainder so odd partition sizes cannot skew 50:50.
+    # Regular validation and optional app-held-out share the remainder.
     total_asr = int(len(records) * args.asr_transcript_ratio + 0.5)
     train_asr = int(len(train) * args.asr_transcript_ratio + 0.5)
-    asr_counts = {"train": train_asr, "validation": total_asr - train_asr}
+    val_asr = total_asr - train_asr
+    if partitions['app_heldout']:
+        val_asr = max(total_asr-train_asr-len(partitions['app_heldout']),
+                      min(total_asr-train_asr, int(len(validation)*args.asr_transcript_ratio+.5)))
+    asr_counts = {"train": train_asr, "validation": val_asr, "app_heldout": total_asr-train_asr-val_asr}
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise FileExistsError("Use an empty output directory; prepared data is never overwritten")
     args.output_dir.mkdir(parents=True, exist_ok=True)
     sys.path.insert(0, str(split_dir))
     from zaic_tools import ToolEnv
-    catalog_path = split_dir / "train_tools_catalog.json"
-    catalog = load_catalog(catalog_path)
+    tokenizer = None
+    if args.rename_variants or args.distractor_probability:
+        from transformers import AutoTokenizer
+        from lifemate.llm import configure_tokenizer
+        tokenizer = configure_tokenizer(AutoTokenizer.from_pretrained(str(args.tokenizer), local_files_only=True), args.tokenizer)
+    augmenter = AppAugmenter(catalog, train, holdout['apps'], groups, seed=args.seed,
+        rename_variants=args.rename_variants, distractor_probability=args.distractor_probability,
+        tokenizer=tokenizer, max_length=args.max_length)
     asr = None
     asr_settings = None
     if args.asr_model:
@@ -74,11 +99,15 @@ def main():
                     temporal_helper_training_policy=TEMPORAL_TRAINING_POLICY,
                     transcript_mixing={"policy": "seeded-sample-v1", "unit": "sample",
                                        "asr_ratio": args.asr_transcript_ratio, "seed": args.seed,
-                                       "rounding": "nearest-total-and-train-validation-remainder"},
+                                       "rounding": ("nearest-total-train-validation-app-heldout-remainder"
+                                                    if partitions['app_heldout'] else
+                                                    "nearest-total-and-train-validation-remainder")},
                     asr=asr_settings,
-                    partitions={})
-    rollout_rows = []
-    for partition, rows in (("train", train), ("validation", validation)):
+                    app_holdout=holdout, partitions={})
+    rollout_rows = {"validation": [], "app_heldout": []}
+    for partition, rows in partitions.items():
+        if not rows:
+            continue
         sources = assign_transcript_sources(rows, args.asr_transcript_ratio, args.seed,
                                             count=asr_counts[partition])
         requested_counts = {name: list(sources.values()).count(name) for name in ("audio_text", "asr")}
@@ -96,7 +125,7 @@ def main():
                 try:
                     prepared = prepare_train_transcript(record, split_dir, asr,
                                                         transcript_source=sources[record["id"]])
-                    if partition == "validation":
+                    if partition != "train":
                         asr_prepared, clean_prepared = prepare_validation_transcripts(record, split_dir, asr, prepared)
                     examples = replay_sample(record, catalog, env, split_dir, asr,
                                              prepared_transcript=prepared)
@@ -109,20 +138,24 @@ def main():
                         report.write(json.dumps(reason, ensure_ascii=False) + "\n")
                     print(f"WARNING skipped entire {partition} sample: {exc}", flush=True)
                     continue
-                if partition == "validation":
+                if partition != "train":
                     gold_hash = env.get_state_hash()
                     if not isinstance(gold_hash, str) or not gold_hash:
                         raise ValueError(f"{record['id']}: ToolEnv returned an invalid gold state hash")
                     supplied_hash = record.get("label", {}).get("state_hash")
                     if supplied_hash is not None and supplied_hash != gold_hash:
                         raise ValueError(f"{record['id']}: replayed gold hash differs from the provided gold hash")
-                    rollout_rows.append({
+                    rollout_rows[partition].append({
                         "item": {k: v for k, v in record.items() if k not in ("label", "audio_text")},
                         "prepared_transcript": asr_prepared,
                         "clean_prepared_transcript": clean_prepared,
                         "gold_tool_calls": record["label"]["tool_calls"], "gold_state_hash": gold_hash,
                     })
                 retained_ids.append(record["id"])
+                if partition == 'train':
+                    for example in examples:
+                        assert_no_heldout(example, holdout['apps'])
+                    examples = examples + augmenter.augment(record, examples)
                 for example in examples:
                     target = json.loads(example["messages"][-1]["content"])
                     if target.get("name") in helper_counts:
@@ -145,13 +178,19 @@ def main():
             local_helper_examples_by_tool=helper_counts, sha256=file_sha256(path))
         print(f"{partition} summary: kept {len(retained_ids)}/{len(rows)}, skipped {len(skipped)}, {count} steps; "
               f"transcript sources: {metadata['partitions'][partition]['transcript_source_counts']}", flush=True)
-    if metadata["partitions"]["validation"]["skipped_samples"]:
-        raise ValueError("State/tool checkpoint selection requires every held-out validation sample; do not skip them")
-    rollout_path = args.output_dir / "validation_rollouts.jsonl"
-    rollout_path.write_text("".join(json.dumps(r, ensure_ascii=False) + "\n" for r in rollout_rows), encoding="utf-8")
-    metadata["validation_rollouts"] = {"path": rollout_path.name, "sha256": file_sha256(rollout_path),
-        "policy": VALIDATION_ROLLOUT_POLICY, "selection_transcript_source": "asr",
-        "clean_view_samples": sum(r["clean_prepared_transcript"] is not None for r in rollout_rows)}
+    for partition, rows in rollout_rows.items():
+        if not rows:
+            continue
+        if metadata['partitions'][partition]['skipped_samples']:
+            raise ValueError('State/tool evaluation requires every held-out sample; do not skip them')
+        rollout_path = args.output_dir / f'{partition}_rollouts.jsonl'
+        rollout_path.write_text(''.join(json.dumps(r, ensure_ascii=False)+'\n' for r in rows), encoding='utf-8')
+        metadata[f'{partition}_rollouts'] = {'path': rollout_path.name, 'sha256': file_sha256(rollout_path),
+            'policy': VALIDATION_ROLLOUT_POLICY, 'selection_transcript_source': 'asr',
+            'clean_view_samples': sum(r['clean_prepared_transcript'] is not None for r in rows)}
+    metadata['training_augmentation'] = {'policy': GENERALIZATION_POLICY, 'rename_variants': args.rename_variants,
+        'distractor_probability': args.distractor_probability, 'distractor_range': [1, 3],
+        'max_length': args.max_length, 'groups': {k: sorted(v) for k, v in groups.items()}, **augmenter.stats}
     (args.output_dir / "manifest.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     print("Prepared TRAIN-only SFT data:", args.output_dir)
     if holder is not None:

@@ -104,6 +104,11 @@ def test_child_processes_inherit_single_gpu(monkeypatch, tmp_path, pipeline):
         prepare = observed[0][0]
         assert prepare[prepare.index('--asr-transcript-ratio') + 1] == '0.5'
         assert prepare[prepare.index('--asr-model') + 1] == 'asr'
+        assert prepare[prepare.index('--rename-variants') + 1] == '2'
+        assert prepare[prepare.index('--distractor-probability') + 1] == '0.5'
+        assert prepare[prepare.index('--heldout-apps') + 1] == 'auto'
+        assert prepare[prepare.index('--tokenizer') + 1] == str(base.resolve())
+        assert prepare[prepare.index('--max-length') + 1] == '16384'
         assert '--asr-transcript-ratio' not in observed[1][0]
         assert '--eval-clean-transcripts' not in prepare
         assert '--eval-clean-transcripts' in observed[1][0]

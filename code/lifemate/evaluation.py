@@ -17,9 +17,12 @@ from .sft import VALIDATION_ROLLOUT_POLICY, file_sha256, validate_prompt_policy
 
 
 class StateToolEvaluator:
-    def __init__(self, sft_dir, manifest, *, require_clean_transcripts=False):
+    def __init__(self, sft_dir, manifest, *, require_clean_transcripts=False, partition='validation'):
+        if partition not in {'validation', 'app_heldout'}:
+            raise ValueError('Unknown rollout partition')
+        self.partition = partition
         validate_prompt_policy(manifest)
-        info = manifest.get("validation_rollouts")
+        info = manifest.get(f'{partition}_rollouts')
         if not info:
             raise ValueError("Missing validation rollout data; rerun prepare_sft.py with the current code")
         if (info.get("policy") != VALIDATION_ROLLOUT_POLICY
@@ -30,7 +33,7 @@ class StateToolEvaluator:
             raise ValueError("Validation rollout data changed after preparation")
         self.rows = [json.loads(line) for line in path.read_text(encoding="utf-8").splitlines() if line.strip()]
         ids = [r["item"]["id"] for r in self.rows]
-        valid = manifest["partitions"]["validation"]
+        valid = manifest["partitions"][partition]
         if (not ids or len(set(ids)) != len(ids) or set(ids) != set(valid["sample_ids"])
                 or set(ids) & set(manifest["partitions"]["train"]["sample_ids"])
                 or valid["skipped_samples"]):
@@ -56,6 +59,9 @@ class StateToolEvaluator:
         if file_sha256(catalog_path) != manifest["catalog_sha256"]:
             raise ValueError("TRAIN catalog changed after preparation")
         self.catalog = load_catalog(catalog_path)
+        if manifest.get('app_holdout', {}).get('status') == 'enabled':
+            from .data_generalization import validate_split_manifest
+            validate_split_manifest(manifest, self.catalog)
         self.config = AgentConfig()
         from main import resolve_data_layout
         _, self.env_root, self.holder = resolve_data_layout(self.split_dir, "train")
@@ -129,6 +135,8 @@ class StateToolEvaluator:
                 "eval_rollout_samples": n, **diagnostics.metrics()}
         if transcript_source == "audio_text":
             metrics = {key.replace("eval_", "eval_clean_", 1): value for key, value in metrics.items()}
+        if self.partition == 'app_heldout':
+            metrics = {key.replace('eval_', 'eval_app_heldout_', 1): value for key, value in metrics.items()}
         summary_path = output_path.with_suffix(".diagnostics.json")
         summary_partial = summary_path.with_suffix(".partial.json")
         summary_partial.write_text(json.dumps({**diagnostics.as_dict(), "metrics": metrics,
@@ -178,7 +186,7 @@ def _rollout_inference_mode(model, tokenizer, fast_language_model):
 
 
 def score_callback(evaluator, tokenizer, output_dir, fast_language_model=None, *, eval_clean_transcripts=False,
-                   eval_prefix_cache="auto", eval_prompt_cache="auto"):
+                   eval_prefix_cache="auto", eval_prompt_cache="auto", app_evaluator=None):
     # Called only after Unsloth has been imported/patched by the training entrypoint.
     from transformers import TrainerCallback
     from .models import LocalLLM
@@ -205,11 +213,21 @@ def score_callback(evaluator, tokenizer, output_dir, fast_language_model=None, *
                 llm = LocalLLM.from_loaded_model(model, tokenizer,
                     prefix_cache=eval_prefix_cache, prompt_cache=eval_prompt_cache)
                 try:
-                    result = evaluator.evaluate(llm, path)
-                    llm.end_sample()
+                    def view(ev, target, source=None):
+                        try:
+                            return ev.evaluate(llm, target, **({'transcript_source': source} if source else {}))
+                        finally:
+                            llm.end_sample()
+                    result = view(evaluator, path)
                     if eval_clean_transcripts:
                         clean_path = path.with_name(path.stem + ".clean.jsonl")
-                        result.update(evaluator.evaluate(llm, clean_path, transcript_source="audio_text"))
+                        result.update(view(evaluator, clean_path, 'audio_text'))
+                    if app_evaluator is not None:
+                        app_path = path.with_name(path.stem + '.app-heldout.jsonl')
+                        result.update(view(app_evaluator, app_path))
+                        if eval_clean_transcripts:
+                            app_clean_path = path.with_name(path.stem + '.app-heldout.clean.jsonl')
+                            result.update(view(app_evaluator, app_clean_path, 'audio_text'))
                 finally:
                     llm.end_sample()
             metrics.update(result)
@@ -224,6 +242,14 @@ def score_callback(evaluator, tokenizer, output_dir, fast_language_model=None, *
                         "clean_diagnostics": str(clean_path.with_suffix(".diagnostics.json")),
                         "clean_trace": str(clean_path.with_suffix(".trace.jsonl"))}
                        if eval_clean_transcripts else {}),
+                    **({'app_heldout_rollouts': str(app_path),
+                        'app_heldout_diagnostics': str(app_path.with_suffix('.diagnostics.json')),
+                        'app_heldout_trace': str(app_path.with_suffix('.trace.jsonl'))}
+                       if app_evaluator is not None else {}),
+                    **({'app_heldout_clean_rollouts': str(app_clean_path),
+                        'app_heldout_clean_diagnostics': str(app_clean_path.with_suffix('.diagnostics.json')),
+                        'app_heldout_clean_trace': str(app_clean_path.with_suffix('.trace.jsonl'))}
+                       if app_evaluator is not None and eval_clean_transcripts else {}),
                     **result}) + "\n")
             logging.info("Validation state/tool score: %.4f/100", result["eval_state_tool_score"])
             return control

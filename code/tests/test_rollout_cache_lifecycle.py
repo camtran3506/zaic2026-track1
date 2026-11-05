@@ -1,6 +1,7 @@
 """Cache isolation across rollout views, optimizer updates and training failures."""
 from copy import deepcopy
 from functools import wraps
+import json
 import random
 from types import SimpleNamespace
 
@@ -18,7 +19,7 @@ from test_prefix_cache import tiny_model
 from test_prompt_session import bpe_tokenizer
 
 
-@pytest.mark.parametrize('failure', [None, 'asr', 'clean', 'training_switch'])
+@pytest.mark.parametrize('failure', [None, 'asr', 'clean', 'app_asr', 'app_clean', 'training_switch'])
 @pytest.mark.parametrize('mode', ['auto', 'off'])
 def test_callback_cache_modes_cleanup_and_all_training_state_restored(tmp_path, bpe_tokenizer, failure, mode):
     tok = bpe_tokenizer
@@ -30,7 +31,7 @@ def test_callback_cache_modes_cleanup_and_all_training_state_restored(tmp_path, 
     py_rng, np_rng, torch_rng = random.getstate(), np.random.get_state(), torch.get_rng_state().clone()
     def consume_rng():
         random.random(); np.random.rand(); torch.rand(1)
-    def evaluate(llm, path, *, transcript_source='asr'):
+    def evaluate(llm, path, *, transcript_source='asr', app=False):
         assert not model.training and model.config.use_cache and model.config.text_config.use_cache
         assert llm.prefix_cache.mode == mode and llm.prompt_cache_mode == mode
         assert llm.prefix_cache.snapshot is None
@@ -38,9 +39,13 @@ def test_callback_cache_modes_cleanup_and_all_training_state_restored(tmp_path, 
         llm.prefix_cache.snapshot = object()  # Even a custom evaluator retaining a cache must be cleaned up.
         tok.padding_side = tok.truncation_side = 'left'
         consume_rng()
-        if failure == ('asr' if transcript_source == 'asr' else 'clean'):
+        view = ('app_' if app else '') + ('asr' if transcript_source == 'asr' else 'clean')
+        if failure == view:
             raise RuntimeError('evaluation failed')
-        return {'eval_state_tool_score' if transcript_source == 'asr' else 'eval_clean_state_tool_score': 75}
+        prefix = 'eval_app_heldout_' if app else 'eval_'
+        if transcript_source == 'audio_text':
+            prefix += 'clean_'
+        return {prefix+'state_tool_score': 98 if app else 75}
     def for_inference(model):
         switches.append('inference'); consume_rng()
     def for_training(model):
@@ -51,13 +56,20 @@ def test_callback_cache_modes_cleanup_and_all_training_state_restored(tmp_path, 
             raise RuntimeError('switch failed')
     fast = SimpleNamespace(for_inference=for_inference, for_training=for_training)
     callback = score_callback(SimpleNamespace(evaluate=evaluate), tok, tmp_path, fast,
-                              eval_clean_transcripts=True, eval_prefix_cache=mode, eval_prompt_cache=mode)
+        eval_clean_transcripts=True, eval_prefix_cache=mode, eval_prompt_cache=mode,
+        app_evaluator=SimpleNamespace(evaluate=lambda *a, **kw: evaluate(*a, **kw, app=True)))
     args = (None, TrainerState(global_step=1), TrainerControl())
     if failure:
         with pytest.raises(RuntimeError):
             callback.on_evaluate(*args, model=model, metrics={})
     else:
-        callback.on_evaluate(*args, model=model, metrics={})
+        metrics = {}
+        callback.on_evaluate(*args, model=model, metrics=metrics)
+        assert metrics['eval_state_tool_score'] == metrics['eval_clean_state_tool_score'] == 75
+        assert metrics['eval_app_heldout_state_tool_score'] == metrics['eval_app_heldout_clean_state_tool_score'] == 98
+        assert len(seen) == 4
+        logged = json.loads((tmp_path/'validation_scores.jsonl').read_text())
+        assert logged['app_heldout_clean_rollouts'].endswith('.app-heldout.clean.jsonl')
     assert model.training and not model.config.use_cache and not model.config.text_config.use_cache
     assert tok.padding_side == tok.truncation_side == 'right'
     assert switches == ['inference', 'training']

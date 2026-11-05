@@ -63,13 +63,21 @@ def test_train_adapter_reload_and_merge(tmp_path, architecture):
     model.save_pretrained(base)
     data = tmp_path / 'data' / 'train'
     data.mkdir(parents=True)
-    (data / 'train_tools_catalog.json').write_text(json.dumps({'apps': [{'tools': [
-        {'name': 'home.read', 'kind': 'read', 'parameters': {'type': 'object', 'properties': {}}}]}]}))
-    (data / 'train.jsonl').write_text(''.join(json.dumps({
+    tools = [{'name': 'home.read', 'kind': 'read', 'parameters': {'type': 'object', 'properties': {}}}]
+    source_rows = [{
         'id': f'train_{i}', 'audio': f'train_{i}.wav', 'audio_text': 'Kiểm tra thiết bị',
         'context': {'installed_apps': {'home': {'tools': ['home.read']}}}, 'history': [],
         'label': {'tool_calls': [{'name': 'home.read', 'arguments': {}}]},
-    }) + '\n' for i in range(4)))
+    } for i in range(4)]
+    # Exercise the third partition through real training/reload on hybrid Qwen.
+    # The single-app Qwen3 fixture also verifies explicit unavailable reporting.
+    if architecture == 'qwen3_5':
+        tools.append({'name': 'library.read', 'kind': 'read', 'parameters': {'type': 'object', 'properties': {}}})
+        source_rows.append({'id': 'train_4', 'audio': 'train_4.wav', 'audio_text': 'Kiểm tra thư viện',
+            'context': {'installed_apps': {'library': {'tools': ['library.read']}}}, 'history': [],
+            'label': {'tool_calls': [{'name': 'library.read', 'arguments': {}}]}})
+    (data / 'train_tools_catalog.json').write_text(json.dumps({'apps': [{'tools': tools}]}))
+    (data / 'train.jsonl').write_text(''.join(json.dumps(row)+'\n' for row in source_rows))
     (data / 'zaic_tools.py').write_text('''class ToolEnv:
     def __init__(self, split, id, root):
         assert split == 'train'
@@ -85,7 +93,7 @@ def test_train_adapter_reload_and_merge(tmp_path, architecture):
     # downloads are needed to exercise ASR-only held-out checkpoint selection.
     import numpy as np
     import soundfile as sf
-    for i in range(4):
+    for i in range(len(source_rows)):
         sf.write(data / f'train_{i}.wav', np.zeros(1600, dtype=np.float32), 16000)
     asr = tmp_path / 'asr'
     asr.mkdir()
@@ -111,6 +119,7 @@ class OfflineRecognizer:
     result = subprocess.run([sys.executable, app / 'finetune.py', '--data-root', data.parent,
         '--base-model', base, '--output-dir', run, '--backend', 'transformers',
         '--asr-transcript-ratio', '0', '--asr-model', asr, '--eval-clean-transcripts',
+        '--heldout-apps', 'library' if architecture == 'qwen3_5' else 'auto',
         '--max-steps', '2', '--gradient-accumulation', '1', '--save-steps', '1',
         '--learning-rate', '0.01', '--export-merged'],
         env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
@@ -120,6 +129,10 @@ class OfflineRecognizer:
     assert config['max_length'] == 16384
     assert config['batch_size'] == 1
     assert config['eval_strategy'] == 'epoch'
+    prepared_manifest = json.loads((run/'sft/manifest.json').read_text())
+    assert prepared_manifest['training_augmentation']['rename_variants'] == 2
+    assert prepared_manifest['training_augmentation']['variants_kept'] == 6
+    assert prepared_manifest['app_holdout']['status'] == ('enabled' if architecture == 'qwen3_5' else 'unavailable')
     adapter = run / 'training' / 'adapter'
     assert (adapter / 'adapter_model.safetensors').is_file()
     runtime = json.loads((adapter / 'lifemate_runtime.json').read_text())
@@ -147,6 +160,8 @@ class OfflineRecognizer:
     assert config['selection_metric'] == 'eval_state_tool_score'
     assert config['selection_transcript_source'] == 'asr'
     assert metrics['eval_clean_rollout_samples'] == metrics['eval_rollout_samples']
+    if architecture == 'qwen3_5':
+        assert metrics['eval_app_heldout_rollout_samples'] == metrics['eval_app_heldout_clean_rollout_samples'] == 1
     rollouts = [json.loads(line) for line in (run / 'sft/validation_rollouts.jsonl').read_text().splitlines()]
     assert all(row['prepared_transcript']['transcript_source'] == 'asr' for row in rollouts)
     assert all(row['clean_prepared_transcript']['transcript_source'] == 'audio_text' for row in rollouts)
@@ -159,6 +174,9 @@ class OfflineRecognizer:
         assert attempt['selection_transcript_source'] == 'asr'
         assert Path(attempt['clean_rollouts']).is_file()
         assert Path(attempt['clean_trace']).is_file()
+        if architecture == 'qwen3_5':
+            assert Path(attempt['app_heldout_rollouts']).is_file()
+            assert Path(attempt['app_heldout_clean_trace']).is_file()
         trace_path = Path(attempt['trace'])
         assert trace_path.is_file()
         events = [json.loads(line) for line in trace_path.read_text().splitlines()]

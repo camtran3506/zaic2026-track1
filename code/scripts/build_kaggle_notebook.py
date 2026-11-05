@@ -42,6 +42,11 @@ TRAIN_LLM = True
 TRAIN_BACKEND = "unsloth"  # backend mặc định; cần CUDA
 TRAIN_ASR_TRANSCRIPT_RATIO = 0.5  # 50% sample dùng audio_text, 50% dùng ASR; chọn theo SEED
 TRAIN_EVAL_CLEAN_TRANSCRIPTS = False  # True: eval thêm text gốc; checkpoint luôn chọn bằng ASR
+TRAIN_RENAME_VARIANTS = 2  # giữ mẫu gốc + tối đa 2 biến thể đổi tên app/tool
+TRAIN_DISTRACTOR_PROBABILITY = 0.5  # thêm 1-3 app khác nhóm vào biến thể nếu có ứng viên
+TRAIN_HELDOUT_APPS = "auto"  # một app chưa xuất hiện trong train; hoặc CSV app IDs / "none"
+TRAIN_HELDOUT_GROUPS = ""  # CSV nhóm chức năng, ví dụ "learning"; tắt chọn app auto
+TRAIN_APP_GROUPS_FILE = None  # JSON group -> app IDs trong TRAIN catalog, nếu muốn tùy chỉnh
 TRAIN_MISSING_TOOL_POLICY = "error"  # toàn bộ schema được giữ; lỗi schema không mặc định bỏ mẫu
 TRAIN_DATA_ROOT = None  # None: tự tìm train/train.jsonl trong /kaggle/input
 LOCAL_ADAPTER = None   # TRAIN_LLM=False + đường dẫn adapter để dùng bản đã train
@@ -222,10 +227,10 @@ for rel in ['lifemate/__init__.py', 'lifemate/catalog.py', 'lifemate/models.py',
             'lifemate/local_time.py', 'lifemate/temporal_training.py',
             'lifemate/itn.py', 'lifemate/local_helpers.py', 'lifemate/local_knowledge.py', 'lifemate/local_checks.py',
             'lifemate/execution_policy.py', 'lifemate/tool_execution.py', 'lifemate/specialist_training.py',
-            'main.py', 'score_train.py', 'lifemate/sft.py', 'prepare_sft.py', 'train_lora.py',
+            'main.py', 'score_train.py', 'lifemate/sft.py', 'lifemate/data_generalization.py', 'prepare_sft.py', 'train_lora.py',
             'merge_lora.py', 'finetune.py', 'tests/test_baseline.py', 'tests/test_sft.py',
             'tests/test_finetune_integration.py', 'tests/test_audio.py', 'tests/test_catalog.py',
-            'tests/test_staged_pipeline.py', 'tests/test_decoding.py', 'tests/test_stopping_filters.py', 'tests/test_scoring.py', 'tests/test_evaluation.py', 'tests/test_rollout_cache_lifecycle.py',
+            'tests/test_staged_pipeline.py', 'tests/test_decoding.py', 'tests/test_stopping_filters.py', 'tests/test_scoring.py', 'tests/test_evaluation.py', 'tests/test_data_generalization.py', 'tests/test_rollout_cache_lifecycle.py',
             'tests/test_transcript_normalization.py', 'tests/test_text.py', 'tests/test_runtime_parity.py', 'tests/test_runtime_config.py',
             'tests/test_native_function_calling.py', 'tests/test_prefix_cache.py', 'tests/test_prompt_session.py', 'tests/test_transcript_mixing.py', 'tests/test_eval_diagnostics.py', 'tests/test_eval_trace.py',
             'tests/test_tool_validation.py',
@@ -359,7 +364,9 @@ print("ASR process has exited; LLM will read and verify cache before loading wei
 
 md('''## 6. Fine-tune tool calling trên TRAIN (LoRA/QLoRA)
 
-Mặc định `TRAIN_LLM=True`, `TRAIN_ASR_TRANSCRIPT_RATIO=0.5`: chia train/validation theo sample ID trước, rồi trộn 50% sample dùng audio_text và 50% dùng ASR trong mỗi phần (số mẫu lẻ lệch tối đa một). SEED quyết định việc chọn nguồn cho loss SFT; mọi bước SFT của một sample dùng cùng transcript. Rollout chọn checkpoint luôn dùng transcript ASR cho toàn bộ held-out, độc lập với nguồn SFT. Dù TRAIN_ASR_TRANSCRIPT_RATIO=0 vẫn cần ASR cho eval. ASR không tự quay về audio_text khi lỗi; nguồn và số lượng được ghi trong manifest. Transcript của cả hai nguồn và text của mọi lượt history được chuẩn hóa chung: NFC, lowercase, gộp khoảng trắng, viết hoa chữ cái đầu lượt, thêm dấu chấm nếu chưa có dấu kết câu. History giữ đầy đủ theo resolver chung. Sau đó huấn luyện LoRA/QLoRA, rồi tự chuyển sang **base model + adapter vừa train** cho task chính. Nhãn phải là `label.tool_calls` theo thứ tự thực thi. Replay dùng `ToolEnv` thật của train; kết quả tool trước được đưa vào prompt bước sau. Chỉ tính loss trên assistant JSON, split theo sample ID trước khi tạo các bước, không đọc nhãn test.
+Mặc định `TRAIN_LLM=True`, `TRAIN_ASR_TRANSCRIPT_RATIO=0.5`: chia train/validation theo sample ID trước, rồi phân bổ sample dùng audio_text và ASR theo tỉ lệ 50:50, có làm tròn theo số mẫu. SEED quyết định việc chọn nguồn cho loss SFT; mọi bước SFT của một sample dùng cùng transcript. Rollout chọn checkpoint luôn dùng transcript ASR cho toàn bộ held-out, độc lập với nguồn SFT. Dù TRAIN_ASR_TRANSCRIPT_RATIO=0 vẫn cần ASR cho eval. ASR không tự quay về audio_text khi lỗi; nguồn và số lượng được ghi trong manifest. Transcript của cả hai nguồn và text của mọi lượt history được chuẩn hóa chung: NFC, lowercase, gộp khoảng trắng, viết hoa chữ cái đầu lượt, thêm dấu chấm nếu chưa có dấu kết câu. History giữ đầy đủ theo resolver chung. Sau đó huấn luyện LoRA/QLoRA, rồi tự chuyển sang **base model + adapter vừa train** cho task chính. Nhãn phải là `label.tool_calls` theo thứ tự thực thi. Replay dùng `ToolEnv` thật của train; kết quả tool trước được đưa vào prompt bước sau. Chỉ tính loss trên assistant JSON, split theo sample ID trước khi tạo các bước, không đọc nhãn test.
+
+Mặc định `TRAIN_HELDOUT_APPS="auto"` giữ riêng mọi sample có tiếp xúc với một app, nhắm khoảng 10% source IDs; schema app đã cài nhưng không dùng và tham chiếu trong history cũng tính là tiếp xúc. Phần còn lại mới chia train/validation 90:10. Có thể chọn app IDs hoặc `TRAIN_HELDOUT_GROUPS`; dataset không thể tách app sẽ ghi rõ unavailable. App-held-out chỉ báo cáo `eval_app_heldout_*` (và clean nếu bật), không chọn checkpoint. Chỉ TRAIN được bổ sung tối đa `TRAIN_RENAME_VARIANTS=2` biến thể đổi tên app/tool nhất quán; với xác suất `TRAIN_DISTRACTOR_PROBABILITY=0.5` mỗi biến thể thêm 1–3 app khác nhóm từ TRAIN, loại app held-out. Không đổi tên tham số, ID, văn bản hay giá trị arguments; giữ tên helper/sys. Demo local_entity/local_context phụ thuộc tên app chỉ giữ ở bản gốc. Biến thể vượt token budget bị bỏ toàn bộ, không cắt nội dung. Canonical gold chỉ replay một lần mỗi sample, aliases không gọi ToolEnv. Số bước SFT có thể tăng gần 3 lần; app-held-out thêm chi phí eval. Manifest lưu cấu hình, exposure, partitions và thống kê biến thể.
 
 `tool_schemas` giữ toàn bộ schema của mọi tool được phép ngay từ bước đầu, gồm đầy đủ description, returns và metadata. History và mọi kết quả tool được giữ nguyên, không giới hạn lượt/ký tự hoặc giảm theo độ dài prompt. SFT tạo trực tiếp action call/done. Mọi schema đều có sẵn; local_schema.inspect chỉ kiểm tra arguments và góp ý, không mở khóa tool. Vượt giới hạn token sẽ báo lỗi, không tự cắt dữ liệu. Cần tạo lại SFT cũ trong thư mục mới; manifest phải có `prompt_policy=full-context-python-automatic-guards-v9`. Mặc định `TRAIN_MISSING_TOOL_POLICY="error"`, không tự bỏ mẫu lỗi schema.
 
@@ -383,6 +390,10 @@ if TRAIN_LLM:
         "--backend", TRAIN_BACKEND,
         "--validation-fraction", str(TRAIN_VALIDATION_FRACTION),
         "--asr-transcript-ratio", str(TRAIN_ASR_TRANSCRIPT_RATIO),
+        "--rename-variants", str(TRAIN_RENAME_VARIANTS),
+        "--distractor-probability", str(TRAIN_DISTRACTOR_PROBABILITY),
+        "--heldout-apps", TRAIN_HELDOUT_APPS,
+        "--heldout-groups", TRAIN_HELDOUT_GROUPS,
         "--seed", str(SEED),
         "--missing-tool-policy", TRAIN_MISSING_TOOL_POLICY,
         "--epochs", str(TRAIN_EPOCHS), "--max-steps", str(TRAIN_MAX_STEPS),
@@ -394,6 +405,8 @@ if TRAIN_LLM:
                           "--asr-precision", ASR_PRECISION, "--asr-threads", str(ASR_THREADS)])
     if TRAIN_EVAL_CLEAN_TRANSCRIPTS:
         train_command.append("--eval-clean-transcripts")
+    if TRAIN_APP_GROUPS_FILE:
+        train_command.extend(["--app-groups-file", TRAIN_APP_GROUPS_FILE])
     try:
         run_logged(train_command, OUT / "training_pipeline.log", cwd=APP, env=FT_ENV)
     finally:
@@ -401,7 +414,7 @@ if TRAIN_LLM:
             for filename in ("prepare_sft.log", "train_lora.log", "base_model.json",
                              "training/training_config.json", "training/eval_results.json",
                              "training/train_results.json", "training/trainer_state.json", "training/validation_scores.jsonl", "sft/manifest.json",
-                             "sft/train_skipped.jsonl", "sft/validation_skipped.jsonl"):
+                             "sft/train_skipped.jsonl", "sft/validation_skipped.jsonl", "sft/app_heldout_skipped.jsonl"):
                 path = FT_RUN / filename
                 if path.is_file():
                     shutil.copy2(path, OUT / ("training_" + filename.replace("/", "_")))
