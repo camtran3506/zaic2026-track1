@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 import json
 import logging
+from pathlib import Path
 from types import MethodType
 
 
@@ -151,6 +152,31 @@ class PrefixCache:
             if not layers or any(getattr(m.forward, "__func__", None) is not Qwen3_5GatedDeltaNet.forward for m in layers):
                 self.disable("linear-attention forward is absent or patched by another runtime")
                 return False
+            # Unsloth may replace a class method globally (including wrapped
+            # text/decoder forwards) while keeping the same class identity.
+            # Check every wrapper in each Qwen forward, not just __wrapped__'s
+            # final function; external patches require their own parity tests.
+            trusted_root = Path(transformers.__file__).resolve().parent
+            import torch
+            context_decorator = Path(torch.__file__).resolve().parent / "utils/_contextlib.py"
+            for module in base.modules():
+                if not type(module).__module__.startswith("transformers.models.qwen3_5."):
+                    continue
+                fn = getattr(module.forward, "__func__", None)
+                if fn is None:
+                    self.disable("Qwen forward is patched by an unverified runtime")
+                    return False
+                while fn is not None:
+                    code = getattr(fn, "__code__", None)
+                    source = Path(code.co_filename).resolve() if code is not None else None
+                    torch_context = source == context_decorator and hasattr(fn, "__wrapped__")
+                    if source is None or not (source.is_relative_to(trusted_root) or torch_context):
+                        self.disable("Qwen forward is patched by an unverified runtime")
+                        return False
+                    fn = getattr(fn, "__wrapped__", None)
+                if getattr(module, "_compiled_call_impl", None) is not None:
+                    self.disable("compiled Qwen forward is not verified for prefix continuation")
+                    return False
             self._layers = layers
         return True
 

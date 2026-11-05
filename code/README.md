@@ -754,9 +754,9 @@ uses additional VRAM; single-step requests may not benefit. Tests cover real tin
 Qwen3.5 FP32/BF16 logits and greedy generation, including nonzero LoRA adapters,
 but throughput/VRAM with the full 4B model and optional GPU kernels must be measured
 on the target GPU. No prompt, SFT target, adapter manifest or dependency pin is
-changed. Training and the live-model validation callback retain the original
-full-prefill path; `LocalLLM.from_loaded_model(..., prefix_cache="auto")` is an
-explicit opt-in for compatible, unpatched evaluation models.
+changed. Generic `LocalLLM.from_loaded_model` callers retain the original
+full-prefill path unless they opt in; the validation callback explicitly requests
+cache auto modes, as described below.
 
 CPU prompt preparation separately defaults to `--prompt-cache auto`. One
 `InferenceSession` per sample normalizes/freezes the request, context, history,
@@ -784,12 +784,32 @@ Use `--prompt-cache off` to disable CPU session preparation independently of
 `--prefix-cache off`; pass both for the original baseline. Diagnostic JSONL adds
 `prompt_cache` preparation/render/reused-token counts and fallback reasons. No
 prompt contents, loss masks, gold targets, tool execution rules or dependency
-versions change. Live training/evaluation wrappers default to both caches off;
-compatible callers can explicitly opt into `prompt_cache="auto"`. CPU preparation
+versions change. Generic live-model wrappers default to both caches off;
+the rollout callback explicitly enables them. CPU preparation
 tests compare every token with full rendering using merged BPE, Unicode, tool
 history, helper results, validation/read-cache feedback, repeated writes and
 changed/removed observations. Speed on a full GPU pipeline still needs a target
 machine measurement; the first-step verification has a CPU warm-up cost.
+
+Validation agent rollouts during fine-tuning default to `--eval-prefix-cache auto`
+and `--eval-prompt-cache auto` (also forwarded by `finetune.py`). A fresh wrapper is
+created for each callback using the current weights. Per-sample caches are cleared
+by the agent, and the callback also clears snapshots between ASR/clean views and
+before switching back to training, including after failures. Root/text `use_cache`,
+training mode, tokenizer sides and Python/NumPy/Torch RNG states are restored. SFT
+forward/backward keeps its original cache setting; the speedup targets validation
+rollouts, not optimizer steps. Cache modes are recorded in `training_config.json`.
+
+GPU prefix reuse requires verified Qwen3.5 Transformers 5.4.0 forwards. The guard
+checks instance and global class patches and the full decorator chain on Qwen
+modules. An unverified Unsloth/compiled forward uses the existing full-prefill
+generation path while CPU prompt preparation can still run. This is an auto
+request, not a claim that every Unsloth version supports hybrid snapshots. Use
+`--eval-prefix-cache off --eval-prompt-cache off` for the old rollout path. No
+sample/gold selection or checkpoint selection metric changes. Tests exercise
+fresh nonzero LoRA states across optimizer updates, post-rollout backward,
+ASR/clean cleanup and exception/RNG restoration; full-size Unsloth/GPU throughput
+still requires measurement on the training machine.
 
 Unavailable/schema-invalid gold labels still fail with the sample ID. Training
 transcripts and ASR weights for held-out evaluation are required at every mix ratio. No

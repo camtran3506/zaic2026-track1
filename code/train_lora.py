@@ -36,6 +36,10 @@ def main():
                    help="Run full held-out agent rollouts and save candidates each epoch, or every --save-steps")
     p.add_argument("--eval-clean-transcripts", action="store_true",
                    help="Also run independent clean-text diagnostics on the same held-out IDs; checkpoint selection always uses ASR")
+    p.add_argument("--eval-prefix-cache", choices=["auto", "off"], default="auto",
+                   help="Reuse rollout prefix snapshots on verified runtimes; patched/unsupported forwards use full prefill")
+    p.add_argument("--eval-prompt-cache", choices=["auto", "off"], default="auto",
+                   help="Prepare fixed rollout prompts once per sample, independently of GPU prefix caching")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--resume-from-checkpoint", type=Path)
     args = p.parse_args()
@@ -169,7 +173,9 @@ def main():
         train_dataset=data["train"], eval_dataset=data["validation"],
         data_collator=AssistantCollator(tokenizer.pad_token_id),
         callbacks=[score_callback(evaluator, tokenizer, args.output_dir, FastLanguageModel,
-                                  eval_clean_transcripts=args.eval_clean_transcripts),
+                                  eval_clean_transcripts=args.eval_clean_transcripts,
+                                  eval_prefix_cache=args.eval_prefix_cache,
+                                  eval_prompt_cache=args.eval_prompt_cache),
                    runtime_save_callback(runtime)])
     try:
         train_result = trainer.train(resume_from_checkpoint=str(args.resume_from_checkpoint) if args.resume_from_checkpoint else None)

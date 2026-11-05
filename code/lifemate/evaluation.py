@@ -1,5 +1,6 @@
 """Held-out TRAIN agent rollouts; no reads of application environment files."""
 import copy
+from contextlib import contextmanager
 import importlib
 import json
 import logging
@@ -140,7 +141,44 @@ class StateToolEvaluator:
         return metrics
 
 
-def score_callback(evaluator, tokenizer, output_dir, fast_language_model=None, *, eval_clean_transcripts=False):
+@contextmanager
+def _rollout_inference_mode(model, tokenizer, fast_language_model):
+    """Restore training/config/RNG state even if rollout or mode switching fails."""
+    import numpy as np
+    import torch
+    was_training = model.training
+    configs = [model.config]
+    text_config = getattr(model.config, "text_config", None)
+    if text_config is not None and text_config is not model.config:
+        configs.append(text_config)
+    cache_settings = [(cfg, cfg.use_cache) for cfg in configs if hasattr(cfg, "use_cache")]
+    sides = tokenizer.padding_side, tokenizer.truncation_side
+    py_rng, np_rng = random.getstate(), np.random.get_state()
+    device = model.get_input_embeddings().weight.device
+    devices = [device.index] if device.type == "cuda" else []
+    with torch.random.fork_rng(devices=devices):
+        try:
+            if fast_language_model is not None:
+                fast_language_model.for_inference(model)
+            model.eval()
+            for cfg, _ in cache_settings:
+                cfg.use_cache = True
+            yield
+        finally:
+            try:
+                if fast_language_model is not None:
+                    fast_language_model.for_training(model)
+            finally:
+                model.train(was_training)
+                for cfg, value in cache_settings:
+                    cfg.use_cache = value
+                tokenizer.padding_side, tokenizer.truncation_side = sides
+                random.setstate(py_rng)
+                np.random.set_state(np_rng)
+
+
+def score_callback(evaluator, tokenizer, output_dir, fast_language_model=None, *, eval_clean_transcripts=False,
+                   eval_prefix_cache="auto", eval_prompt_cache="auto"):
     # Called only after Unsloth has been imported/patched by the training entrypoint.
     from transformers import TrainerCallback
     from .models import LocalLLM
@@ -153,13 +191,6 @@ def score_callback(evaluator, tokenizer, output_dir, fast_language_model=None, *
             return control
 
         def on_evaluate(self, args, state, control, model=None, metrics=None, **kwargs):
-            import numpy as np
-            import torch
-            was_training, use_cache = model.training, model.config.use_cache
-            padding_side, truncation_side = tokenizer.padding_side, tokenizer.truncation_side
-            py_rng, np_rng = random.getstate(), np.random.get_state()
-            device = model.get_input_embeddings().weight.device
-            devices = [device.index] if device.type == "cuda" else []
             # Keep all evaluation attempts (including re-evaluation of the loaded best model).
             folder = output_dir / "validation_rollouts"
             folder.mkdir(exist_ok=True)
@@ -168,25 +199,19 @@ def score_callback(evaluator, tokenizer, output_dir, fast_language_model=None, *
                                              dir=folder, delete=False) as tmp:
                 path = Path(tmp.name)
             path.unlink()  # Only a fully completed evaluation promotes a final JSONL.
-            try:
-                with torch.random.fork_rng(devices=devices):
-                    if fast_language_model is not None:
-                        fast_language_model.for_inference(model)
-                    model.eval()
-                    model.config.use_cache = True
-                    llm = LocalLLM.from_loaded_model(model, tokenizer)
+            with _rollout_inference_mode(model, tokenizer, fast_language_model):
+                # Fresh wrapper after each weight update. No snapshot may cross
+                # checkpoints, transcript views, or the return to backward().
+                llm = LocalLLM.from_loaded_model(model, tokenizer,
+                    prefix_cache=eval_prefix_cache, prompt_cache=eval_prompt_cache)
+                try:
                     result = evaluator.evaluate(llm, path)
+                    llm.end_sample()
                     if eval_clean_transcripts:
                         clean_path = path.with_name(path.stem + ".clean.jsonl")
                         result.update(evaluator.evaluate(llm, clean_path, transcript_source="audio_text"))
-            finally:
-                if fast_language_model is not None:
-                    fast_language_model.for_training(model)
-                model.train(was_training)
-                model.config.use_cache = use_cache
-                tokenizer.padding_side, tokenizer.truncation_side = padding_side, truncation_side
-                random.setstate(py_rng)
-                np.random.set_state(np_rng)
+                finally:
+                    llm.end_sample()
             metrics.update(result)
             if state.log_history and state.log_history[-1].get("step") == state.global_step:
                 state.log_history[-1].update(result)
