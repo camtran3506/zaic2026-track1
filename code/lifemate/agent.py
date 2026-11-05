@@ -174,6 +174,22 @@ class LifeMateAgent:
     def run(self, item: dict, env: Any, split_dir: Path, split: str,
             prepared_transcript: dict | None = None, *, trace=None) -> dict:
         """env is created exactly once by caller; never instantiate another here."""
+        begin = getattr(self.llm, "begin_sample", None)
+        end = getattr(self.llm, "end_sample", None)
+        if callable(begin):
+            begin()
+        try:
+            report = self._run(item, env, split_dir, split, prepared_transcript, trace=trace)
+            stats = getattr(self.llm, "prefix_cache_stats", None)
+            if callable(stats):
+                report["prefix_cache"] = stats()
+            return report
+        finally:
+            if callable(end):
+                end()
+
+    def _run(self, item: dict, env: Any, split_dir: Path, split: str,
+             prepared_transcript: dict | None = None, *, trace=None) -> dict:
         t0 = time.monotonic()
         step = 0
         def emit(event, **data):

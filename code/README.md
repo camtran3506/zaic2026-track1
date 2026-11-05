@@ -701,6 +701,37 @@ have been removed; legacy outputs requesting it are invalid proposals and consum
 `max_invalid`, never executing a tool. `--max-tool-details` and the notebook's
 `MAX_TOOL_DETAILS` setting have also been removed.
 
+Standalone inference defaults to `--prefix-cache auto`. On the pinned
+Transformers 5.4.0 Qwen3.5 text-only runtime, it snapshots the closed native-chat
+prefix (system/tools, history and current request) on the first step of each
+sample. Later steps clone that snapshot and prefill only the suffix. The complete
+prompt is still rendered, tokenized and checked against the token budget; reuse
+requires an **exact token-prefix match**, not a character or semantic match.
+Results, helper calls and rejection feedback remain in the suffix, so removing a
+rejected proposal does not leave stale recurrent state in the next request.
+
+The snapshot includes attention K/V, convolution and recurrent tensors, with
+device-preserving copies before every use. A scoped, instance-local compatibility
+shim extends the existing 5.4.0 linear-attention kernels with the previous conv and
+recurrent states for multi-token suffixes; unmodified HF 5.4.0 only handles cached
+single-token continuation correctly. Single-token decode/fresh prefill retain the
+original HF forward, and the shim is removed even after errors. Snapshots are
+released at sample boundaries, including failed samples. Other Transformers
+versions, models, or patched linear-attention forwards use full prefill; a cache
+failure disables caching and retries the generation with the original full prompt.
+This does not retry or alter any executed ToolEnv call.
+
+Use `bash run_server.sh --prefix-cache off ...` for a baseline comparison. With
+`--log-path /path/to/diagnostics.jsonl`, each sample reports `prefix_cache` hits,
+misses, reused-token counts and fallback reasons. The extra persistent snapshot
+uses additional VRAM; single-step requests may not benefit. Tests cover real tiny
+Qwen3.5 FP32/BF16 logits and greedy generation, including nonzero LoRA adapters,
+but throughput/VRAM with the full 4B model and optional GPU kernels must be measured
+on the target GPU. No prompt, SFT target, adapter manifest or dependency pin is
+changed. Training and the live-model validation callback retain the original
+full-prefill path; `LocalLLM.from_loaded_model(..., prefix_cache="auto")` is an
+explicit opt-in for compatible, unpatched evaluation models.
+
 Unavailable/schema-invalid gold labels still fail with the sample ID. Training
 transcripts and ASR weights for held-out evaluation are required at every mix ratio. No
 synthetic tool results or gold arguments are inserted into earlier prompts. Loss

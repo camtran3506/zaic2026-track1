@@ -46,6 +46,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--llm-max-memory-gib", type=float, default=6,
                    help="Weight budget per GPU for balanced sharding (reserve activation/KV memory)")
     p.add_argument("--llm-adapter", type=Path, default=None, help="Optional local fine-tuned LoRA adapter")
+    p.add_argument("--prefix-cache", choices=["auto", "off"], default="auto",
+                   help="Reuse an exact native-chat prefix per sample on verified runtimes; off for A/B checks")
     p.add_argument("--output", type=Path, default=Path("result/submission.jsonl"))
     p.add_argument("--log-path", type=Path, default=None, help="Optional diagnostic JSONL, never submitted")
     p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
@@ -143,7 +145,8 @@ def run_llm_stage(args, items, transcript_rows, split_dir, env_root):
     llm = LocalLLM(args.llm_model, device=args.device, dtype=args.llm_dtype,
                    max_input_tokens=args.max_input_tokens, max_new_tokens=args.max_new_tokens,
                    adapter_path=args.llm_adapter, device_map=args.llm_device_map,
-                   max_memory_gib=args.llm_max_memory_gib, seed=args.seed)
+                   max_memory_gib=args.llm_max_memory_gib, seed=args.seed,
+                   prefix_cache=args.prefix_cache)
     cfg = AgentConfig(max_calls=args.max_calls, max_invalid=args.max_invalid,
                       sample_seconds=args.sample_seconds,
                       use_train_transcript=args.use_train_transcript)

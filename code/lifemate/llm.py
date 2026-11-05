@@ -42,10 +42,10 @@ def chat_token_ids(tokenizer, messages, add_generation_prompt):
     return encoded["input_ids"] if hasattr(encoded, "keys") else encoded
 
 
-def render_prompt(tokenizer, messages):
+def render_prompt(tokenizer, messages, *, add_generation_prompt=True):
     """Portable prompt text and exact input IDs for any inference engine."""
     messages, kwargs = template_inputs(tokenizer, messages)
-    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=True, **kwargs)
+    text = tokenizer.apply_chat_template(messages, tokenize=False, add_generation_prompt=add_generation_prompt, **kwargs)
     ids = tokenizer(text, add_special_tokens=False, truncation=False,
                     return_token_type_ids=False)["input_ids"]
     return text, ids

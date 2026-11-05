@@ -7,6 +7,7 @@ from pathlib import Path
 from .context import DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_NEW_TOKENS, validate_inference_budget
 from .asr import LocalASR
 from .llm import model_loader, configure_tokenizer, render_prompt
+from .prefix_cache import PrefixCache, stable_prefix_ids
 from .runtime import (DEFAULT_LLM_DTYPE, DEFAULT_SEED, generation_policy,
                       load_runtime_manifest, select_tokenizer_path, generation_context)
 
@@ -15,8 +16,10 @@ class LocalLLM:
     def __init__(self, model_path: Path, device: str = "cuda", dtype: str = DEFAULT_LLM_DTYPE,
                  max_input_tokens: int = DEFAULT_MAX_INPUT_TOKENS, max_new_tokens: int = DEFAULT_MAX_NEW_TOKENS,
                  adapter_path: Path | None = None, device_map: str = "single",
-                 max_memory_gib: float = 6, seed: int = DEFAULT_SEED):
+                 max_memory_gib: float = 6, seed: int = DEFAULT_SEED,
+                 prefix_cache: str = "auto"):
         validate_inference_budget(max_input_tokens, max_new_tokens)
+        self.prefix_cache = PrefixCache(prefix_cache)
         import torch
         from transformers import AutoTokenizer
         if not model_path.is_dir():
@@ -77,18 +80,30 @@ class LocalLLM:
 
     @classmethod
     def from_loaded_model(cls, model, tokenizer, max_input_tokens=DEFAULT_MAX_INPUT_TOKENS,
-                          max_new_tokens=DEFAULT_MAX_NEW_TOKENS):
+                          max_new_tokens=DEFAULT_MAX_NEW_TOKENS, *, prefix_cache="off"):
         """Run identical agent decoding on current training weights without a second model."""
         validate_inference_budget(max_input_tokens, max_new_tokens)
         import torch
         obj = cls.__new__(cls)
         obj.torch, obj.model, obj.tokenizer = torch, model, tokenizer
+        # Training callbacks may patch forwards/change weights. Leave their
+        # existing rollout path intact unless explicitly requested by a caller.
+        obj.prefix_cache = PrefixCache(prefix_cache)
         obj.generation_policy = dict(getattr(model, "lifemate_generation_policy", None)
                                      or generation_policy(tokenizer))
         obj.generation_policy.update(max_input_tokens=max_input_tokens, max_new_tokens=max_new_tokens)
         obj.device = model.get_input_embeddings().weight.device
         obj.max_input_tokens, obj.max_new_tokens = max_input_tokens, max_new_tokens
         return obj
+
+    def begin_sample(self):
+        self.prefix_cache.begin_sample()
+
+    def end_sample(self):
+        self.prefix_cache.clear()
+
+    def prefix_cache_stats(self):
+        return self.prefix_cache.report()
 
     def generate(self, system: str, user: str) -> str:
         # Import lazily: Unsloth must be imported before Transformers during training.
@@ -108,10 +123,30 @@ class LocalLLM:
         stop = stopping_class(tokenizer, encoded["input_ids"].shape[1])
         with self.torch.inference_mode(), generation_context(
                 self.model, self.generation_policy, self.max_new_tokens) as config:
-            ids = self.model.generate(
-                **encoded, generation_config=config,
-                stopping_criteria=StoppingCriteriaList([stop]),
-            )
+            ids = None
+            if self.prefix_cache.eligible(self.model):
+                try:
+                    prefix = stable_prefix_ids(tokenizer, messages, token_ids, memo=self.prefix_cache.prefix_memo)
+                    if prefix:
+                        with self.prefix_cache.restore(self.model, input_ids, prefix) as cached:
+                            ids = self.model.generate(
+                                **encoded, **cached, generation_config=config,
+                                stopping_criteria=StoppingCriteriaList([stop]))
+                    else:
+                        self.prefix_cache.clear()
+                except Exception as exc:
+                    # Nothing has reached ToolEnv. Retry this generation once
+                    # with the original full prompt and unpatched HF forwards.
+                    self.prefix_cache.stats["fallbacks"] += 1
+                    self.prefix_cache.disable(f"{type(exc).__name__}: {exc}")
+                    stop = stopping_class(tokenizer, input_ids.shape[1])
+                    cached = None
+                    if isinstance(exc, self.torch.OutOfMemoryError) and self.torch.cuda.is_available():
+                        self.torch.cuda.empty_cache()
+            if ids is None:
+                ids = self.model.generate(
+                    **encoded, generation_config=config,
+                    stopping_criteria=StoppingCriteriaList([stop]))
         completed = stop.completed_output if native else stop.completed_json
         if completed is not None:
             return completed

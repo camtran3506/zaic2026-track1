@@ -218,7 +218,7 @@ md('''## 3. Toàn bộ mã pipeline nhúng trong notebook
 
 Các cell dưới ghi mã vào `/kaggle/working/lifemate_app` để chạy trong subprocess, tách runtime tải model (online) khỏi suy luận (local-only). Logic baseline được giữ nguyên; không cần repository bên ngoài. Có cả mã fine-tune, bộ unit test và scorer train.''')
 for rel in ['lifemate/__init__.py', 'lifemate/catalog.py', 'lifemate/models.py', 'lifemate/agent.py', 'lifemate/transcripts.py', 'lifemate/decoding.py',
-            'lifemate/gpu.py', 'lifemate/context.py', 'lifemate/text.py', 'lifemate/function_calling.py', 'lifemate/asr.py', 'lifemate/llm.py', 'lifemate/runtime.py', 'lifemate/history.py', 'lifemate/scoring.py', 'lifemate/evaluation.py', 'lifemate/eval_diagnostics.py', 'lifemate/eval_trace.py',
+            'lifemate/gpu.py', 'lifemate/context.py', 'lifemate/text.py', 'lifemate/function_calling.py', 'lifemate/asr.py', 'lifemate/llm.py', 'lifemate/prefix_cache.py', 'lifemate/runtime.py', 'lifemate/history.py', 'lifemate/scoring.py', 'lifemate/evaluation.py', 'lifemate/eval_diagnostics.py', 'lifemate/eval_trace.py',
             'lifemate/local_time.py', 'lifemate/temporal_training.py',
             'lifemate/itn.py', 'lifemate/local_helpers.py', 'lifemate/local_knowledge.py', 'lifemate/local_checks.py',
             'lifemate/execution_policy.py', 'lifemate/tool_execution.py', 'lifemate/specialist_training.py',
@@ -227,7 +227,7 @@ for rel in ['lifemate/__init__.py', 'lifemate/catalog.py', 'lifemate/models.py',
             'tests/test_finetune_integration.py', 'tests/test_audio.py', 'tests/test_catalog.py',
             'tests/test_staged_pipeline.py', 'tests/test_decoding.py', 'tests/test_scoring.py', 'tests/test_evaluation.py',
             'tests/test_transcript_normalization.py', 'tests/test_text.py', 'tests/test_runtime_parity.py', 'tests/test_runtime_config.py',
-            'tests/test_native_function_calling.py', 'tests/test_transcript_mixing.py', 'tests/test_eval_diagnostics.py', 'tests/test_eval_trace.py',
+            'tests/test_native_function_calling.py', 'tests/test_prefix_cache.py', 'tests/test_transcript_mixing.py', 'tests/test_eval_diagnostics.py', 'tests/test_eval_trace.py',
             'tests/test_tool_validation.py',
             'tests/test_local_time.py', 'tests/test_local_time_runtime.py',
             'tests/test_local_tools_agent.py', 'tests/test_temporal_training.py', 'tests/test_local_time_evaluation.py',
