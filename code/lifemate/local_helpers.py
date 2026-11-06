@@ -3,7 +3,6 @@ from . import local_checks, local_knowledge, local_time
 from .batching import BATCH_TOOL, batch_schema
 
 LOCAL_HELPER_POLICY = "python-specialists-itn-v2"
-DEFAULT_MAX_LOCAL_CALLS = 8
 _PREFIXES = ("local_time.", "local_context.", "local_entity.", "local_text.",
              "local_checks.", "local_schema.", "local_batch.")
 

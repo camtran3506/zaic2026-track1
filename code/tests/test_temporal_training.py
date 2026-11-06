@@ -6,7 +6,7 @@ from pathlib import Path
 import pytest
 
 from lifemate.sft import replay_sample
-from lifemate.temporal_training import MAX_TRAINING_LOCAL_CALLS, helper_demonstrations
+from lifemate.temporal_training import helper_demonstrations
 
 
 CONTEXT = {"current_time": "2026-10-13T20:50:00+07:00", "timezone": "Asia/Ho_Chi_Minh"}
@@ -130,14 +130,16 @@ def test_unrelated_history_does_not_add_calendar_to_nontemporal_task():
                                  [{"role": "user", "text": "Thứ sáu tuần sau bay Đồng Hới."}], CATALOG, [])
 
 
-def test_absent_anchor_malformed_route_and_repeat_budget_are_safe():
+def test_absent_anchor_malformed_route_and_repeat_deduplication_are_safe():
     assert helper_demonstrations("Ngày mai học từ 19:30 tới 20:10.", {}, [], CATALOG, []) == []
     text = "Chín giờ sáng mai đến bệnh viện sớm mười lăm phút."
     bad_route = [{"name": "maps.get_route", "result": {"ok": True, "route": None}}]
     assert [row["name"] for row in helper_demonstrations(text, CONTEXT, [], CATALOG, bad_route)] == ["local_time.calendar_reference"]
     local = [{"name": "local_time.calendar_reference", "arguments": {}, "scope": "local", "result": "{}"}]
     assert helper_demonstrations(text, CONTEXT, [], CATALOG, local) == []
-    assert helper_demonstrations("Tối nay học từ 19:30 tới 20:10.", CONTEXT, [], CATALOG, local * MAX_TRAINING_LOCAL_CALLS) == []
+    other_helpers = [{'name': 'local_checks.evaluate', 'arguments': {'values': [i]}, 'scope': 'local'} for i in range(40)]
+    result = helper_demonstrations('Tối nay học từ 19:30 tới 20:10.', CONTEXT, [], CATALOG, other_helpers)
+    assert [r['name'] for r in result] == ['local_time.calendar_reference', 'local_time.duration_between']
 
 
 @pytest.mark.parametrize("day", ["Mốt", "Hai ngày nữa", "2 ngày nữa"])

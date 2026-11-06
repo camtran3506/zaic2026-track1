@@ -19,11 +19,20 @@ execution hooks. They require no additional packages or services.
 
 The exact schemas in `local_helpers.helper_tool_schemas()` define required fields
 and bounds. All local names are reserved and rejected if they collide with an
-application catalog. Invalid helper arguments consume the separate local budget
-and report feedback. Defaults allow eight local executions, eight application
-calls and 32 planner steps, with the existing invalid-proposal limit still active.
-Every requested helper requires one model output; using its result usually needs
-another generation. These functions do not make Qwen inference itself faster.
+application catalog. Invalid helper arguments report feedback and consume the
+existing invalid-proposal budget. There is no helper-count ceiling per batch or
+sample. `local_batch.run` can group independent helpers according to actual output
+token length; unknown/future operands require another turn. SFT uses the same
+token/dependency checks with the configured tokenizer, and has no fixed demo-count
+truncation. Without a tokenizer it leaves helper demos single.
+
+Env read batches still have at most four members; eight application calls/sample
+remain the default. The 32-step planning limit counts env/invalid decisions, not
+valid helper-only turns. Diagnostics distinguish total `llm_steps` from
+`non_helper_steps`. Token/context and configured time budgets still apply, as do
+the bounds of each helper's input schema (such as at most 100 numeric operands).
+Gaining fewer LLM turns is the purpose of batching; CPU helper execution remains
+sequential and never creates additional LLMs or hidden application calls.
 
 ## Evidence and application boundaries
 
@@ -68,7 +77,7 @@ requires explicit validation success before execution. A blocked proposal return
 read reuse. It is never rendered as another executed native tool call/response.
 `automatic_execution_feedback` accompanies actual observations in both SFT and
 inference, identifying Python-managed rules, result origin and state epoch.
-The model does not request these guards or spend its local-helper budget on them.
+The model does not request these guards; they execute automatically.
 `local_schema.inspect` remains a separate optional, advisory model-callable helper.
 
 History is not seeded into the read cache, so it cannot suppress the first read

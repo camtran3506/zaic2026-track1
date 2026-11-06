@@ -94,13 +94,16 @@ Other model families keep the portable JSON-decision protocol. Runtime manifests
 record `qwen35-native-fc-v1` for Qwen3.5; an old Qwen3.5 JSON-protocol adapter is
 rejected instead of silently mixing protocols. Regenerate SFT in a fresh directory
 and retrain that adapter. The current preparation policy is
-`full-context-readonly-batches-v10`. Production never replaces the checkpoint template;
+`full-context-token-bounded-helpers-v11`. Production never replaces the checkpoint template;
 tests use a pinned upstream Qwen3.5 template fixture without downloading weights.
 
 ## Group independent helpers and reads into one LLM turn
 
 `local_batch.run` is an internal agent controller, exposed beside the complete
-tool schemas. Its single `calls` argument contains 2–4 `{name, arguments}` objects.
+tool schemas. Its single `calls` argument contains `{name, arguments}` objects.
+Helper batches have no numeric maximum size or per-sample helper-call ceiling;
+they are packed by actual generated-token length and operand dependencies. Env
+read batches still contain 2–4 calls. A single helper can be called directly.
 A batch contains either Python helpers or environment tools whose catalog kind is
 exactly `read`. The two groups are not mixed. Write, unknown-kind, `sys.*` and
 nested batch calls are rejected before any child is executed. Each write and
@@ -122,8 +125,8 @@ log. No application calls are deleted, deduplicated or rolled back after executi
 Duplicate successful writes are still permitted outside batches.
 
 Preflight checks the whole group for allowed tools, declared schemas, duplicate
-members and remaining per-sample budgets. Each child counts against the existing
-8 env / 8 helper budgets; the wrapper is not an extra env call. All operands must
+members and the remaining env call budget. Each env child counts against the
+existing 8 env calls/sample; the wrapper and helper children do not. All operands must
 be available before the group, from the current request, context/history, ITN,
 earlier successful results, schema constants/enums or pagination controls. This
 is a conservative availability check, not proof of intent or entity existence.
@@ -141,7 +144,12 @@ Its single response contains `results` with an `executed` flag per member and
 results with `executed=false`, never as a fabricated env result. Successful prefix
 calls remain executed; the LLM must read the response and replan rather than retry
 the entire group. Traces contain `batch_start`, `batch_result` and per-child indices;
-sample diagnostics include `batches` and `llm_steps` for latency comparisons.
+sample diagnostics include `batches`, `llm_steps` and `non_helper_steps` for latency
+comparisons. Valid helper-only turns do not consume `max_total_steps`; its default
+32-step ceiling applies to env/invalid planning turns. Thus it cannot become a
+hidden helper-count ceiling. Existing invalid-proposal, schema and time checks
+still apply. Model input/output token budgets remain enforced; complete wrapper
+JSON is required before any child can execute, including when generation is cut.
 
 SFT first replays canonical gold exactly once and applies TRAIN-only aliases/noise.
 It then groups adjacent independent calls within each original/alias trajectory.
@@ -156,11 +164,16 @@ the native/JSON target fits the default 384 generated-token budget. If a group i
 too large, it retains smaller groups/single calls. If wrapper overhead exceeds the
 configured full context budget, it keeps the entire ungrouped trajectory instead
 of dropping labels or clipping any field. Standalone preparation without a tokenizer
-records that these token-budget checks were not performed. The manifest saves
+keeps helpers single (there is no guessed helper group size); provide `--tokenizer`
+to enable their grouping. Its read grouping still has the 4-call cap and records
+whether token checks were performed. All SFT helper-demo generators are also free
+of the old 8-call truncation; deduplication of already executed demos remains. The manifest saves
 `batching`, `batch_examples` and `ungrouped_examples` alongside helper child counts.
+`batching.max_read_calls` is 4; `max_helper_calls` and `max_helpers_per_sample` are
+null. Larger output budgets permit larger helper groups, not a fixed helper count.
 
 Create a new run/SFT directory and fine-tune on policy
-`full-context-readonly-batches-v10` to teach the controller format. Single-call
+`full-context-token-bounded-helpers-v11` to teach the controller format. Single-call
 inference remains supported for existing compatible adapters; adding the controller
 does not establish that an older adapter will use batches effectively. Regenerate
 old SFT before training/resuming with this policy. No additional LLM, runtime package
@@ -197,9 +210,10 @@ ToolEnv execution. Submission and evaluation still use the unmodified
 the official call list or alter application state. Local results do not provide
 application IDs or replace successful application reads for `x-ref` parameters.
 
-One model output calls one tool. A helper result therefore requires another
-generation before an application call can use it. Helpers have a separate
-default budget of eight calls per sample, with a total limit of 32 agent steps;
+One model output calls one tool/controller. Independent helpers can share a batch;
+using their results in an application call needs a later model generation. Helpers
+have no per-batch or per-sample count ceiling; token budgets and dependencies
+determine grouping. The 32-step planning limit excludes valid helper-only turns;
 the existing application-call and invalid-proposal limits still apply. Internal
 calls are recorded in diagnostic traces/stats so their latency and failure rates
 can be inspected even though they are absent from submission calls.
@@ -217,7 +231,7 @@ coverage for the chosen clean/ASR mixture. Helper demonstrations are conditional
 so adding schemas does not guarantee that every input supplies all three targets.
 
 Regenerate prepared SFT in a fresh directory: the manifest must record
-`prompt_policy=full-context-readonly-batches-v10` and
+`prompt_policy=full-context-token-bounded-helpers-v11` and
 `local_time_policy=local-time-tools-v1` and
 `local_helper_policy=python-specialists-itn-v2` and
 `itn_policy=vi-explicit-spans-v1` and
@@ -260,7 +274,7 @@ SFT adds conservative demonstrations from visible inputs and prior actual result
 with the same local execution and assistant-only loss path used at inference.
 Schema-repair demonstrations require a prior rejected proposal; result verification
 and retry monitoring also run automatically. Rebuild prepared SFT and retrain an
-adapter for policy `full-context-readonly-batches-v10`. Manifests with a different
+adapter for policy `full-context-token-bounded-helpers-v11`. Manifests with a different
 helper policy are rejected; legacy adapters without a manifest emit an explicit
 warning and have no verified helper training. Accuracy and added
 LLM-turn latency must be measured on held-out Qwen GPU evaluation.
@@ -441,7 +455,7 @@ including tool-only turns. Tool results are not clipped. The on-disk transcript
 cache retains this same full history, so compatible caches can be reused.
 Regenerate older SFT datasets in a new output directory: shortened data cannot
 be recovered by the trainer. Training and rollout evaluation reject manifests
-without the current `prompt_policy: full-context-readonly-batches-v10` marker.
+without the current `prompt_policy: full-context-token-bounded-helpers-v11` marker.
 `--use-train-transcript` still requires `split=train`; test request audio is always
 transcribed rather than read from a possible `audio_text` field.
 

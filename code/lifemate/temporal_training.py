@@ -10,11 +10,9 @@ import re
 from zoneinfo import ZoneInfo
 
 from .local_time import execute_local_tool
-from .local_helpers import DEFAULT_MAX_LOCAL_CALLS
 
 
 TEMPORAL_TRAINING_POLICY = "observable-temporal-helpers-v1"
-MAX_TRAINING_LOCAL_CALLS = DEFAULT_MAX_LOCAL_CALLS
 _UNITS = {"không": 0, "một": 1, "hai": 2, "ba": 3, "bốn": 4, "tư": 4,
           "năm": 5, "lăm": 5, "sáu": 6, "bảy": 7, "tám": 8, "chín": 9}
 _UNIT_PATTERN = "(?:" + "|".join(_UNITS) + ")"
@@ -219,7 +217,6 @@ def helper_demonstrations(transcript, context, history, enabled, observations):
             "arrival": updated, "travel_minutes": 0, "early_minutes": minutes}})
     previous = {(row.get("name"), json.dumps(row.get("arguments"), sort_keys=True, ensure_ascii=False))
                 for row in observations if row.get("scope") == "local"}
-    remaining = MAX_TRAINING_LOCAL_CALLS - sum(row.get("scope") == "local" for row in observations)
     result = []
     for candidate in candidates:
         key = (candidate["name"], json.dumps(candidate["arguments"], sort_keys=True, ensure_ascii=False))
@@ -231,4 +228,4 @@ def helper_demonstrations(transcript, context, history, enabled, observations):
             continue
         result.append(candidate)
         previous.add(key)
-    return result[:max(0, remaining)]
+    return result

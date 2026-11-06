@@ -102,12 +102,12 @@ def test_schema_inspection_only_uses_a_previously_rejected_proposal():
     assert inspect["arguments"] == {"target_tool": "notes.create", "arguments": {"title": "Ghi chú"}}
 
 
-def test_helper_budget_and_executed_helper_deduplication():
+def test_executed_helper_deduplication_without_count_budget():
     text = "Soạn nháp gửi team chấm qa a còng example chấm test."
     first = specialist_demonstrations(text, CONTEXT, [], TOOLS, [])
     observed = [{**h, "scope": "local", "result": "{}"} for h in first]
     assert specialist_demonstrations(text, CONTEXT, [], TOOLS, observed) == []
-    assert specialist_demonstrations(text, CONTEXT, [], TOOLS, observed * 8) == []
+    assert specialist_demonstrations(text, CONTEXT, [], TOOLS, observed * 40) == []
 
 
 class Env:

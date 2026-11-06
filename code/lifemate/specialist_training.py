@@ -8,13 +8,12 @@ import json
 import re
 import unicodedata
 
-from .local_helpers import DEFAULT_MAX_LOCAL_CALLS, execute_helper
+from .local_helpers import execute_helper
 from .local_knowledge import knowledge_records
 from .itn import detect_candidates, fallback_money_requests
 
 
 SPECIALIST_TRAINING_POLICY = "observable-python-specialists-itn-v2"
-MAX_TRAINING_HELPERS = DEFAULT_MAX_LOCAL_CALLS
 _ANAPHORA = re.compile(r"^(?:ừ|ờ|rồi|thế|đúng rồi)|\b(?:lúc nãy|hồi nãy|vừa rồi|cái đó|người đó|bác ấy|quán đó)\b")
 _EMAIL = re.compile(
     r"(?<![\w@])(?:[a-z0-9_+\-]+(?:\s*(?:chấm|\.)\s*[a-z0-9_+\-]+)*)"
@@ -124,11 +123,8 @@ def specialist_demonstrations(transcript, context, history, enabled, observation
     previous = {(row.get("name"), json.dumps(row.get("arguments"), ensure_ascii=False, sort_keys=True))
                 for row in observations if row.get("scope") == "local"}
     previous.update((row["name"], json.dumps(row["arguments"], ensure_ascii=False, sort_keys=True)) for row in pending)
-    remaining = MAX_TRAINING_HELPERS - sum(row.get("scope") == "local" for row in observations) - len(pending)
     selected = []
     for candidate in candidates:
-        if len(selected) >= remaining:
-            break
         key = (candidate["name"], json.dumps(candidate["arguments"], ensure_ascii=False, sort_keys=True))
         if key in previous:
             continue

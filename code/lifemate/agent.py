@@ -10,8 +10,7 @@ from typing import Any
 from .catalog import allowed_tools
 from .eval_trace import exception_details
 from .history import prompt_history, resolve_history
-from .local_helpers import (DEFAULT_MAX_LOCAL_CALLS, execute_helper,
-                            helper_tool_schemas, with_local_tools)
+from .local_helpers import execute_helper, helper_tool_schemas, with_local_tools
 from .local_checks import inspect_call
 from .execution_policy import AUTOMATIC_GUARD_INSTRUCTIONS, LoopMonitor
 from .tool_execution import precheck_call, attempt_env_call, result_observation
@@ -156,7 +155,8 @@ class AgentConfig:
     # Reserving time is best effort, not a hard CUDA generation timeout.
     reserve_seconds: float = 1.0
     use_train_transcript: bool = False
-    max_local_calls: int = DEFAULT_MAX_LOCAL_CALLS
+    # Only env/invalid planning decisions spend this budget. Valid helper-only
+    # turns have no count ceiling; model input/output token limits still apply.
     max_total_steps: int = 32
 
 
@@ -201,6 +201,7 @@ class LifeMateAgent:
              prepared_transcript: dict | None = None, *, trace=None, session=None) -> dict:
         t0 = time.monotonic()
         step = 0
+        non_helper_steps = 0
         batch_child_index = None
         def emit(event, **data):
             if trace is not None:
@@ -218,7 +219,7 @@ class LifeMateAgent:
             return {"transcript": normalize_transcript(prepared_transcript["transcript"]) if prepared_transcript else "",
                     "elapsed_seconds": 0, "executed": 0, "invalid_proposals": 0,
                     "local_executed": 0,
-                    'llm_steps': 0, 'batches': 0,
+                    'llm_steps': 0, 'non_helper_steps': 0, 'batches': 0,
                     "stop_reason": "no_available_tools"}
         if prepared_transcript is not None:
             if prepared_transcript.get("id") != item["id"]:
@@ -259,10 +260,6 @@ class LifeMateAgent:
                 reject(**rejection)
                 return False
             if name in local_names:
-                if local_executed >= self.cfg.max_local_calls:
-                    reject('Local helper budget exhausted; use existing results or an available application tool.',
-                           'local_budget', name=name, arguments=args)
-                    return False
                 local_executed += 1
                 emit('local_call_start', name=name, arguments=args, local_call_index=local_executed-1)
                 try:
@@ -292,7 +289,7 @@ class LifeMateAgent:
             return successful(observation)
 
         while (executed < self.cfg.max_calls and invalid < self.cfg.max_invalid
-               and step < self.cfg.max_total_steps):
+               and non_helper_steps < self.cfg.max_total_steps):
             if time.monotonic() - t0 > self.cfg.sample_seconds - self.cfg.reserve_seconds:
                 stop_reason = "time_limit"
                 break
@@ -301,6 +298,7 @@ class LifeMateAgent:
             else:
                 _, user_prompt = build_step_prompt(transcript, context, history, enabled, observations)
             step += 1
+            non_helper_steps += 1
             emit("llm_start", request={"system": SYSTEM_PROMPT, "user": user_prompt})
             try:
                 raw = self.llm.generate(SYSTEM_PROMPT, user_prompt)
@@ -325,7 +323,7 @@ class LifeMateAgent:
             if name == BATCH_TOOL:
                 payload = json.loads(user_prompt)
                 error = batch_error(args, planner_tools, local_names, payload,
-                    env_remaining=self.cfg.max_calls-executed, local_remaining=self.cfg.max_local_calls-local_executed)
+                    env_remaining=self.cfg.max_calls-executed)
                 if error:
                     reject(error, 'batch_precheck', name=name, arguments=args)
                     continue
@@ -336,7 +334,7 @@ class LifeMateAgent:
                     reject(**rejection)
                     continue
                 batches += 1
-                start, before_executed, results = len(observations), executed, []
+                start, before_executed, before_invalid, results = len(observations), executed, invalid, []
                 emit('batch_start', calls=args['calls'])
                 for batch_child_index, child in enumerate(args['calls']):
                     if time.monotonic()-t0 > self.cfg.sample_seconds-self.cfg.reserve_seconds:
@@ -357,19 +355,24 @@ class LifeMateAgent:
                     observations[:] = [o for o in observations if 'result' in o]
                 response = batch_observation(args['calls'], results)
                 observations.append(response)
+                if invalid == before_invalid and all(c['name'] in local_names for c in args['calls']):
+                    non_helper_steps -= 1
                 emit('batch_result', response=response)
                 if stop_reason is not None:
                     break
                 continue
+            before_invalid = invalid
             execute_one(name, args)
+            if isinstance(name, str) and name in local_names and invalid == before_invalid:
+                non_helper_steps -= 1
             if stop_reason is not None:
                 break
         if stop_reason is None:
             stop_reason = ("max_calls" if executed >= self.cfg.max_calls else
                            "max_invalid" if invalid >= self.cfg.max_invalid else "max_total_steps")
         emit("stop", reason=stop_reason, executed=executed, local_executed=local_executed,
-             invalid_proposals=invalid, batches=batches)
+             invalid_proposals=invalid, batches=batches, non_helper_steps=non_helper_steps)
         return {"transcript": transcript, "elapsed_seconds": round(time.monotonic() - t0, 3),
                 "executed": executed, "local_executed": local_executed, "invalid_proposals": invalid,
-                'llm_steps': step, 'batches': batches,
+                'llm_steps': step, 'non_helper_steps': non_helper_steps, 'batches': batches,
                 "stop_reason": stop_reason}

@@ -21,7 +21,7 @@ from lifemate.temporal_training import TEMPORAL_TRAINING_POLICY
 from lifemate.data_generalization import (POLICY as GENERALIZATION_POLICY, AppAugmenter, add_arguments,
     load_groups, split_generalization, assert_no_heldout, validate_options)
 from lifemate.context import MAX_CONTEXT_TOKENS, DEFAULT_MAX_NEW_TOKENS, validate_training_length
-from lifemate.batching import BATCH_POLICY, BATCH_TOOL, MAX_BATCH_CALLS, group_examples
+from lifemate.batching import BATCH_POLICY, BATCH_TOOL, MAX_READ_BATCH_CALLS, group_examples
 
 
 def main():
@@ -105,7 +105,8 @@ def main():
                                                     "nearest-total-and-train-validation-remainder")},
                     asr=asr_settings,
                     app_holdout=holdout, partitions={})
-    metadata['batching'] = {'policy': BATCH_POLICY, 'max_calls': MAX_BATCH_CALLS,
+    metadata['batching'] = {'policy': BATCH_POLICY, 'max_read_calls': MAX_READ_BATCH_CALLS,
+                           'max_helper_calls': None, 'max_helpers_per_sample': None,
                            'token_budget_checked': tokenizer is not None, 'max_new_tokens': DEFAULT_MAX_NEW_TOKENS}
     rollout_rows = {"validation": [], "app_heldout": []}
     for partition, rows in partitions.items():

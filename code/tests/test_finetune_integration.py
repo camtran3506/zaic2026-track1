@@ -73,6 +73,9 @@ def test_train_adapter_reload_and_merge(tmp_path, architecture):
     # Exercise the third partition through real training/reload on hybrid Qwen.
     # The single-app Qwen3 fixture also verifies explicit unavailable reporting.
     if architecture == 'qwen3_5':
+        # Real assistant-only SFT contains a >8-helper batch, not just executor mocks.
+        for row in source_rows:
+            row['audio_text'] += '; '+ '; '.join(f'{i}.0 + {i+1}.0' for i in range(20))
         tools.append({'name': 'library.read', 'kind': 'read', 'parameters': {'type': 'object', 'properties': {}}})
         source_rows.append({'id': 'train_4', 'audio': 'train_4.wav', 'audio_text': 'Kiểm tra thư viện',
             'context': {'installed_apps': {'library': {'tools': ['library.read']}}}, 'history': [],
@@ -133,7 +136,12 @@ class OfflineRecognizer:
     prepared_manifest = json.loads((run/'sft/manifest.json').read_text())
     assert prepared_manifest['training_augmentation']['rename_variants'] == 2
     assert prepared_manifest['training_augmentation']['variants_kept'] == 6
-    assert prepared_manifest['partitions']['train']['batch_examples'] == 9
+    assert prepared_manifest['partitions']['train']['batch_examples'] == (18 if architecture == 'qwen3_5' else 9)
+    assert prepared_manifest['batching']['max_helper_calls'] is None
+    assert prepared_manifest['batching']['max_helpers_per_sample'] is None
+    assert prepared_manifest['batching']['max_read_calls'] == 4
+    if architecture == 'qwen3_5':
+        assert prepared_manifest['partitions']['train']['local_helper_examples'] == 180
     assert prepared_manifest['partitions']['train']['ungrouped_examples'] > prepared_manifest['partitions']['train']['examples']
     assert prepared_manifest['app_holdout']['status'] == ('enabled' if architecture == 'qwen3_5' else 'unavailable')
     adapter = run / 'training' / 'adapter'

@@ -60,16 +60,32 @@ def test_helpers_do_not_consume_official_call_budget():
     assert stats["local_executed"] == 1 and stats["stop_reason"] == "max_calls"
 
 
-def test_local_budget_and_total_step_limit_bound_helper_loops():
-    class Loop:
-        def generate(self, system, user): return DURATION
+def test_valid_helper_turns_have_no_local_or_hidden_planner_count_limit():
+    env = FakeEnv()
+    outputs = [DURATION]*40 + ['{"action":"done"}']
+    stats = LifeMateAgent(StubASR(), StubLLM(outputs), CATALOG, AgentConfig(max_total_steps=1)).run(
+        item(), env, Path('/unused'), 'train')
+    assert stats['stop_reason'] == 'done' and stats['local_executed'] == 40
+    assert stats['llm_steps'] == 41 and stats['non_helper_steps'] == 1
+    assert not env.calls
 
-    for cfg, expected, calls in [(AgentConfig(max_local_calls=1), "max_invalid", 1),
-                                 (AgentConfig(max_total_steps=2), "max_total_steps", 2)]:
+
+def test_non_helper_decisions_still_have_the_planner_step_limit():
+    env = FakeEnv()
+    outputs = [decision('smart_home.get_status'), '{"action":"done"}']
+    stats = LifeMateAgent(StubASR(), StubLLM(outputs), CATALOG, AgentConfig(max_total_steps=1)).run(
+        item(), env, Path('/unused'), 'train')
+    assert stats['stop_reason'] == 'max_total_steps'
+    assert stats['executed'] == stats['llm_steps'] == stats['non_helper_steps'] == 1
+
+
+def test_malformed_names_remain_invalid_proposals_without_breaking_step_accounting():
+    for name in ({'tool': 'local_time.duration_between'}, ['local_time.duration_between'], None):
         env = FakeEnv()
-        stats = LifeMateAgent(StubASR(), Loop(), CATALOG, cfg).run(item(), env, Path("/unused"), "train")
-        assert stats["stop_reason"] == expected and stats["local_executed"] == calls
-        assert not env.calls
+        outputs = [decision(name), '{"action":"done"}']
+        stats = LifeMateAgent(StubASR(), StubLLM(outputs), CATALOG, AgentConfig()).run(item(), env, Path('/unused'), 'train')
+        assert stats['invalid_proposals'] == 1 and stats['non_helper_steps'] == 2
+        assert stats['local_executed'] == 0 and stats['stop_reason'] == 'done' and not env.calls
 
 
 def test_invalid_helper_returns_feedback_without_falling_through_to_env():

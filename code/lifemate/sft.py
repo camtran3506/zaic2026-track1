@@ -12,7 +12,7 @@ from .agent import (SYSTEM_PROMPT, _train_transcript, audio_path, build_step_pro
 from .catalog import allowed_tools
 from .llm import chat_token_ids
 from .local_time import LOCAL_TIME_POLICY
-from .local_helpers import DEFAULT_MAX_LOCAL_CALLS, LOCAL_HELPER_POLICY, execute_helper
+from .local_helpers import LOCAL_HELPER_POLICY, execute_helper
 from .execution_policy import EXECUTION_POLICY, LoopMonitor
 from .tool_execution import precheck_call, attempt_env_call, result_observation
 from .specialist_training import specialist_demonstrations
@@ -21,7 +21,7 @@ from .text import TEXT_NORMALIZATION, normalize_transcript
 from .itn import ITN_POLICY
 
 
-SFT_PROMPT_POLICY = "full-context-readonly-batches-v10"
+SFT_PROMPT_POLICY = "full-context-token-bounded-helpers-v11"
 VALIDATION_ROLLOUT_POLICY = "asr-only-paired-clean-v1"
 DEFAULT_ASR_TRANSCRIPT_RATIO = 0.5
 
@@ -163,8 +163,7 @@ def replay_sample(item, catalog, env, split_dir, asr=None, prepared_transcript=N
         # history and previous results, never from this gold action's operands.
         helpers = helper_demonstrations(transcript, context, history, enabled, observations)
         helpers += specialist_demonstrations(transcript, context, history, enabled, observations, pending=helpers)
-        remaining = max(0, DEFAULT_MAX_LOCAL_CALLS - sum(row.get("scope") == "local" for row in observations))
-        for helper in helpers[:remaining]:
+        for helper in helpers:
             examples.append(example({"action": "call", **helper}, len(examples)))
             local_result = execute_helper(helper["name"], helper["arguments"], context, history, enabled, observations)
             observations.append({**helper, "scope": "local", "result": full_json(local_result)})

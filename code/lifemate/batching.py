@@ -12,11 +12,13 @@ from .context import DEFAULT_MAX_NEW_TOKENS, MAX_CONTEXT_TOKENS
 
 
 BATCH_TOOL = 'local_batch.run'
-BATCH_POLICY = 'independent-helpers-and-reads-v1'
-MAX_BATCH_CALLS = 4
+BATCH_POLICY = 'token-bounded-helpers-and-reads-v2'
+MAX_READ_BATCH_CALLS = 4
 BATCH_INSTRUCTIONS = """
-- Có thể gọi local_batch.run với calls=[{name,arguments}, ...] để gộp 2–4 helper
+- Có thể gọi local_batch.run với calls=[{name,arguments}, ...] để gộp các helper
   độc lập HOẶC 2–4 tool có kind=read độc lập vào một lượt. Không trộn hai nhóm.
+  Helper không giới hạn số lượng theo batch/sample; chỉ gộp khi arguments và output
+  vừa ngân sách token. Nhóm quá dài hoặc cần kết quả trước thì chia sang lượt sau.
   Mọi toán hạng phải đã biết trước nhóm; không tham chiếu kết quả tương lai.
   Nếu bộ kiểm tra chưa xác minh được toán hạng, gọi riêng từng tool như bình thường.
 - Write, tool chưa rõ kind, sys.ask_missing_info và batch lồng nhau luôn gọi riêng.
@@ -28,10 +30,11 @@ BATCH_INSTRUCTIONS = """
 
 def batch_schema():
     return {'name': BATCH_TOOL, 'kind': 'local',
-        'description': 'Gộp 2–4 helper độc lập hoặc 2–4 env read độc lập. Không write/meta/nested batch. '
+        'description': 'Gộp các helper độc lập theo ngân sách token, không có trần số helper; '
+                       'env read giới hạn 2–4 call/nhóm. Không write/meta/nested batch. '
                        'Kết quả từng child và phần chưa thực thi được trả chung; không giảm số env calls.',
         'parameters': {'type': 'object', 'additionalProperties': False, 'required': ['calls'],
-            'properties': {'calls': {'type': 'array', 'minItems': 2, 'maxItems': MAX_BATCH_CALLS,
+            'properties': {'calls': {'type': 'array', 'minItems': 2,
                 'items': {'type': 'object', 'additionalProperties': False, 'required': ['name', 'arguments'],
                     'properties': {'name': {'type': 'string'}, 'arguments': {'type': 'object'}}}}}}}
 
@@ -170,15 +173,15 @@ def arguments_ready(call, schemas, evidence):
     return all(ready(value, props.get(key, {}), key) for key, value in call['arguments'].items())
 
 
-def batch_error(arguments, schemas, local_names, payload, *, env_remaining=8, local_remaining=8):
+def batch_error(arguments, schemas, local_names, payload, *, env_remaining=8):
     """Preflight every member before any execution. Never call env.validate here."""
     from .execution_policy import _canonical
     from .local_checks import inspect_call
     if not isinstance(arguments, dict) or set(arguments) != {'calls'}:
         return 'Batch arguments must contain only calls.'
     calls = arguments['calls']
-    if not isinstance(calls, list) or not 2 <= len(calls) <= MAX_BATCH_CALLS:
-        return f'Batch requires 2–{MAX_BATCH_CALLS} calls.'
+    if not isinstance(calls, list) or len(calls) < 2:
+        return 'Batch requires at least two calls; one helper/tool can be called directly.'
     categories, seen = set(), set()
     evidence = visible_values(payload)
     for index, call in enumerate(calls, 1):
@@ -208,8 +211,10 @@ def batch_error(arguments, schemas, local_names, payload, *, env_remaining=8, lo
         return 'Batch helpers and env reads separately.'
     if 'read' in categories and requires_observation(payload):
         return 'Conditional request: call env reads separately and observe each result before planning the next.'
-    if len(calls) > (local_remaining if 'local' in categories else env_remaining):
-        return 'Batch exceeds the remaining per-sample call budget.'
+    if 'read' in categories and len(calls) > MAX_READ_BATCH_CALLS:
+        return f'Env read batch exceeds {MAX_READ_BATCH_CALLS} calls; split into smaller read batches.'
+    if 'read' in categories and len(calls) > env_remaining:
+        return 'Batch exceeds the remaining per-sample env call budget.'
     return None
 
 
@@ -221,6 +226,7 @@ def group_examples(examples, *, tokenizer=None, max_new_tokens=DEFAULT_MAX_NEW_T
     """
     from .local_helpers import helper_tool_schemas
     from .llm import chat_token_ids
+    local_names = helper_tool_schemas()
     groups, output = {}, []
     trajectory_key = None
     index = 0
@@ -248,8 +254,12 @@ def group_examples(examples, *, tokenizer=None, max_new_tokens=DEFAULT_MAX_NEW_T
         calls = []
         if target.get('action') == 'call' and target['name'] != BATCH_TOOL:
             calls.append({'name': target['name'], 'arguments': target['arguments']})
-        for next_index in range(index+1, min(index+MAX_BATCH_CALLS, len(examples))):
-            if not calls:
+        # Without a tokenizer there is no defensible token budget for arbitrarily
+        # many helpers. Keep them single; finetune.py always supplies a tokenizer.
+        can_group_helpers = tokenizer is not None or target.get('name') not in local_names
+        prefix = None
+        for next_index in range(index+1, len(examples)):
+            if not calls or not can_group_helpers:
                 break
             following = examples[next_index]
             # Never cross source sample or alias trajectory boundaries.
@@ -263,15 +273,15 @@ def group_examples(examples, *, tokenizer=None, max_new_tokens=DEFAULT_MAX_NEW_T
             if next_target.get('action') != 'call':
                 break
             proposal = calls+[{'name': next_target['name'], 'arguments': next_target['arguments']}]
-            error = batch_error({'calls': proposal}, schemas, helper_tool_schemas(), payload,
-                env_remaining=8-sum(o.get('scope') != 'local' for o in original_obs),
-                local_remaining=8-sum(o.get('scope') == 'local' for o in original_obs))
+            error = batch_error({'calls': proposal}, schemas, local_names, payload,
+                env_remaining=8-sum(o.get('scope') != 'local' for o in original_obs))
             if error:
                 break
             candidate = {'action': 'call', 'name': BATCH_TOOL, 'arguments': {'calls': proposal}}
             row['messages'][-1]['content'] = json.dumps(candidate, ensure_ascii=False, separators=(',', ':'))
             if tokenizer is not None:
-                prefix = chat_token_ids(tokenizer, row['messages'][:-1], True)
+                if prefix is None:
+                    prefix = chat_token_ids(tokenizer, row['messages'][:-1], True)
                 full = chat_token_ids(tokenizer, row['messages'], False)
                 if len(full)-len(prefix) > max_new_tokens:
                     row['messages'][-1]['content'] = json.dumps(

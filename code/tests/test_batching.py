@@ -7,7 +7,7 @@ import pytest
 
 from lifemate.agent import AgentConfig, LifeMateAgent, SYSTEM_PROMPT, build_step_prompt, parse_decision
 from lifemate.batching import (BATCH_TOOL, batch_observation, group_examples,
-                               observation_children, successful)
+                               observation_children, successful, batch_schema)
 from lifemate.function_calling import complete_native_call, native_chat, parse_native_call
 from lifemate.llm import chat_token_ids, render_prompt
 from lifemate.local_helpers import execute_helper
@@ -119,6 +119,40 @@ def test_helper_batch_counts_each_child_without_any_env_access():
     assert [json.loads(c['result'])['result']['value'] for c in children] == [5, True]
 
 
+@pytest.mark.parametrize('count', [5, 12, 40])
+def test_helper_batches_have_no_batch_or_sample_count_ceiling(count):
+    assert 'maxItems' not in batch_schema()['parameters']['properties']['calls']
+    helpers = [call('local_checks.evaluate', operation='sum', values=[2]*i+[3]) for i in range(1, count+1)]
+    planner, env, stats = run([batch(*helpers), batch(*helpers), DONE], config=AgentConfig(max_total_steps=1))
+    assert stats['local_executed'] == count*2 and stats['batches'] == 2
+    assert stats['llm_steps'] == 3 and stats['non_helper_steps'] == 1
+    assert stats['invalid_proposals'] == 0 and stats['stop_reason'] == 'done'
+    assert env.calls == env.validations == []
+    for payload in planner.prompts[1:]:
+        response = json.loads(payload['previous_actions_and_results'][-1]['result'])
+        assert response['status'] == 'completed' and len(response['results']) == count
+        assert response['remaining_calls'] == []
+
+
+def test_a_late_helper_dependency_rejects_the_whole_large_batch():
+    helpers = [call('local_checks.evaluate', operation='sum', values=[2]*i+[3]) for i in range(1, 10)]
+    # 5 is produced by the first helper, but is not in the request/context/history.
+    helpers.append(call('local_checks.evaluate', operation='sum', values=[5]))
+    planner, env, stats = run([batch(*helpers), DONE])
+    assert stats['local_executed'] == 0 and stats['invalid_proposals'] == 1
+    assert env.calls == env.validations == []
+    error = planner.prompts[1]['previous_actions_and_results'][-1]['error']
+    assert '10' in error and 'operands' in error
+
+
+def test_read_batches_still_have_their_own_four_call_ceiling():
+    reads = [call('people.search', query=f'person_{i}') for i in range(5)]
+    entry = item(); entry['audio_text'] = 'Tìm '+', '.join(c['arguments']['query'] for c in reads)
+    planner, env, stats = run([batch(*reads), DONE], entry=entry)
+    assert stats['invalid_proposals'] == 1 and env.calls == env.validations == []
+    assert '4' in planner.prompts[1]['previous_actions_and_results'][-1]['error']
+
+
 @pytest.mark.parametrize('calls', [
     READS+[call('notes.append', text='xong')],
     [call('notes.append', text='xong'), *READS],
@@ -161,8 +195,7 @@ def test_conditional_read_control_dependency_keeps_planning_boundary(text):
     assert group_examples(singles) == singles
 
 
-@pytest.mark.parametrize('config,calls', [
-    (AgentConfig(max_calls=1), READS), (AgentConfig(max_local_calls=1), HELPERS)])
+@pytest.mark.parametrize('config,calls', [(AgentConfig(max_calls=1), READS)])
 def test_batch_cannot_bypass_remaining_child_budget(config, calls):
     _, env, stats = run([batch(*calls), DONE], config=config)
     assert stats['invalid_proposals'] == 1 and stats['local_executed'] == stats['executed'] == 0
@@ -266,13 +299,13 @@ def test_grouped_sft_matches_runtime_prompts_preserves_hash_and_assistant_mask(n
     assert stats['invalid_proposals'] == 0 and stats['batches'] == 1
 
 
-def test_helper_sft_batch_uses_only_preexisting_operands_and_never_replays_env(monkeypatch):
+def test_helper_sft_batch_uses_only_preexisting_operands_and_never_replays_env(monkeypatch, native_tokenizer):
     import lifemate.sft as module
     monkeypatch.setattr(module, 'helper_demonstrations', lambda *args: HELPERS)
     monkeypatch.setattr(module, 'specialist_demonstrations', lambda *args, **kw: [])
     entry, env = item([call('notes.append', text='xong')]), Env()
     singles = replay_sample(entry, CATALOG, env, Path('/unused'))
-    grouped = group_examples(singles)
+    grouped = group_examples(singles, tokenizer=native_tokenizer)
     assert json.loads(grouped[0]['messages'][-1]['content']) == batch(*HELPERS)
     results = observation_children(json.loads(grouped[1]['messages'][1]['content'])['previous_actions_and_results'])
     assert [r['name'] for r in results] == [c['name'] for c in HELPERS]
@@ -292,6 +325,54 @@ def test_sft_token_budgets_keep_ungrouped_targets_instead_of_clipping(bpe_tokeni
     singles = replay_sample(item(), CATALOG, Env(), Path('/unused'))
     assert group_examples(singles, tokenizer=bpe_tokenizer, max_new_tokens=1) == singles
     assert group_examples(singles, tokenizer=bpe_tokenizer, max_length=1) == singles
+
+
+def many_helper_examples():
+    entry = item([call('notes.append', text='xong')])
+    entry['audio_text'] = '; '.join(f'{i}.0 + {i+1}.0' for i in range(20))+'; ghi xong.'
+    env = Env()
+    singles = replay_sample(entry, CATALOG, env, Path('/unused'))
+    assert env.calls == entry['label']['tool_calls']  # Still one canonical env replay.
+    return singles
+
+
+def helper_targets(rows):
+    children = []
+    for row in rows:
+        target = json.loads(row['messages'][-1]['content'])
+        if target.get('name') == BATCH_TOOL:
+            children.extend(target['arguments']['calls'])
+        elif target.get('name', '').startswith('local_'):
+            children.append({'name': target['name'], 'arguments': target['arguments']})
+    return children
+
+
+def test_sft_demo_generation_and_grouping_do_not_drop_helpers_after_eight(native_tokenizer):
+    singles = many_helper_examples()
+    expected = helper_targets(singles)
+    assert len(expected) == 20
+    grouped = group_examples(singles, tokenizer=native_tokenizer, max_new_tokens=4096)
+    target = json.loads(grouped[0]['messages'][-1]['content'])
+    assert target['name'] == BATCH_TOOL and len(target['arguments']['calls']) == 20
+    assert helper_targets(grouped) == expected
+    assert len(grouped) == 3  # One helper batch, one write, one done.
+    encoded = encode_example(grouped[0], native_tokenizer, 16384)
+    assert encoded['labels'].count(-100) < len(encoded['labels'])
+
+
+def test_helper_group_width_is_chosen_by_actual_tokens_and_dependencies(bpe_tokenizer):
+    singles = many_helper_examples()
+    expected = helper_targets(singles)
+    for budget in (128, 512, 4096):
+        grouped = group_examples(singles, tokenizer=bpe_tokenizer, max_new_tokens=budget)
+        assert helper_targets(grouped) == expected
+        for row in grouped:
+            target = json.loads(row['messages'][-1]['content'])
+            if target.get('name') == BATCH_TOOL:
+                prefix = chat_token_ids(bpe_tokenizer, row['messages'][:-1], True)
+                full = chat_token_ids(bpe_tokenizer, row['messages'], False)
+                assert len(full)-len(prefix) <= budget
+    assert group_examples(singles) == singles  # No guessed count when the tokenizer is unavailable.
 
 
 def test_native_batch_json_literals_and_nested_closers_never_end_generation_early():
