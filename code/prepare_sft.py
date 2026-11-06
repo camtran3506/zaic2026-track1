@@ -20,7 +20,8 @@ from lifemate.specialist_training import SPECIALIST_TRAINING_POLICY
 from lifemate.temporal_training import TEMPORAL_TRAINING_POLICY
 from lifemate.data_generalization import (POLICY as GENERALIZATION_POLICY, AppAugmenter, add_arguments,
     load_groups, split_generalization, assert_no_heldout, validate_options)
-from lifemate.context import MAX_CONTEXT_TOKENS, validate_training_length
+from lifemate.context import MAX_CONTEXT_TOKENS, DEFAULT_MAX_NEW_TOKENS, validate_training_length
+from lifemate.batching import BATCH_POLICY, BATCH_TOOL, MAX_BATCH_CALLS, group_examples
 
 
 def main():
@@ -73,7 +74,7 @@ def main():
     sys.path.insert(0, str(split_dir))
     from zaic_tools import ToolEnv
     tokenizer = None
-    if args.rename_variants or args.distractor_probability:
+    if args.tokenizer is not None:
         from transformers import AutoTokenizer
         from lifemate.llm import configure_tokenizer
         tokenizer = configure_tokenizer(AutoTokenizer.from_pretrained(str(args.tokenizer), local_files_only=True), args.tokenizer)
@@ -104,6 +105,8 @@ def main():
                                                     "nearest-total-and-train-validation-remainder")},
                     asr=asr_settings,
                     app_holdout=holdout, partitions={})
+    metadata['batching'] = {'policy': BATCH_POLICY, 'max_calls': MAX_BATCH_CALLS,
+                           'token_budget_checked': tokenizer is not None, 'max_new_tokens': DEFAULT_MAX_NEW_TOKENS}
     rollout_rows = {"validation": [], "app_heldout": []}
     for partition, rows in partitions.items():
         if not rows:
@@ -115,6 +118,8 @@ def main():
         path = args.output_dir / f"{partition}.jsonl"
         count = 0
         helper_count = 0
+        batch_count = 0
+        ungrouped_count = 0
         helper_counts = {name: 0 for name in helper_tool_schemas()}
         retained_ids = []
         skipped = []
@@ -155,12 +160,30 @@ def main():
                 if partition == 'train':
                     for example in examples:
                         assert_no_heldout(example, holdout['apps'])
-                    examples = examples + augmenter.augment(record, examples)
+                    augmented = augmenter.augment(record, examples)
+                else:
+                    augmented = []
+                # Group after augmentation so aliases, helper omissions and token
+                # budgets are evaluated on the actual trajectory being trained.
+                trajectories = [examples]
+                for row in augmented:
+                    if len(trajectories) == 1 or trajectories[-1][-1]['augmentation']['variant'] != row['augmentation']['variant']:
+                        trajectories.append([])
+                    trajectories[-1].append(row)
+                ungrouped_count += sum(map(len, trajectories))
+                examples = [row for trajectory in trajectories
+                            for row in group_examples(trajectory, tokenizer=tokenizer, max_length=args.max_length)]
                 for example in examples:
                     target = json.loads(example["messages"][-1]["content"])
-                    if target.get("name") in helper_counts:
-                        helper_count += 1
-                        helper_counts[target["name"]] += 1
+                    if target.get('name') == BATCH_TOOL:
+                        batch_count += 1
+                        targets = target['arguments']['calls']
+                    else:
+                        targets = [target]
+                    for child in targets:
+                        if child.get('name') in helper_counts:
+                            helper_count += 1
+                            helper_counts[child['name']] += 1
                     example["transcript_source"] = prepared["transcript_source"]
                     f.write(json.dumps(example, ensure_ascii=False) + "\n")
                     count += 1
@@ -174,7 +197,8 @@ def main():
             transcript_source_counts={name: sum(sources[sample_id] == name for sample_id in retained_ids)
                                       for name in ("audio_text", "asr")},
             requested_transcript_source_counts=requested_counts,
-            examples=count, local_helper_examples=helper_count,
+            examples=count, ungrouped_examples=ungrouped_count, batch_examples=batch_count,
+            local_helper_examples=helper_count,
             local_helper_examples_by_tool=helper_counts, sha256=file_sha256(path))
         print(f"{partition} summary: kept {len(retained_ids)}/{len(rows)}, skipped {len(skipped)}, {count} steps; "
               f"transcript sources: {metadata['partitions'][partition]['transcript_source_counts']}", flush=True)

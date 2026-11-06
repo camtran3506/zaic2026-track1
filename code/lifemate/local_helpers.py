@@ -1,10 +1,11 @@
 """Specialists-as-tools registry: bounded Python functions, no nested LLM/env."""
 from . import local_checks, local_knowledge, local_time
+from .batching import BATCH_TOOL, batch_schema
 
 LOCAL_HELPER_POLICY = "python-specialists-itn-v2"
 DEFAULT_MAX_LOCAL_CALLS = 8
 _PREFIXES = ("local_time.", "local_context.", "local_entity.", "local_text.",
-             "local_checks.", "local_schema.")
+             "local_checks.", "local_schema.", "local_batch.")
 
 
 def helper_tool_schemas():
@@ -14,7 +15,7 @@ def helper_tool_schemas():
 def with_local_tools(env_tools):
     if any(name.startswith(_PREFIXES) for name in env_tools):
         raise ValueError("ToolEnv catalog collides with reserved local helper namespace")
-    return {**env_tools, **helper_tool_schemas()}
+    return {**env_tools, **helper_tool_schemas(), BATCH_TOOL: batch_schema()}
 
 
 def execute_helper(name, arguments, context, history, env_tools, observations=None):

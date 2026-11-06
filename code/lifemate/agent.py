@@ -1,4 +1,4 @@
-"""Observe -> plan a single tool call -> validate -> execute -> observe."""
+"""Observe -> plan a call/read-only batch -> validate -> execute -> observe."""
 from __future__ import annotations
 
 import json
@@ -17,6 +17,8 @@ from .execution_policy import AUTOMATIC_GUARD_INSTRUCTIONS, LoopMonitor
 from .tool_execution import precheck_call, attempt_env_call, result_observation
 from .text import normalize_transcript
 from .prompt_session import InferenceSession, fixed_prompt_payload
+from .batching import (BATCH_TOOL, BATCH_INSTRUCTIONS, batch_error, batch_observation,
+                       observation_children, successful)
 
 SYSTEM_PROMPT = """Bạn là AI Agent LifeMate. Chỉ xuất ĐÚNG MỘT JSON object, KHÔNG markdown hoặc diễn giải.
 Bạn có transcript yêu cầu nói tiếng Việt, context, history, các tool được cài và kết quả các calls trước.
@@ -58,7 +60,7 @@ QUY TẮC BẮT BUỘC:
 """
 
 
-SYSTEM_PROMPT += AUTOMATIC_GUARD_INSTRUCTIONS
+SYSTEM_PROMPT += AUTOMATIC_GUARD_INSTRUCTIONS + BATCH_INSTRUCTIONS
 
 
 def parse_decision(raw: str, catalog=None) -> dict:
@@ -66,19 +68,36 @@ def parse_decision(raw: str, catalog=None) -> dict:
     from .function_calling import parse_native_call, visible_output
     raw = visible_output(raw)
     decoder = json.JSONDecoder()
-    for idx, char in enumerate(raw):
+    idx = 0
+    while idx < len(raw):
+        char = raw[idx]
         if raw.startswith("<tool_call>", idx):
             return parse_native_call(raw[idx:], catalog or {})
+        if char in '["':
+            try:
+                _, end = decoder.raw_decode(raw, idx)
+            except json.JSONDecodeError as exc:
+                raise ValueError('Incomplete JSON envelope; do not execute nested calls') from exc
+            if char == '[':
+                raise ValueError('Use local_batch.run, not a top-level call array')
+            idx = end
+            continue
         if char != "{":
+            idx += 1
             continue
         try:
-            obj, _ = decoder.raw_decode(raw[idx:])
-        except json.JSONDecodeError:
-            continue
+            obj, end = decoder.raw_decode(raw, idx)
+        except json.JSONDecodeError as exc:
+            raise ValueError('Incomplete JSON envelope; do not execute nested calls') from exc
+        idx = end
         if not isinstance(obj, dict):
             continue
         if "tool_calls" in obj and isinstance(obj["tool_calls"], list) and obj["tool_calls"]:
+            if len(obj['tool_calls']) != 1:
+                raise ValueError('Use local_batch.run for independent helpers/reads; do not emit multiple top-level calls')
             obj = obj["tool_calls"][0]
+            if not isinstance(obj, dict):
+                raise ValueError('Tool call must be a JSON object')
         if obj.get("action") in ("done", "finish", "stop", "none"):
             return {"action": "done"}
         if obj.get("action") == "call" or ("action" not in obj and "name" in obj and "arguments" in obj):
@@ -182,8 +201,11 @@ class LifeMateAgent:
              prepared_transcript: dict | None = None, *, trace=None, session=None) -> dict:
         t0 = time.monotonic()
         step = 0
+        batch_child_index = None
         def emit(event, **data):
             if trace is not None:
+                if batch_child_index is not None:
+                    data['batch_child_index'] = batch_child_index
                 trace({"event": event, "step": step, **data})
 
         context = item.get("context", {})
@@ -196,6 +218,7 @@ class LifeMateAgent:
             return {"transcript": normalize_transcript(prepared_transcript["transcript"]) if prepared_transcript else "",
                     "elapsed_seconds": 0, "executed": 0, "invalid_proposals": 0,
                     "local_executed": 0,
+                    'llm_steps': 0, 'batches': 0,
                     "stop_reason": "no_available_tools"}
         if prepared_transcript is not None:
             if prepared_transcript.get("id") != item["id"]:
@@ -214,6 +237,7 @@ class LifeMateAgent:
         invalid = 0
         executed = 0
         local_executed = 0
+        batches = 0
         stop_reason = None
 
         def reject(error, stage, **feedback):
@@ -225,6 +249,47 @@ class LifeMateAgent:
             observation = {"error": error, "stage": stage, **feedback}
             observations.append(observation)
             emit("decision_rejected", **observation)
+
+        def execute_one(name, args, *, in_batch=False):
+            nonlocal executed, local_executed, stop_reason
+            rejection = precheck_call(name, args, self.catalog, enabled, monitor, local_names)
+            if rejection:
+                if rejection['stage'] == 'loop_guard':
+                    emit('loop_advisory', name=name, arguments=args, feedback=rejection['feedback'])
+                reject(**rejection)
+                return False
+            if name in local_names:
+                if local_executed >= self.cfg.max_local_calls:
+                    reject('Local helper budget exhausted; use existing results or an available application tool.',
+                           'local_budget', name=name, arguments=args)
+                    return False
+                local_executed += 1
+                emit('local_call_start', name=name, arguments=args, local_call_index=local_executed-1)
+                try:
+                    result = execute_helper(name, args, context, history, enabled, observation_children(observations))
+                    if result.get('status') == 'invalid_request':
+                        reject(str(result.get('warnings', 'Invalid helper request')), 'local_validate', name=name, arguments=args)
+                except ValueError as exc:
+                    result = {'ok': False, 'error': str(exc)}
+                    reject(str(exc), 'local_validate', name=name, arguments=args)
+                emit('local_call_result', name=name, arguments=args, result=result, local_call_index=local_executed-1)
+                observation = {'name': name, 'arguments': args, 'result': full_json(result), 'scope': 'local'}
+                observations.append(observation)
+                return successful(observation)
+            advisory = inspect_call(name, args, enabled)
+            emit('schema_inspection', name=name, inspection=advisory)
+            outcome = attempt_env_call(env, name, args, enabled[name].get('kind', 'unknown'), monitor, executed, emit=emit)
+            if not outcome['executed']:
+                reject(**outcome['feedback'])
+                return False
+            executed += 1
+            if not in_batch:
+                observations[:] = [o for o in observations if 'result' in o]
+            observation = result_observation(name, args, outcome, full_json)
+            observations.append(observation)
+            if name == 'sys.ask_missing_info':
+                stop_reason = 'ask_missing_info'
+            return successful(observation)
 
         while (executed < self.cfg.max_calls and invalid < self.cfg.max_invalid
                and step < self.cfg.max_total_steps):
@@ -257,54 +322,54 @@ class LifeMateAgent:
                 stop_reason = "done"
                 break
             name, args = decision.get("name"), decision.get("arguments")
-            rejection = precheck_call(name, args, self.catalog, enabled, monitor, local_names)
-            if rejection:
-                if rejection["stage"] == "loop_guard":
-                    emit("loop_advisory", name=name, arguments=args, feedback=rejection["feedback"])
-                reject(**rejection)
-                continue
-            if name in local_names:
-                if local_executed >= self.cfg.max_local_calls:
-                    reject("Local helper budget exhausted; use existing results or an available application tool.",
-                           "local_budget", name=name, arguments=args)
+            if name == BATCH_TOOL:
+                payload = json.loads(user_prompt)
+                error = batch_error(args, planner_tools, local_names, payload,
+                    env_remaining=self.cfg.max_calls-executed, local_remaining=self.cfg.max_local_calls-local_executed)
+                if error:
+                    reject(error, 'batch_precheck', name=name, arguments=args)
                     continue
-                local_executed += 1
-                emit("local_call_start", name=name, arguments=args, local_call_index=local_executed - 1)
-                try:
-                    result = execute_helper(name, args, context, history, enabled, observations)
-                    if result.get("status") == "invalid_request":
-                        reject(str(result.get("warnings", "Invalid helper request")),
-                               "local_validate", name=name, arguments=args)
-                except ValueError as exc:
-                    result = {"ok": False, "error": str(exc)}
-                    reject(str(exc), "local_validate", name=name, arguments=args)
-                emit("local_call_result", name=name, arguments=args, result=result,
-                     local_call_index=local_executed - 1)
-                observations.append({"name": name, "arguments": args,
-                                     "result": full_json(result), "scope": "local"})
-                # Helpers cannot call ToolEnv. Entity IDs only reference existing evidence.
+                # All access/repetition guards run before executing any child.
+                rejection = next((r for c in args['calls'] if
+                    (r := precheck_call(c['name'], c['arguments'], self.catalog, enabled, monitor, local_names))), None)
+                if rejection:
+                    reject(**rejection)
+                    continue
+                batches += 1
+                start, before_executed, results = len(observations), executed, []
+                emit('batch_start', calls=args['calls'])
+                for batch_child_index, child in enumerate(args['calls']):
+                    if time.monotonic()-t0 > self.cfg.sample_seconds-self.cfg.reserve_seconds:
+                        stop_reason = 'time_limit'
+                        break
+                    child_start = len(observations)
+                    ok = execute_one(child['name'], child['arguments'], in_batch=True)
+                    child_observations = observations[child_start:]
+                    result = dict(child_observations[-1])
+                    if len(child_observations) > 1:
+                        result['agent_feedback'] = child_observations[:-1]
+                    results.append(result)
+                    if not ok:
+                        break
+                batch_child_index = None
+                del observations[start:]
+                if executed > before_executed:
+                    observations[:] = [o for o in observations if 'result' in o]
+                response = batch_observation(args['calls'], results)
+                observations.append(response)
+                emit('batch_result', response=response)
+                if stop_reason is not None:
+                    break
                 continue
-            advisory = inspect_call(name, args, enabled)
-            emit("schema_inspection", name=name, inspection=advisory)
-            outcome = attempt_env_call(env, name, args, enabled[name].get("kind", "unknown"),
-                                       monitor, executed, emit=emit)
-            if not outcome["executed"]:
-                reject(**outcome["feedback"])
-                continue
-            executed += 1
-            # Move on using actual calls/results once validation led to execution.
-            # Executed failures remain evidence; only unexecuted feedback expires.
-            # The debug trace and cumulative invalid counter retain earlier errors.
-            observations[:] = [observation for observation in observations if "result" in observation]
-            observations.append(result_observation(name, args, outcome, full_json))
-            if name == "sys.ask_missing_info":
-                stop_reason = "ask_missing_info"
+            execute_one(name, args)
+            if stop_reason is not None:
                 break
         if stop_reason is None:
             stop_reason = ("max_calls" if executed >= self.cfg.max_calls else
                            "max_invalid" if invalid >= self.cfg.max_invalid else "max_total_steps")
         emit("stop", reason=stop_reason, executed=executed, local_executed=local_executed,
-             invalid_proposals=invalid)
+             invalid_proposals=invalid, batches=batches)
         return {"transcript": transcript, "elapsed_seconds": round(time.monotonic() - t0, 3),
                 "executed": executed, "local_executed": local_executed, "invalid_proposals": invalid,
+                'llm_steps': step, 'batches': batches,
                 "stop_reason": stop_reason}

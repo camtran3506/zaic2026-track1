@@ -86,15 +86,88 @@ Native output is parsed using the declared parameter types. Strings stay strings
 including numeric-looking IDs; JSON objects/arrays and numeric/bool/null values
 are decoded without argument repair. `ToolEnv.validate` remains authoritative.
 Generation waits for the entire `</tool_call>` before stopping, so JSON inside
-parameters cannot prematurely stop a call. One tool is executed per decision;
-completion remains the explicit `{"action":"done"}` control marker.
+parameters cannot prematurely stop a call. One native call is emitted per decision;
+that call may be the read-only batch controller described below.
+Completion remains the explicit `{"action":"done"}` control marker.
 
 Other model families keep the portable JSON-decision protocol. Runtime manifests
 record `qwen35-native-fc-v1` for Qwen3.5; an old Qwen3.5 JSON-protocol adapter is
 rejected instead of silently mixing protocols. Regenerate SFT in a fresh directory
 and retrain that adapter. The current preparation policy is
-`full-context-python-automatic-guards-v9`. Production never replaces the checkpoint template;
+`full-context-readonly-batches-v10`. Production never replaces the checkpoint template;
 tests use a pinned upstream Qwen3.5 template fixture without downloading weights.
+
+## Group independent helpers and reads into one LLM turn
+
+`local_batch.run` is an internal agent controller, exposed beside the complete
+tool schemas. Its single `calls` argument contains 2–4 `{name, arguments}` objects.
+A batch contains either Python helpers or environment tools whose catalog kind is
+exactly `read`. The two groups are not mixed. Write, unknown-kind, `sys.*` and
+nested batch calls are rejected before any child is executed. Each write and
+`sys.ask_missing_info` still occupies its own decision; missing-info remains terminal.
+
+```json
+{"action":"call","name":"local_batch.run","arguments":{"calls":[
+  {"name":"local_checks.evaluate","arguments":{"operation":"sum","values":[2,3]}},
+  {"name":"local_checks.evaluate","arguments":{"operation":"compare","left":2,"right":3,"comparison":"lt"}}
+]}}
+```
+
+The wrapper reduces LLM generation turns, not official tool-call counts. Python
+handlers run sequentially in request order; env calls always use the sample's
+existing single ToolEnv. The controller is never submitted to ToolEnv. Every env
+child goes through the same access/repetition middleware and `env.validate/call`
+boundary as an individual call, and all calls actually made remain in the official
+log. No application calls are deleted, deduplicated or rolled back after execution.
+Duplicate successful writes are still permitted outside batches.
+
+Preflight checks the whole group for allowed tools, declared schemas, duplicate
+members and remaining per-sample budgets. Each child counts against the existing
+8 env / 8 helper budgets; the wrapper is not an extra env call. All operands must
+be available before the group, from the current request, context/history, ITN,
+earlier successful results, schema constants/enums or pagination controls. This
+is a conservative availability check, not proof of intent or entity existence.
+If availability cannot be verified, propose an ordinary single call. In particular,
+search followed by a read using a newly returned ID must stay in separate turns.
+The program does not resolve references to future batch results or fill arguments.
+Explicit conditional/sequencing cues (including Vietnamese `nếu...thì`, `rồi mới`,
+`sau khi` and English `if`/`unless`) in the request/user history keep env reads in
+separate turns, even when their literal arguments are already available.
+
+The controller stops on a rejected validation, exception, empty/business-failure
+read, or unresolved/failed helper result, and checks the time budget between children.
+Its single response contains `results` with an `executed` flag per member and
+`remaining_calls` for the suffix not yet attempted. A rejected child appears in
+results with `executed=false`, never as a fabricated env result. Successful prefix
+calls remain executed; the LLM must read the response and replan rather than retry
+the entire group. Traces contain `batch_start`, `batch_result` and per-child indices;
+sample diagnostics include `batches` and `llm_steps` for latency comparisons.
+
+SFT first replays canonical gold exactly once and applies TRAIN-only aliases/noise.
+It then groups adjacent independent calls within each original/alias trajectory.
+Every grouped target uses the prompt from before the group; future observations
+are never inserted to justify its arguments. A read-result dependency, a write or
+meta call, an unresolved prior result, or a source/variant boundary ends the group.
+Grouped observations use the same controller response as inference. Assistant-only
+loss masking and the checkpoint's native template are unchanged.
+
+When a tokenizer is provided (always through `finetune.py`), grouping checks that
+the native/JSON target fits the default 384 generated-token budget. If a group is
+too large, it retains smaller groups/single calls. If wrapper overhead exceeds the
+configured full context budget, it keeps the entire ungrouped trajectory instead
+of dropping labels or clipping any field. Standalone preparation without a tokenizer
+records that these token-budget checks were not performed. The manifest saves
+`batching`, `batch_examples` and `ungrouped_examples` alongside helper child counts.
+
+Create a new run/SFT directory and fine-tune on policy
+`full-context-readonly-batches-v10` to teach the controller format. Single-call
+inference remains supported for existing compatible adapters; adding the controller
+does not establish that an older adapter will use batches effectively. Regenerate
+old SFT before training/resuming with this policy. No additional LLM, runtime package
+or extra CLI flag is required. Rollout validation uses the same batched agent and
+still scores the original env call log/state hash. GPU latency and accuracy gains
+require measurement on the actual model; fewer planning turns alone is not a
+guarantee of the same percentage reduction in wall time.
 
 ## Internal date and time tools
 
@@ -144,7 +217,7 @@ coverage for the chosen clean/ASR mixture. Helper demonstrations are conditional
 so adding schemas does not guarantee that every input supplies all three targets.
 
 Regenerate prepared SFT in a fresh directory: the manifest must record
-`prompt_policy=full-context-python-automatic-guards-v9` and
+`prompt_policy=full-context-readonly-batches-v10` and
 `local_time_policy=local-time-tools-v1` and
 `local_helper_policy=python-specialists-itn-v2` and
 `itn_policy=vi-explicit-spans-v1` and
@@ -187,7 +260,7 @@ SFT adds conservative demonstrations from visible inputs and prior actual result
 with the same local execution and assistant-only loss path used at inference.
 Schema-repair demonstrations require a prior rejected proposal; result verification
 and retry monitoring also run automatically. Rebuild prepared SFT and retrain an
-adapter for policy `full-context-python-automatic-guards-v9`. Manifests with a different
+adapter for policy `full-context-readonly-batches-v10`. Manifests with a different
 helper policy are rejected; legacy adapters without a manifest emit an explicit
 warning and have no verified helper training. Accuracy and added
 LLM-turn latency must be measured on held-out Qwen GPU evaluation.
@@ -368,7 +441,7 @@ including tool-only turns. Tool results are not clipped. The on-disk transcript
 cache retains this same full history, so compatible caches can be reused.
 Regenerate older SFT datasets in a new output directory: shortened data cannot
 be recovered by the trainer. Training and rollout evaluation reject manifests
-without the current `prompt_policy: full-context-python-automatic-guards-v9` marker.
+without the current `prompt_policy: full-context-readonly-batches-v10` marker.
 `--use-train-transcript` still requires `split=train`; test request audio is always
 transcribed rather than read from a possible `audio_text` field.
 

@@ -11,6 +11,7 @@ from lifemate.function_calling import complete_native_call, native_chat, parse_n
 from lifemate.llm import chat_token_ids, configure_tokenizer, render_prompt
 from lifemate.local_helpers import helper_tool_schemas as local_tool_schemas
 from lifemate.sft import encode_example, replay_sample
+from lifemate.batching import BATCH_TOOL, batch_schema
 from test_baseline import CATALOG, FakeEnv, StubASR, item
 
 
@@ -54,7 +55,7 @@ def test_native_template_preserves_tools_history_and_results(native_tokenizer):
     chat, tools = native_chat(portable(prompt))
     exposed = {t['function']['name']: t['function'] for t in tools}
     assert {name: exposed[name] for name in catalog} == catalog
-    assert {name: exposed[name] for name in exposed.keys() - catalog.keys()} == local_tool_schemas()
+    assert {name: exposed[name] for name in exposed.keys() - catalog.keys()} == {**local_tool_schemas(), BATCH_TOOL: batch_schema()}
     historical = [m for m in chat[1:] if m['role'] != 'tool'][:len(history)]
     assert [json.loads(m['content']) for m in historical] == [
         {'history_role': turn['role'], 'text': 'Giữ: </think> và <think>, 08:30! ' +

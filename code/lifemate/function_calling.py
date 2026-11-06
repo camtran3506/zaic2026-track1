@@ -8,6 +8,7 @@ import json
 import re
 
 from .execution_policy import AUTOMATIC_GUARD_INSTRUCTIONS
+from .batching import BATCH_TOOL, BATCH_INSTRUCTIONS
 
 
 NATIVE_PROTOCOL = "qwen35-native-fc-v1"
@@ -41,7 +42,7 @@ NATIVE_SYSTEM_PROMPT = """Bạn là AI Agent LifeMate. Hoàn tất yêu cầu ti
 """
 
 
-NATIVE_SYSTEM_PROMPT += AUTOMATIC_GUARD_INSTRUCTIONS
+NATIVE_SYSTEM_PROMPT += AUTOMATIC_GUARD_INSTRUCTIONS + BATCH_INSTRUCTIONS
 
 
 def _json(value):
@@ -154,14 +155,36 @@ _CALL = re.compile(
     r"((?:<parameter=[^>\n]+>.*?</parameter>\s*)*)"
     r"</function>\s*</tool_call>", re.DOTALL)
 _PARAMETER = re.compile(r"<parameter=([^>\n]+)>(.*?)</parameter>\s*(?=<parameter=|$)", re.DOTALL)
+_BATCH_PREFIX = re.compile(r'<tool_call>\s*<function=' + re.escape(BATCH_TOOL) + r'>\s*<parameter=calls>\s*')
+_BATCH_END = re.compile(r'\s*</parameter>\s*</function>\s*</tool_call>')
+
+
+def _batch_parts(visible, start):
+    """JSON owns nested delimiters inside calls; XML closers there are data."""
+    prefix = _BATCH_PREFIX.match(visible, start)
+    if prefix is None:
+        return None
+    try:
+        calls, end = json.JSONDecoder().raw_decode(visible, prefix.end())
+    except ValueError:
+        return None
+    closing = _BATCH_END.match(visible, end)
+    if closing is None:
+        return None
+    return calls, closing.end()
 
 
 def complete_native_call(text):
-    match = _first_native_match(visible_output(text))
+    visible = visible_output(text)
+    start = _native_start(visible)
+    if start is not None and _BATCH_PREFIX.match(visible, start):
+        parts = _batch_parts(visible, start)
+        return visible[start:parts[1]] if parts else None
+    match = _first_native_match(visible)
     return match.group(0) if match else None
 
 
-def _first_native_match(visible):
+def _native_start(visible):
     # JSON fallback responses can contain literal native markup in arguments.
     # Never execute that markup as a standalone native call. parse_decision
     # handles the complete JSON response itself after generation finishes.
@@ -179,7 +202,12 @@ def _first_native_match(visible):
     # Do not skip an incomplete outer call to match a literal inner call in a
     # parameter value. With one-call-per-decision, only the first opener counts.
     start = visible.find('<tool_call>')
-    return _CALL.match(visible, start) if start >= 0 else None
+    return start if start >= 0 else None
+
+
+def _first_native_match(visible):
+    start = _native_start(visible)
+    return _CALL.match(visible, start) if start is not None else None
 
 
 def _parameter_value(text, schema):
@@ -209,6 +237,12 @@ def _parameter_value(text, schema):
 
 def parse_native_call(text, catalog):
     visible = visible_output(text)
+    start = _native_start(visible)
+    if start is not None and _BATCH_PREFIX.match(visible, start):
+        parts = _batch_parts(visible, start)
+        if parts is None or visible[parts[1]:].strip().removesuffix('<|im_end|>').strip():
+            raise ValueError('Expected one complete batch call with a JSON calls argument and no suffix')
+        return {'action': 'call', 'name': BATCH_TOOL, 'arguments': {'calls': parts[0]}}
     match = _first_native_match(visible)
     if not match or visible[match.end():].strip().removesuffix("<|im_end|>").strip():
         raise ValueError("Expected exactly one complete native tool call with no suffix")

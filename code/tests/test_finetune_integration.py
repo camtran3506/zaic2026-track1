@@ -63,11 +63,12 @@ def test_train_adapter_reload_and_merge(tmp_path, architecture):
     model.save_pretrained(base)
     data = tmp_path / 'data' / 'train'
     data.mkdir(parents=True)
-    tools = [{'name': 'home.read', 'kind': 'read', 'parameters': {'type': 'object', 'properties': {}}}]
+    tools = [{'name': name, 'kind': 'read', 'parameters': {'type': 'object', 'properties': {}}}
+             for name in ('home.read', 'home.other_read')]
     source_rows = [{
         'id': f'train_{i}', 'audio': f'train_{i}.wav', 'audio_text': 'Kiểm tra thiết bị',
-        'context': {'installed_apps': {'home': {'tools': ['home.read']}}}, 'history': [],
-        'label': {'tool_calls': [{'name': 'home.read', 'arguments': {}}]},
+        'context': {'installed_apps': {'home': {'tools': ['home.read', 'home.other_read']}}}, 'history': [],
+        'label': {'tool_calls': [{'name': name, 'arguments': {}} for name in ('home.read', 'home.other_read')]},
     } for i in range(4)]
     # Exercise the third partition through real training/reload on hybrid Qwen.
     # The single-app Qwen3 fixture also verifies explicit unavailable reporting.
@@ -132,6 +133,8 @@ class OfflineRecognizer:
     prepared_manifest = json.loads((run/'sft/manifest.json').read_text())
     assert prepared_manifest['training_augmentation']['rename_variants'] == 2
     assert prepared_manifest['training_augmentation']['variants_kept'] == 6
+    assert prepared_manifest['partitions']['train']['batch_examples'] == 9
+    assert prepared_manifest['partitions']['train']['ungrouped_examples'] > prepared_manifest['partitions']['train']['examples']
     assert prepared_manifest['app_holdout']['status'] == ('enabled' if architecture == 'qwen3_5' else 'unavailable')
     adapter = run / 'training' / 'adapter'
     assert (adapter / 'adapter_model.safetensors').is_file()

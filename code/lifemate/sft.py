@@ -21,7 +21,7 @@ from .text import TEXT_NORMALIZATION, normalize_transcript
 from .itn import ITN_POLICY
 
 
-SFT_PROMPT_POLICY = "full-context-python-automatic-guards-v9"
+SFT_PROMPT_POLICY = "full-context-readonly-batches-v10"
 VALIDATION_ROLLOUT_POLICY = "asr-only-paired-clean-v1"
 DEFAULT_ASR_TRANSCRIPT_RATIO = 0.5
 
