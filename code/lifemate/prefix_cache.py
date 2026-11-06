@@ -148,6 +148,11 @@ class PrefixCache:
             if type(base) not in {Qwen3_5ForConditionalGeneration, Qwen3_5ForCausalLM}:
                 self.disable("model is not a supported Qwen3.5 model")
                 return False
+            text_config = getattr(base.config, 'text_config', base.config)
+            rope = getattr(text_config, 'rope_parameters', None) or {}
+            if rope.get('rope_type', 'default') != 'default':
+                self.disable('only default, sequence-length-independent RoPE is verified')
+                return False
             layers = [m for m in base.modules() if isinstance(m, Qwen3_5GatedDeltaNet)]
             if not layers or any(getattr(m.forward, "__func__", None) is not Qwen3_5GatedDeltaNet.forward for m in layers):
                 self.disable("linear-attention forward is absent or patched by another runtime")
@@ -190,7 +195,7 @@ class PrefixCache:
         return {**self.stats, "disabled_reason": self.disabled_reason}
 
     @contextmanager
-    def restore(self, model, input_ids, prefix_ids):
+    def restore(self, model, input_ids, prefix_ids, *, schema_cache=None, schema_prefix=()):
         """Build/restore at an exact boundary, then shield snapshot from writes."""
         import torch
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
@@ -200,16 +205,35 @@ class PrefixCache:
                 self.snapshot, self.tokens = None, ()
                 self.stats["misses"] += 1
                 prefix = input_ids[:, :len(tokens)]
-                positions = torch.arange(len(tokens), device=input_ids.device).view(1, -1)
-                output = model(input_ids=prefix, attention_mask=torch.ones_like(prefix),
-                               position_ids=positions, use_cache=True, logits_to_keep=1,
-                               return_dict=True)
-                snapshot = output.past_key_values
-                if type(snapshot) is not Qwen3_5DynamicCache or snapshot.get_seq_length() != len(tokens):
-                    raise ValueError("Unexpected hybrid cache type or prefix length")
+                if tuple(input_ids[0, :len(tokens)].tolist()) != tokens:
+                    raise ValueError('Prefix token mismatch')
+
+                def prefill(ids, start=0, initial=None):
+                    positions = torch.arange(start, ids.shape[1], device=ids.device).view(1, -1)
+                    if initial is not None:
+                        positions = positions.unsqueeze(0).expand(4, -1, -1)
+                    output = model(input_ids=ids[:, start:], attention_mask=torch.ones_like(ids),
+                                   position_ids=positions, past_key_values=initial,
+                                   use_cache=True, logits_to_keep=1, return_dict=True)
+                    result = output.past_key_values
+                    if type(result) is not Qwen3_5DynamicCache or result.get_seq_length() != ids.shape[1]:
+                        raise ValueError('Unexpected hybrid cache type or prefix length')
+                    return result
+
+                shared = None
+                if schema_cache is not None and schema_prefix:
+                    if len(schema_prefix) > len(tokens) or tokens[:len(schema_prefix)] != tuple(schema_prefix):
+                        raise ValueError('Schema token prefix mismatch')
+                    shared = schema_cache.snapshot_for(schema_prefix,
+                        lambda: prefill(prefix[:, :len(schema_prefix)]))
+                if shared is None:
+                    snapshot = prefill(prefix)
+                elif len(schema_prefix) == len(tokens):
+                    snapshot = deepcopy(shared)
+                else:
+                    snapshot = prefill(prefix, len(schema_prefix), deepcopy(shared))
                 self.snapshot, self.tokens = snapshot, tokens
                 self.stats["snapshot_tokens"] = len(tokens)
-                del output
             else:
                 self.stats["hits"] += 1
                 self.stats["reused_tokens"] += len(tokens)

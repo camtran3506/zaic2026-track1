@@ -186,7 +186,8 @@ def _rollout_inference_mode(model, tokenizer, fast_language_model):
 
 
 def score_callback(evaluator, tokenizer, output_dir, fast_language_model=None, *, eval_clean_transcripts=False,
-                   eval_prefix_cache="auto", eval_prompt_cache="auto", app_evaluator=None):
+                   eval_prefix_cache="auto", eval_prompt_cache="auto", app_evaluator=None,
+                   eval_schema_cache='auto', eval_schema_cache_mb=256):
     # Called only after Unsloth has been imported/patched by the training entrypoint.
     from transformers import TrainerCallback
     from .models import LocalLLM
@@ -211,13 +212,14 @@ def score_callback(evaluator, tokenizer, output_dir, fast_language_model=None, *
                 # Fresh wrapper after each weight update. No snapshot may cross
                 # checkpoints, transcript views, or the return to backward().
                 llm = LocalLLM.from_loaded_model(model, tokenizer,
-                    prefix_cache=eval_prefix_cache, prompt_cache=eval_prompt_cache)
+                    prefix_cache=eval_prefix_cache, prompt_cache=eval_prompt_cache,
+                    schema_cache=eval_schema_cache, schema_cache_mb=eval_schema_cache_mb)
                 try:
                     def view(ev, target, source=None):
                         try:
                             return ev.evaluate(llm, target, **({'transcript_source': source} if source else {}))
                         finally:
-                            llm.end_sample()
+                            llm.close()
                     result = view(evaluator, path)
                     if eval_clean_transcripts:
                         clean_path = path.with_name(path.stem + ".clean.jsonl")
@@ -229,7 +231,7 @@ def score_callback(evaluator, tokenizer, output_dir, fast_language_model=None, *
                             app_clean_path = path.with_name(path.stem + '.app-heldout.clean.jsonl')
                             result.update(view(app_evaluator, app_clean_path, 'audio_text'))
                 finally:
-                    llm.end_sample()
+                    llm.close()
             metrics.update(result)
             if state.log_history and state.log_history[-1].get("step") == state.global_step:
                 state.log_history[-1].update(result)

@@ -12,6 +12,7 @@ import re
 from .catalog import allowed_tools
 from .context import MAX_CONTEXT_TOKENS
 from .sft import split_records
+from .schema_prompt import compact_tool_schema
 
 POLICY = "train-schema-augmentation-app-holdout-v1"
 GROUPS = {
@@ -312,7 +313,7 @@ class AppAugmenter:
                 payload = json.loads(row['messages'][1]['content'])
                 specs = payload['available_tools']['tool_schemas']
                 specs += [deepcopy(spec) for name, spec in sorted(self.catalog.items()) if name.split('.')[0] in extras]
-                schemas = [_schema(spec, tool_map, app_map) for spec in specs]
+                schemas = [compact_tool_schema(_schema(spec, tool_map, app_map)) for spec in specs]
                 payload['available_tools'] = {
                     'tool_index': [{'name': s['name'], 'kind': s.get('kind', ''), 'description': s.get('description', '')} for s in sorted(schemas, key=lambda s: s['name'])],
                     'tool_schemas': sorted(schemas, key=lambda s: s['name'])}

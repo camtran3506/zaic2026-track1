@@ -228,6 +228,7 @@ def test_llm_submission_uses_only_env_calls_and_env_hash(tmp_path, monkeypatch, 
         split="public_test", seed=42, llm_model=tmp_path / "unused", device="cpu", llm_dtype="float32",
         max_input_tokens=65536, max_new_tokens=512, llm_adapter=None, llm_device_map="single",
         prefix_cache="auto", prompt_cache="auto", max_calls=8, max_invalid=3, sample_seconds=float("inf"),
+        schema_cache='auto', schema_cache_mb=256,
         use_train_transcript=False, output=tmp_path / "submission.jsonl", log_path=tmp_path / "log.jsonl",
         fail_fast=True)
     if oom:

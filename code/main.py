@@ -26,6 +26,7 @@ from lifemate.agent import AgentConfig, LifeMateAgent
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
 from lifemate.context import DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_NEW_TOKENS, validate_inference_budget
 from lifemate.runtime import DEFAULT_LLM_DTYPE
+from lifemate.schema_cache import DEFAULT_SCHEMA_CACHE_MB, cache_budget_mb
 
 LOG = logging.getLogger("lifemate")
 
@@ -49,6 +50,10 @@ def parse_args() -> argparse.Namespace:
                    help="Reuse an exact native-chat prefix per sample on verified runtimes; off for A/B checks")
     p.add_argument("--prompt-cache", choices=["auto", "off"], default="auto",
                    help="Prepare fixed sample data once; cache CPU prefix rendering/tokenization where verified")
+    p.add_argument('--schema-cache', choices=['auto', 'off', 'shared'], default='auto',
+                   help='Cross-sample system/tools GPU snapshots; auto admits repeated prefixes, shared admits immediately; requires prefix-cache auto')
+    p.add_argument('--schema-cache-mb', type=cache_budget_mb, default=DEFAULT_SCHEMA_CACHE_MB,
+                   help='Maximum retained schema snapshot storage in MiB (default 256)')
     p.add_argument("--output", type=Path, default=Path("result/submission.jsonl"))
     p.add_argument("--log-path", type=Path, default=None, help="Optional diagnostic JSONL, never submitted")
     p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
@@ -148,7 +153,8 @@ def run_llm_stage(args, items, transcript_rows, split_dir, env_root):
                    max_input_tokens=args.max_input_tokens, max_new_tokens=args.max_new_tokens,
                    adapter_path=args.llm_adapter, device_map=args.llm_device_map,
                    seed=args.seed,
-                   prefix_cache=args.prefix_cache, prompt_cache=args.prompt_cache)
+                   prefix_cache=args.prefix_cache, prompt_cache=args.prompt_cache,
+                   schema_cache=args.schema_cache, schema_cache_mb=args.schema_cache_mb)
     cfg = AgentConfig(max_calls=args.max_calls, max_invalid=args.max_invalid,
                       sample_seconds=args.sample_seconds,
                       use_train_transcript=args.use_train_transcript)
@@ -191,6 +197,9 @@ def run_llm_stage(args, items, transcript_rows, split_dir, env_root):
                         "total_sample_seconds": round(sample_time + prepared["asr_seconds"], 6), **report}, ensure_ascii=False) + "\n")
                     log_file.flush()
         finally:
+            close = getattr(llm, 'close', None)
+            if callable(close):
+                close()
             if log_file:
                 log_file.close()
     LOG.info("Finished %d samples in %.1fs. Submission: %s", count, time.monotonic()-overall_start, args.output)

@@ -83,6 +83,11 @@ def test_train_adapter_reload_and_merge(tmp_path, architecture):
         source_rows.append({'id': 'train_4', 'audio': 'train_4.wav', 'audio_text': 'Kiểm tra thư viện',
             'context': {'installed_apps': {'library': {'tools': ['library.read']}}}, 'history': [],
             'label': {'tool_calls': [{'name': 'library.read', 'arguments': {}}]}})
+    for spec in tools:
+        spec['app'] = spec['name'].split('.')[0]
+        spec['returns'] = ''
+        spec['parameters']['properties']['limit'] = {'type': 'integer', 'minimum': 1,
+            'description': 'Số nguyên, không dấu chấm hay phẩy, ví dụ 2'}
     (data / 'train_tools_catalog.json').write_text(json.dumps({'apps': [{'tools': tools}]}))
     (data / 'train.jsonl').write_text(''.join(json.dumps(row)+'\n' for row in source_rows))
     (data / 'zaic_tools.py').write_text('''class ToolEnv:
@@ -136,6 +141,7 @@ class OfflineRecognizer:
     assert config['max_length'] == 16384
     assert config['batch_size'] == 1
     assert config['eval_strategy'] == 'epoch'
+    assert config['eval_schema_cache'] == 'auto' and config['eval_schema_cache_mb'] == 256
     prepared_manifest = json.loads((run/'sft/manifest.json').read_text())
     assert prepared_manifest['training_augmentation']['rename_variants'] == 2
     assert prepared_manifest['training_augmentation']['variants_kept'] == 6
@@ -147,6 +153,16 @@ class OfflineRecognizer:
         assert prepared_manifest['partitions']['train']['local_helper_examples'] == 189
         assert prepared_manifest['partitions']['train']['local_helper_examples_by_tool']['local_assist.solve'] == 9
     assert prepared_manifest['assist_policy'] == 'fixed-python-task-workflows-v1'
+    assert prepared_manifest['schema_prompt_policy'] == 'redundant-schema-metadata-v1'
+    # Real preparation/training sees compact schemas, while the file consumed by
+    # the organizer/env retains its original app/returns/parameter annotations.
+    original_names = {spec['name'] for spec in tools}
+    first = json.loads((run/'sft/train.jsonl').read_text().splitlines()[0])
+    prompt_schemas = json.loads(first['messages'][1]['content'])['available_tools']['tool_schemas']
+    for spec in prompt_schemas:
+        if spec['name'] in original_names:
+            assert 'app' not in spec and 'returns' not in spec
+            assert spec['parameters']['properties']['limit'] == {'type': 'integer', 'minimum': 1}
     assert prepared_manifest['partitions']['train']['ungrouped_examples'] > prepared_manifest['partitions']['train']['examples']
     assert prepared_manifest['app_holdout']['status'] == ('enabled' if architecture == 'qwen3_5' else 'unavailable')
     adapter = run / 'training' / 'adapter'
@@ -154,6 +170,7 @@ class OfflineRecognizer:
     runtime = json.loads((adapter / 'lifemate_runtime.json').read_text())
     assert runtime['inference_dtype'] == 'bfloat16'
     assert runtime['assist_policy'] == prepared_manifest['assist_policy']
+    assert runtime['schema_prompt_policy'] == prepared_manifest['schema_prompt_policy']
     expected_protocol = 'qwen35-native-fc-v1' if architecture == 'qwen3_5' else 'lifemate-decision-json-v1'
     assert runtime['output_protocol'] == expected_protocol
     assert runtime['generation']['temperature'] == 0

@@ -17,7 +17,7 @@ Bộ dữ liệu cần có `<split>.jsonl`, `<split>_tools_catalog.json`, audio 
 
 Chỉnh cấu hình bên dưới. `LIMIT=0` chạy **toàn bộ split**. Model tải từ Hugging Face trước khi suy luận; có thể dùng model gắn sẵn ở `/kaggle/input`. Model ASR mặc định là `g-group-ai-lab/gipformer1.5-68M-rnnt`, dùng trực tiếp định dạng ONNX.
 
-Qwen3.5 dùng function calling native từ chat template của checkpoint: `tools`, assistant `tool_calls` và tool responses; SFT/inference dùng chung template, không train JSON action call làm output model. Schema, lịch sử hội thoại và kết quả tool được giữ đầy đủ khi finetune và inference; không tự rút gọn khi prompt dài. Vượt giới hạn token sẽ báo lỗi rõ ràng.
+Qwen3.5 dùng function calling native từ chat template của checkpoint: `tools`, assistant `tool_calls` và tool responses; SFT/inference dùng chung template, không train JSON action call làm output model. Mọi tool được phép và mọi ràng buộc schema được giữ khi finetune/inference; chỉ bỏ metadata dư và câu mô tả integer lặp. Lịch sử và kết quả tool được giữ đầy đủ; không tự rút gọn khi prompt dài. Vượt giới hạn token sẽ báo lỗi rõ ràng.
 
 Feedback parse/precheck/validate được giữ khi LLM đang sửa lỗi. Sau khi validate thành công và call được thực thi, feedback từ chối cũ được bỏ khỏi prompt tiếp theo; mọi lời gọi đã thực thi và kết quả vẫn được giữ, kể cả call trả lỗi. Trace debug vẫn lưu đầy đủ lỗi trước đó.
 
@@ -71,6 +71,8 @@ HF_SECRET_NAME = None  # tùy chọn: tên Kaggle Secret chứa HF token (public
 SAMPLE_SECONDS = float("inf")  # không giới hạn thời gian mỗi mẫu
 MAX_INPUT_TOKENS = DEFAULT_MAX_INPUT_TOKENS
 MAX_NEW_TOKENS = DEFAULT_MAX_NEW_TOKENS
+SCHEMA_CACHE_MODE = "auto"  # auto / shared / off: cache system+tools giữa sample, không chứa yêu cầu
+SCHEMA_CACHE_MB = 256       # ngân sách snapshot giữ lại; chưa gồm model/cache riêng của sample
 MAX_CALLS = 8
 MAX_INVALID = 3
 ASR_PRECISION = "int8"
@@ -109,6 +111,8 @@ assert ASR_THREADS > 0
 assert isinstance(GPU_INDEX, int) and GPU_INDEX >= 0
 validate_inference_budget(MAX_INPUT_TOKENS, MAX_NEW_TOKENS)
 validate_training_length(TRAIN_MAX_LENGTH)
+assert SCHEMA_CACHE_MODE in {"auto", "shared", "off"}
+assert 0 < SCHEMA_CACHE_MB < float("inf")
 print("Artifacts:", OUT)
 ''')
 
@@ -226,6 +230,7 @@ Các cell dưới ghi mã vào `/kaggle/working/lifemate_app` để chạy trong
 for rel in ['lifemate/__init__.py', 'lifemate/catalog.py', 'lifemate/models.py', 'lifemate/agent.py', 'lifemate/transcripts.py', 'lifemate/decoding.py',
             'lifemate/gpu.py', 'lifemate/context.py', 'lifemate/text.py', 'lifemate/function_calling.py', 'lifemate/asr.py', 'lifemate/llm.py', 'lifemate/prefix_cache.py', 'lifemate/prompt_session.py', 'lifemate/runtime.py', 'lifemate/history.py', 'lifemate/scoring.py', 'lifemate/evaluation.py', 'lifemate/eval_diagnostics.py', 'lifemate/eval_trace.py',
             'lifemate/local_time.py', 'lifemate/temporal_text.py', 'lifemate/temporal_training.py', 'lifemate/batching.py',
+            'lifemate/schema_prompt.py', 'lifemate/schema_cache.py',
             'lifemate/local_assist.py', 'lifemate/assist_training.py',
             'lifemate/itn.py', 'lifemate/local_helpers.py', 'lifemate/local_knowledge.py', 'lifemate/local_checks.py',
             'lifemate/execution_policy.py', 'lifemate/tool_execution.py', 'lifemate/specialist_training.py',
@@ -235,6 +240,7 @@ for rel in ['lifemate/__init__.py', 'lifemate/catalog.py', 'lifemate/models.py',
             'tests/test_staged_pipeline.py', 'tests/test_decoding.py', 'tests/test_stopping_filters.py', 'tests/test_scoring.py', 'tests/test_evaluation.py', 'tests/test_batching.py', 'tests/test_data_generalization.py', 'tests/test_rollout_cache_lifecycle.py',
             'tests/test_transcript_normalization.py', 'tests/test_text.py', 'tests/test_runtime_parity.py', 'tests/test_runtime_config.py',
             'tests/test_native_function_calling.py', 'tests/test_prefix_cache.py', 'tests/test_prompt_session.py', 'tests/test_transcript_mixing.py', 'tests/test_eval_diagnostics.py', 'tests/test_eval_trace.py',
+            'tests/test_schema_prompt.py', 'tests/test_schema_cache.py',
             'tests/test_tool_validation.py',
             'tests/test_local_time.py', 'tests/test_local_time_runtime.py',
             'tests/test_local_tools_agent.py', 'tests/test_temporal_training.py', 'tests/test_local_time_evaluation.py', 'tests/test_local_assist.py',
@@ -392,6 +398,7 @@ if TRAIN_LLM:
     train_command = [sys.executable, "-u", APP / "finetune.py",
         "--data-root", training_data, "--base-model", LLM_PATH, "--output-dir", FT_RUN,
         "--backend", TRAIN_BACKEND,
+        "--eval-schema-cache", SCHEMA_CACHE_MODE, "--eval-schema-cache-mb", str(SCHEMA_CACHE_MB),
         "--validation-fraction", str(TRAIN_VALIDATION_FRACTION),
         "--asr-transcript-ratio", str(TRAIN_ASR_TRANSCRIPT_RATIO),
         "--rename-variants", str(TRAIN_RENAME_VARIANTS),
@@ -457,6 +464,7 @@ DIAGNOSTICS = OUT / "diagnostics.jsonl"
 command = [sys.executable, "-u", APP / "main.py",
     "--stage", "llm", "--transcript-cache", TRANSCRIPTS,
     "--llm-device-map", "single",
+    "--schema-cache", SCHEMA_CACHE_MODE, "--schema-cache-mb", str(SCHEMA_CACHE_MB),
     "--data-root", SPLIT_DIR, "--split", SPLIT,
     "--asr-model", ASR_PATH, "--llm-model", LLM_PATH,
     "--output", SUBMISSION, "--log-path", DIAGNOSTICS,
@@ -478,6 +486,7 @@ run_config = dict(split=SPLIT, data_root=str(SPLIT_DIR), sample_count=len(EXPECT
                   unlimited_sample_time=SAMPLE_SECONDS == float("inf"), transcript_cache=str(TRANSCRIPTS),
                   asr_from_cache=json.loads(TRANSCRIPT_MANIFEST.read_text(encoding="utf-8"))["asr"],
                   inference_gpu_ids=[GPU_INDEX], llm_device_map="single", stop_on_decision_json=True,
+                  schema_cache=SCHEMA_CACHE_MODE, schema_cache_mb=SCHEMA_CACHE_MB,
                   limit=LIMIT, hardware=HW, command=[str(x) for x in command], models=MODEL_MANIFEST)
 (OUT / "run_config.json").write_text(json.dumps(run_config, ensure_ascii=False, indent=2), encoding="utf-8")
 validation = {"status": "running", "expected_rows": len(EXPECTED_IDS)}

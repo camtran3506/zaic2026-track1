@@ -35,8 +35,10 @@ def test_callback_cache_modes_cleanup_and_all_training_state_restored(tmp_path, 
         assert not model.training and model.config.use_cache and model.config.text_config.use_cache
         assert llm.prefix_cache.mode == mode and llm.prompt_cache_mode == mode
         assert llm.prefix_cache.snapshot is None
+        assert not llm.schema_cache.entries
         seen.append(llm)
         llm.prefix_cache.snapshot = object()  # Even a custom evaluator retaining a cache must be cleaned up.
+        llm.schema_cache.entries['test-entry'] = ((), object(), 0)
         tok.padding_side = tok.truncation_side = 'left'
         consume_rng()
         view = ('app_' if app else '') + ('asr' if transcript_source == 'asr' else 'clean')
@@ -50,6 +52,7 @@ def test_callback_cache_modes_cleanup_and_all_training_state_restored(tmp_path, 
         switches.append('inference'); consume_rng()
     def for_training(model):
         assert all(llm.prefix_cache.snapshot is None for llm in seen)
+        assert all(not llm.schema_cache.entries for llm in seen)
         switches.append('training'); consume_rng()
         model.config.text_config.use_cache = True
         if failure == 'training_switch':
@@ -74,6 +77,7 @@ def test_callback_cache_modes_cleanup_and_all_training_state_restored(tmp_path, 
     assert tok.padding_side == tok.truncation_side == 'right'
     assert switches == ['inference', 'training']
     assert all(llm.prefix_cache.snapshot is None for llm in seen)
+    assert all(not llm.schema_cache.entries for llm in seen)
     assert random.getstate() == py_rng
     restored_np = np.random.get_state()
     assert restored_np[0] == np_rng[0] and np.array_equal(restored_np[1], np_rng[1]) and restored_np[2:] == np_rng[2:]
@@ -108,12 +112,20 @@ def test_fresh_lora_weights_and_gradients_after_each_cached_rollout(tmp_path, bp
                     assert llm.generate(SYSTEM_PROMPT, prompt) == reference.generate(SYSTEM_PROMPT, str(prompt))
                 assert llm.prefix_cache_stats()['hits'] == 1
                 assert llm.prefix_cache_stats()['disabled_reason'] is None
+                # A second source sample may reuse ONLY the schema snapshot;
+                # both levels must be gone before the callback returns to train.
+                llm.end_sample()
+                llm.begin_sample()
+                session.prepare('Tắt đèn khác', {}, [], {})
+                prompt = session.prompt([])
+                assert llm.generate(SYSTEM_PROMPT, prompt) == reference.generate(SYSTEM_PROMPT, str(prompt))
+                assert llm.schema_cache_stats()['hits'] == 1
                 snapshots.append(deepcopy(llm.prefix_cache.snapshot))
                 wrappers.append(llm)
             finally:
                 session.close()
             return {'eval_state_tool_score': 75}
-        callback = score_callback(SimpleNamespace(evaluate=evaluate), tok, tmp_path)
+        callback = score_callback(SimpleNamespace(evaluate=evaluate), tok, tmp_path, eval_schema_cache='shared')
         optimizer = torch.optim.SGD([p for p in model.parameters() if p.requires_grad], lr=.2)
         for step in (1, 2):
             callback.on_evaluate(None, TrainerState(global_step=step), TrainerControl(), model=model, metrics={})

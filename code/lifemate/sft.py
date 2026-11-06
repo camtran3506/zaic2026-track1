@@ -22,9 +22,10 @@ from .local_assist import ASSIST_TOOL, ASSIST_POLICY
 from .context import DEFAULT_MAX_NEW_TOKENS
 from .text import TEXT_NORMALIZATION, normalize_transcript
 from .itn import ITN_POLICY
+from .schema_prompt import SCHEMA_PROMPT_POLICY
 
 
-SFT_PROMPT_POLICY = "full-context-python-task-workflows-v12"
+SFT_PROMPT_POLICY = "compact-schemas-shared-prefix-v13"
 VALIDATION_ROLLOUT_POLICY = "asr-only-paired-clean-v1"
 DEFAULT_ASR_TRANSCRIPT_RATIO = 0.5
 
@@ -56,6 +57,7 @@ def validate_prompt_policy(manifest):
             or manifest.get("local_time_policy") != LOCAL_TIME_POLICY
             or manifest.get("local_helper_policy") != LOCAL_HELPER_POLICY
             or manifest.get("assist_policy") != ASSIST_POLICY
+            or manifest.get("schema_prompt_policy") != SCHEMA_PROMPT_POLICY
             or manifest.get("itn_policy") != ITN_POLICY
             or manifest.get("execution_policy") != EXECUTION_POLICY):
         raise ValueError("Prepared SFT data uses an older prompt/text-normalization/evaluation policy; "

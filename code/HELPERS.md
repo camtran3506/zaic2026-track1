@@ -194,12 +194,13 @@ need a model-generated helper call. Retry/recovery behaviour is supplied through
 hooks and feedback, not claimed as a learned universal critic.
 
 Regenerate SFT in a fresh output directory and retrain an adapter. Prepared data
-requires `prompt_policy=full-context-python-task-workflows-v12`,
+requires `prompt_policy=compact-schemas-shared-prefix-v13`,
 `local_time_policy=local-time-tools-v1` and
 `local_helper_policy=python-specialists-itn-v2` and
 `itn_policy=vi-explicit-spans-v1` and
 `execution_policy=automatic-tool-guards-v1`; new runtime exports also pin
-`assist_policy=fixed-python-task-workflows-v1`. Existing primitive-only runtime
+`assist_policy=fixed-python-task-workflows-v1` and
+`schema_prompt_policy=redundant-schema-metadata-v1`. Existing primitive-only runtime
 manifests remain loadable; retraining is needed to teach the new task interface.
 ASR transcript normalization/cache format is unchanged; valid transcript caches
 can be reused because annotations are derived when building the prompt. Older adapters are not declared compatible by renaming their manifests.

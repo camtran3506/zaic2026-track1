@@ -136,7 +136,8 @@ def test_sft_manifest_requires_itn_policy():
     manifest = {"prompt_policy": SFT_PROMPT_POLICY, "text_normalization": TEXT_NORMALIZATION,
                 "local_helper_policy": LOCAL_HELPER_POLICY, "local_time_policy": LOCAL_TIME_POLICY,
                 "itn_policy": ITN_POLICY, "execution_policy": EXECUTION_POLICY,
-                "assist_policy": 'fixed-python-task-workflows-v1'}
+                "assist_policy": 'fixed-python-task-workflows-v1',
+                "schema_prompt_policy": 'redundant-schema-metadata-v1'}
     validate_prompt_policy(manifest)
     manifest.pop("itn_policy")
     with pytest.raises(ValueError, match="rerun prepare_sft"):

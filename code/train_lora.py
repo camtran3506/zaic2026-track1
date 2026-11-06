@@ -39,6 +39,10 @@ def main():
                    help="Reuse rollout prefix snapshots on verified runtimes; patched/unsupported forwards use full prefill")
     p.add_argument("--eval-prompt-cache", choices=["auto", "off"], default="auto",
                    help="Prepare fixed rollout prompts once per sample, independently of GPU prefix caching")
+    from lifemate.schema_cache import DEFAULT_SCHEMA_CACHE_MB, cache_budget_mb
+    p.add_argument('--eval-schema-cache', choices=['auto', 'off', 'shared'], default='auto',
+                   help='Cache system/tools GPU prefixes between samples within each rollout view')
+    p.add_argument('--eval-schema-cache-mb', type=cache_budget_mb, default=DEFAULT_SCHEMA_CACHE_MB)
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--resume-from-checkpoint", type=Path)
     args = p.parse_args()
@@ -193,7 +197,9 @@ def main():
         callbacks=[score_callback(evaluator, tokenizer, args.output_dir, FastLanguageModel,
                                   eval_clean_transcripts=args.eval_clean_transcripts,
                                   eval_prefix_cache=args.eval_prefix_cache,
-                                  eval_prompt_cache=args.eval_prompt_cache, app_evaluator=app_evaluator),
+                                  eval_prompt_cache=args.eval_prompt_cache,
+                                  eval_schema_cache=args.eval_schema_cache,
+                                  eval_schema_cache_mb=args.eval_schema_cache_mb, app_evaluator=app_evaluator),
                    runtime_save_callback(runtime)])
     try:
         train_result = trainer.train(resume_from_checkpoint=str(args.resume_from_checkpoint) if args.resume_from_checkpoint else None)

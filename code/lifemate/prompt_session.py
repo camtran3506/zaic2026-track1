@@ -153,6 +153,13 @@ class InferenceSession:
     def report(self):
         return dict(self.stats)
 
+    def schema_head(self, tokenizer, system):
+        """Sample-free native system/tools material after render() prepared it."""
+        if (self._base_chat and self._tokenizer is tokenizer
+                and self._renderer_key is not None and self._renderer_key[-1] == system):
+            return self._base_chat[:1], {**self._kwargs, 'tools': self._tools}
+        return None
+
     @staticmethod
     def _tokens(tokenizer, text):
         return tokenizer(text, add_special_tokens=False, truncation=False,

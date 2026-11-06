@@ -5,6 +5,7 @@ from copy import deepcopy
 import json
 from pathlib import Path
 from typing import Any
+from .schema_prompt import compact_tool_schema
 
 
 def load_catalog(path: Path) -> dict[str, dict]:
@@ -66,10 +67,10 @@ def allowed_tools(catalog: dict[str, dict], installed_apps: Any) -> dict[str, di
 
 
 def prompt_catalog(allowed: dict[str, dict]) -> dict:
-    """Expose every allowed tool with its complete, unmodified catalog schema."""
+    """Expose every allowed tool; compact only redundant prompt metadata."""
     return {
         "tool_index": [{"name": name, "kind": allowed[name].get("kind", ""),
                         "description": deepcopy(allowed[name].get("description", ""))}
                        for name in sorted(allowed)],
-        "tool_schemas": [deepcopy(allowed[name]) for name in sorted(allowed)],
+        "tool_schemas": [compact_tool_schema(allowed[name]) for name in sorted(allowed)],
     }

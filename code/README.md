@@ -67,8 +67,9 @@ remain work for that migration.
 For [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B), inference and SFT
 use the **checkpoint tokenizer's own chat template** with `tools=...` and
 `enable_thinking=False`. Each tool is passed as
-`{"type":"function","function": <complete catalog schema>}`; all schema fields
-are retained. Prior calls become assistant `tool_calls`, and their real results
+`{"type":"function","function": <prompt schema>}`. Every allowed tool and all
+argument constraints are retained; the conservative metadata compaction below
+applies equally to SFT and inference. Prior calls become assistant `tool_calls`, and their real results
 become `role="tool"` messages. The native template renders `<tools>`,
 `<tool_call>`, `<function=...>`, `<parameter=...>` and `<tool_response>`.
 This matches the `qwen3_coder` format used for Qwen3.5 tool serving; see also
@@ -94,7 +95,7 @@ Other model families keep the portable JSON-decision protocol. Runtime manifests
 record `qwen35-native-fc-v1` for Qwen3.5; an old Qwen3.5 JSON-protocol adapter is
 rejected instead of silently mixing protocols. Regenerate SFT in a fresh directory
 and retrain that adapter. The current preparation policy is
-`full-context-python-task-workflows-v12`. Production never replaces the checkpoint template;
+`compact-schemas-shared-prefix-v13`. Production never replaces the checkpoint template;
 tests use a pinned upstream Qwen3.5 template fixture without downloading weights.
 
 ## Group independent helpers and reads into one LLM turn
@@ -173,7 +174,7 @@ of the old 8-call truncation; deduplication of already executed demos remains. T
 null. Larger output budgets permit larger helper groups, not a fixed helper count.
 
 Create a new run/SFT directory and fine-tune on policy
-`full-context-python-task-workflows-v12` to teach the controller format. Single-call
+`compact-schemas-shared-prefix-v13` to teach the controller format. Single-call
 inference remains supported for existing compatible adapters; adding the controller
 does not establish that an older adapter will use batches effectively. Regenerate
 old SFT before training/resuming with this policy. No additional LLM, runtime package
@@ -211,7 +212,7 @@ Multi-field normalization is split by actual completion tokens when necessary,
 without a numeric field-count cap. It retains primitives when the source/workflow
 is unsupported, or when untokenized preparation cannot establish a field budget.
 Gold replay order and final state are unchanged. The preparation policy is now
-`full-context-python-task-workflows-v12`; create a fresh SFT/run directory and retrain
+`compact-schemas-shared-prefix-v13`; create a fresh SFT/run directory and retrain
 to teach the new interface. Valid transcript caches can be reused; no new CLI flag
 is needed. Existing compatible primitive-only adapters still load, but efficient
 use of the solver and GPU latency gains require training and held-out measurement.
@@ -265,7 +266,7 @@ coverage for the chosen clean/ASR mixture. Helper demonstrations are conditional
 so adding schemas does not guarantee that every input supplies all three targets.
 
 Regenerate prepared SFT in a fresh directory: the manifest must record
-`prompt_policy=full-context-python-task-workflows-v12` and
+`prompt_policy=compact-schemas-shared-prefix-v13` and
 `local_time_policy=local-time-tools-v1` and
 `local_helper_policy=python-specialists-itn-v2` and
 `itn_policy=vi-explicit-spans-v1` and
@@ -309,7 +310,7 @@ SFT adds conservative demonstrations from visible inputs and prior actual result
 with the same local execution and assistant-only loss path used at inference.
 Schema-repair demonstrations require a prior rejected proposal; result verification
 and retry monitoring also run automatically. Rebuild prepared SFT and retrain an
-adapter for policy `full-context-python-task-workflows-v12`. Manifests with a different
+adapter for policy `compact-schemas-shared-prefix-v13`. Manifests with a different
 helper policy are rejected; legacy adapters without a manifest emit an explicit
 warning and have no verified helper training. Accuracy and added
 LLM-turn latency must be measured on held-out Qwen GPU evaluation.
@@ -490,7 +491,7 @@ including tool-only turns. Tool results are not clipped. The on-disk transcript
 cache retains this same full history, so compatible caches can be reused.
 Regenerate older SFT datasets in a new output directory: shortened data cannot
 be recovered by the trainer. Training and rollout evaluation reject manifests
-without the current `prompt_policy: full-context-python-task-workflows-v12` marker.
+without the current `prompt_policy: compact-schemas-shared-prefix-v13` marker.
 `--use-train-transcript` still requires `split=train`; test request audio is always
 transcribed rather than read from a possible `audio_text` field.
 
@@ -906,9 +907,10 @@ preventing a sample's trajectory from leaking into validation. It replays each g
 call through the real train `ToolEnv.validate/call`; the next prompt contains only
 previous real tool results. It never opens environment state files. Gold lists must
 be in execution order. It uses the **same complete prompt builder** as inference.
-Every allowed tool is present in `tool_schemas` from the first step, with all
-catalog fields intact: full descriptions, structured returns, nested parameters,
-and extension metadata. `tool_index` also retains full descriptions. Tools not
+Every allowed tool is present in `tool_schemas` from the first step. The prompt
+view removes redundant app metadata, empty returns and one exact integer-type
+boilerplate description; all business descriptions, argument constraints, nonempty
+returns, nested parameters and extension metadata remain. `tool_index` also retains full descriptions. Tools not
 exposed by `installed_apps` remain unavailable in canonical data and rollouts.
 Only the additional TRAIN augmentation views expose distractor schemas as described above.
 
@@ -921,6 +923,71 @@ all schemas are already visible. The internal `inspect` action and its counters
 have been removed; legacy outputs requesting it are invalid proposals and consume
 `max_invalid`, never executing a tool. `--max-tool-details` and the notebook's
 `MAX_TOOL_DETAILS` setting have also been removed.
+
+The prompt schema policy is `redundant-schema-metadata-v1`. The official catalog
+remains unchanged for tool access, validation/execution and helper inspection.
+Only the model-facing view removes a redundant top-level `app` matching the tool
+namespace, exactly empty-string `returns`, and the exact parameter description
+`Số nguyên, không dấu chấm hay phẩy, ví dụ 2` when its type is `integer`.
+No descriptions are length-clipped or generally rewritten. Names, kind, business
+semantics, optional arguments, all constraints (including x-one-of/ref/match),
+nonempty returns and unknown metadata survive. The traversal distinguishes schema
+nodes from literal enum/default/example data and properties named description/app.
+Compiled tool views use a bounded CPU LRU keyed by their complete source and policy,
+returning fresh mutable copies. TRAIN aliases and distractors use the same policy.
+All allowed tools remain visible; no relevance ranking or top-k selection is added.
+
+New SFT uses `compact-schemas-shared-prefix-v13` and records `schema_prompt_policy`;
+regenerate prepared data in a fresh directory before training/resuming. New runtime
+exports pin this policy. Existing manifests without that marker remain loadable;
+an explicitly different marker is rejected. Existing adapters should be evaluated
+with the compact prompt before relying on their accuracy.
+
+### System/tools snapshots between samples
+
+The existing ASR-first / LLM-second processes and single-sample agent scheduling
+are unchanged. `--schema-cache auto` adds a bounded model-local GPU pool of **only
+the closed native system/tools prefix**, before history, context, transcript and
+observations. The prefix is rendered with the checkpoint template and must match
+the actual full input token prefix exactly. A dummy user envelope needed by Qwen's
+template is removed in full before tokenization; none of it enters the snapshot.
+
+| Option | Cross-sample behavior |
+| --- | --- |
+| `--schema-cache auto` (default) | First occurrence uses the original per-sample prefill. On a second distinct sample with the same prefix, build/admit the schema snapshot; later samples hit. Unique schemas retain no GPU pool entry. |
+| `--schema-cache shared` | Build/admit immediately, for workloads known to share schemas. |
+| `--schema-cache off` | Keep only the existing per-sample prefix cache. |
+| `--schema-cache-mb 256` | Retained snapshot storage budget in MiB; the pool also has an 8-entry LRU limit. |
+
+Schemas are keyed by the effective ordered tool contracts after installed-app
+filtering, system/template kwargs, tokenizer identity and exact token IDs. A shared
+catalog filename alone is insufficient. Changed model identity, normal parameter
+version/storage updates, dtype/device/config, active/disabled adapters or forward
+patches invalidate both levels before reuse. Call `clear_schema_cache()` after
+unsupported raw `.data`/storage mutations that bypass PyTorch version counters.
+A newly loaded model gets a new pool; nothing is serialized to disk.
+
+Every use clones all attention KV, convolution and recurrent state. Python extends
+that working copy with sample-specific data to build the usual per-sample snapshot;
+the pool entry is never mutated. Pool accounting includes distinct retained tensor
+storages, including conv/recurrent tensors. Oversized snapshots are not retained;
+LRU entries are evicted to meet the budget. The budget excludes model weights,
+per-sample/working caches and temporary activations, so actual peak VRAM is higher.
+
+`--prefix-cache off` disables both GPU levels. Both require the verified text-only
+Qwen3.5 Transformers 5.4.0 forward and default, sequence-length-independent RoPE;
+unsupported runtimes fall back to full prefill. A cache failure clears both levels
+and retries only the unexecuted generation with the original prompt. Env call logs
+and state hashes stay authoritative. CPU compaction still applies when GPU caches
+are off. `schema_cache` diagnostics report hits, builds, skipped unique/oversized
+prefixes, reused tokens, entries, storage bytes and invalidations.
+
+Rollout defaults are `--eval-schema-cache auto --eval-schema-cache-mb 256`, forwarded
+by finetune.py. A pool may persist across samples of one frozen-weight rollout view;
+ASR/clean/app-held-out view boundaries, evaluation failures and return to backward
+clear it. Training forward/backward never uses these snapshots. The notebook exposes
+`SCHEMA_CACHE_MODE` and `SCHEMA_CACHE_MB` for inference and rollout. GPU speed and
+peak memory with the full model need measurement on the target hardware.
 
 Standalone inference defaults to `--prefix-cache auto`. On the pinned
 Transformers 5.4.0 Qwen3.5 text-only runtime, it snapshots the closed native-chat
@@ -937,7 +1004,8 @@ shim extends the existing 5.4.0 linear-attention kernels with the previous conv 
 recurrent states for multi-token suffixes; unmodified HF 5.4.0 only handles cached
 single-token continuation correctly. Single-token decode/fresh prefill retain the
 original HF forward, and the shim is removed even after errors. Snapshots are
-released at sample boundaries, including failed samples. Other Transformers
+released at sample boundaries, including failed samples. The separate bounded
+system/tools pool below may persist across samples. Other Transformers
 versions, models, or patched linear-attention forwards use full prefill; a cache
 failure disables caching and retries the generation with the original full prompt.
 This does not retry or alter any executed ToolEnv call.
@@ -948,8 +1016,7 @@ misses, reused-token counts and fallback reasons. The extra persistent snapshot
 uses additional VRAM; single-step requests may not benefit. Tests cover real tiny
 Qwen3.5 FP32/BF16 logits and greedy generation, including nonzero LoRA adapters,
 but throughput/VRAM with the full 4B model and optional GPU kernels must be measured
-on the target GPU. No prompt, SFT target, adapter manifest or dependency pin is
-changed. Generic `LocalLLM.from_loaded_model` callers retain the original
+on the target GPU. Prefix reuse alone does not change prompt tokens, SFT targets or dependency pins. Generic `LocalLLM.from_loaded_model` callers retain the original
 full-prefill path unless they opt in; the validation callback explicitly requests
 cache auto modes, as described below.
 
@@ -973,7 +1040,8 @@ including the newline. Changed tokenizer identity/settings, vocabulary size, sys
 template kwargs rebuild the renderer. Unverified templates/tokenizer boundaries
 use full rendering/tokenization with prepared native messages. Closed sessions or
 ordinary strings use the original rendering path. Both CPU and GPU caches are
-released at sample boundaries, including exceptions and `ask_missing_info`.
+released at sample boundaries, including exceptions and `ask_missing_info`;
+only the separate sample-free schema pool persists when enabled.
 
 Use `--prompt-cache off` to disable CPU session preparation independently of
 `--prefix-cache off`; pass both for the original baseline. Diagnostic JSONL adds
@@ -990,7 +1058,8 @@ Validation agent rollouts during fine-tuning default to `--eval-prefix-cache aut
 and `--eval-prompt-cache auto` (also forwarded by `finetune.py`). A fresh wrapper is
 created for each callback using the current weights. Per-sample caches are cleared
 by the agent, and the callback also clears snapshots between ASR/clean views and
-before switching back to training, including after failures. Root/text `use_cache`,
+before switching back to training, including after failures. The schema pool
+can serve repeated prefixes within one view, and is cleared between views. Root/text `use_cache`,
 training mode, tokenizer sides and Python/NumPy/Torch RNG states are restored. SFT
 forward/backward keeps its original cache setting; the speedup targets validation
 rollouts, not optimizer steps. Cache modes are recorded in `training_config.json`.

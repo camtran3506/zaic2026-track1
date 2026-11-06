@@ -191,6 +191,9 @@ class LifeMateAgent:
                 report["prefix_cache"] = stats()
             if session is not None:
                 report["prompt_cache"] = session.report()
+            stats = getattr(self.llm, 'schema_cache_stats', None)
+            if callable(stats):
+                report['schema_cache'] = stats()
             return report
         finally:
             if session is not None:

@@ -168,7 +168,8 @@ def test_sft_feedback_distinguishes_reported_failure_empty_and_success(result, s
 def test_old_specialist_manifest_is_rejected_without_guessing_compatibility():
     manifest = {"prompt_policy": SFT_PROMPT_POLICY, "text_normalization": TEXT_NORMALIZATION,
                 "local_time_policy": LOCAL_TIME_POLICY, "local_helper_policy": LOCAL_HELPER_POLICY,
-                "assist_policy": ASSIST_POLICY, "itn_policy": ITN_POLICY, "execution_policy": EXECUTION_POLICY}
+                "assist_policy": ASSIST_POLICY, "itn_policy": ITN_POLICY, "execution_policy": EXECUTION_POLICY,
+                "schema_prompt_policy": 'redundant-schema-metadata-v1'}
     validate_prompt_policy(manifest)
     manifest.pop("local_helper_policy")
     with pytest.raises(ValueError, match="rerun prepare_sft"):
