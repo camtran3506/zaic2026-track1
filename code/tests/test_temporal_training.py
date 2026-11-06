@@ -59,7 +59,7 @@ def targets(examples):
 
 
 def local_targets(examples):
-    return [target for target in targets(examples) if target.get("name", "").startswith("local_time.")]
+    return [target for target in targets(examples) if target.get("name", "").startswith("local_")]
 
 
 @pytest.mark.parametrize("text", [
@@ -71,11 +71,13 @@ def test_duration_demonstration_with_numeric_or_spoken_times(text):
     env = Env()
     examples = replay_sample(record, CATALOG, env, Path("/unused"))
     helpers = local_targets(examples)
-    assert [h["name"] for h in helpers] == ["local_time.calendar_reference", "local_time.duration_between"]
-    assert helpers[1]["arguments"] == {"start": "2026-10-13T19:30:00+07:00", "end": "2026-10-13T20:10:00+07:00"}
+    assert [h["name"] for h in helpers] == ["local_assist.solve"]
+    assert helpers[0]["arguments"]["task"] == 'duration'
+    assert all(span in text for span in helpers[0]["arguments"]["inputs"].values())
     env_target = next(row for row in examples if json.loads(row["messages"][-1]["content"]).get("name") == "learning.log_progress")
     observations = json.loads(env_target["messages"][1]["content"])["previous_actions_and_results"]
-    assert json.loads(observations[-1]["result"]) == {"ok": True, "minutes": 40}
+    result = json.loads(observations[-1]["result"])
+    assert result['status'] == 'resolved' and result['result'] == {'minutes': 40}
     assert env.calls == record["label"]["tool_calls"]
 
 
@@ -100,10 +102,11 @@ def test_departure_demonstration_waits_for_observed_route_and_keeps_env_hash():
     env, baseline = Env(), Env()
     examples = replay_sample(record, CATALOG, env, Path("/unused"))
     names = [target.get("name", "done") for target in targets(examples)]
-    assert names == ["local_time.calendar_reference", "maps.get_route", "local_time.departure_time", "reminders.create", "done"]
-    departure = next(row for row in examples if json.loads(row["messages"][-1]["content"]).get("name") == "local_time.departure_time")
+    assert names == ["maps.get_route", "local_assist.solve", "reminders.create", "done"]
+    departure = next(row for row in examples if json.loads(row["messages"][-1]["content"]).get("name") == "local_assist.solve")
     args = json.loads(departure["messages"][-1]["content"])["arguments"]
-    assert args == {"arrival": "2026-09-22T09:00:00+07:00", "travel_minutes": 15, "early_minutes": 15}
+    assert args == {'task': 'departure_time', 'inputs': {'date_text': 'sáng mai', 'arrival_time': 'Chín giờ sáng',
+                                                       'travel_minutes': 15, 'early_minutes': 15}}
     for call in record["label"]["tool_calls"]:
         baseline.call(call["name"], call["arguments"])
     assert env.get_state_hash() == baseline.get_state_hash()

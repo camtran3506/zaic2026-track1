@@ -18,6 +18,8 @@ from lifemate.local_time import LOCAL_TIME_POLICY
 from lifemate.local_helpers import LOCAL_HELPER_POLICY, helper_tool_schemas
 from lifemate.specialist_training import SPECIALIST_TRAINING_POLICY
 from lifemate.temporal_training import TEMPORAL_TRAINING_POLICY
+from lifemate.assist_training import ASSIST_TRAINING_POLICY
+from lifemate.local_assist import ASSIST_POLICY
 from lifemate.data_generalization import (POLICY as GENERALIZATION_POLICY, AppAugmenter, add_arguments,
     load_groups, split_generalization, assert_no_heldout, validate_options)
 from lifemate.context import MAX_CONTEXT_TOKENS, DEFAULT_MAX_NEW_TOKENS, validate_training_length
@@ -96,6 +98,7 @@ def main():
                     execution_policy=EXECUTION_POLICY,
                     local_time_policy=LOCAL_TIME_POLICY,
                     local_helper_policy=LOCAL_HELPER_POLICY,
+                    assist_policy=ASSIST_POLICY, assist_training_policy=ASSIST_TRAINING_POLICY,
                     specialist_training_policy=SPECIALIST_TRAINING_POLICY,
                     temporal_helper_training_policy=TEMPORAL_TRAINING_POLICY,
                     transcript_mixing={"policy": "seeded-sample-v1", "unit": "sample",
@@ -134,7 +137,7 @@ def main():
                     if partition != "train":
                         asr_prepared, clean_prepared = prepare_validation_transcripts(record, split_dir, asr, prepared)
                     examples = replay_sample(record, catalog, env, split_dir, asr,
-                                             prepared_transcript=prepared)
+                                             prepared_transcript=prepared, tokenizer=tokenizer)
                 except UnexposedToolError as exc:
                     if args.missing_tool_policy == "error":
                         raise

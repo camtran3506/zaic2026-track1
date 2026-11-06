@@ -1,14 +1,15 @@
 """Specialists-as-tools registry: bounded Python functions, no nested LLM/env."""
-from . import local_checks, local_knowledge, local_time
+from . import local_assist, local_checks, local_knowledge, local_time
 from .batching import BATCH_TOOL, batch_schema
 
 LOCAL_HELPER_POLICY = "python-specialists-itn-v2"
 _PREFIXES = ("local_time.", "local_context.", "local_entity.", "local_text.",
-             "local_checks.", "local_schema.", "local_batch.")
+             "local_checks.", "local_schema.", "local_batch.", "local_assist.")
 
 
 def helper_tool_schemas():
-    return {**local_time.local_tool_schemas(), **local_knowledge.schemas(), **local_checks.schemas()}
+    return {**local_time.local_tool_schemas(), **local_knowledge.schemas(), **local_checks.schemas(),
+            **local_assist.schemas()}
 
 
 def with_local_tools(env_tools):
@@ -17,7 +18,7 @@ def with_local_tools(env_tools):
     return {**env_tools, **helper_tool_schemas(), BATCH_TOOL: batch_schema()}
 
 
-def execute_helper(name, arguments, context, history, env_tools, observations=None):
+def execute_helper(name, arguments, context, history, env_tools, observations=None, *, trace=None):
     if not isinstance(name, str) or not isinstance(arguments, dict):
         raise ValueError("Local helper name must be a string and arguments a JSON object")
     if not isinstance(context, dict) or not isinstance(history, list) or not isinstance(env_tools, dict):
@@ -28,6 +29,8 @@ def execute_helper(name, arguments, context, history, env_tools, observations=No
     validation = local_checks.inspect_call(name, arguments, schemas)
     if validation["status"] == "invalid":
         raise ValueError(f"Invalid helper arguments: {validation['errors']}")
+    if name == local_assist.ASSIST_TOOL:
+        return local_assist.solve(arguments, context, trace=trace)
     if name.startswith("local_time."):
         return local_time.execute_local_tool(name, arguments, context)
     if name.startswith(("local_context.", "local_entity.")):

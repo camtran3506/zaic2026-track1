@@ -66,7 +66,7 @@ def successful(observation):
         return False
     if 'ok' in result:
         return result['ok'] is True and result.get('done') is not False
-    return result.get('status') in {'ok', 'matched', 'valid'}
+    return result.get('status') in {'ok', 'matched', 'valid', 'resolved'}
 
 
 def batch_observation(calls, results):

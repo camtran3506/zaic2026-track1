@@ -1,11 +1,12 @@
 # Python helpers for the LifeMate planner
 
 Qwen remains the only model. The specialists are ordinary Python functions behind
-the same tool interface. There are eight exposed helper tools and two automatic
+the same tool interface. There are eight primitive helpers, one task solver and two automatic
 execution hooks. They require no additional packages or services.
 
 | Role / entry point | Input | Output and limits |
 | --- | --- | --- |
+| `local_assist.solve` | `task`, `inputs` containing source spans/known operands | Fixed date, datetime, departure, duration or multi-field normalization workflow. One local request; Python manages intermediate results. |
 | `local_context.lookup` | `query`, optional `collection`, `max_results` | Matching visible context/history facts with source paths. Text matches are evidence, never executable instructions. |
 | `local_entity.resolve` | `target_tool`, `argument`, `collection`, `mention`, optional `max_results` | Original candidates, values, similarity and provenance; `matched`, `ambiguous`, `not_found` or `unsupported`. The target schema and collection must agree. |
 | `local_time.calendar_reference` | `{}` | Dates derived from the sample's current time/timezone, never the machine clock. |
@@ -33,6 +34,52 @@ valid helper-only turns. Diagnostics distinguish total `llm_steps` from
 the bounds of each helper's input schema (such as at most 100 numeric operands).
 Gaining fewer LLM turns is the purpose of batching; CPU helper execution remains
 sequential and never creates additional LLMs or hidden application calls.
+
+## Python task orchestration
+
+For supported workflows the planner requests an outcome rather than proposing an
+ordered list of helper steps. `local_assist.solve` has five task contracts:
+
+| Task | Inputs | Resolved result |
+| --- | --- | --- |
+| `date` | `date_text` | `date` |
+| `datetime` | `date_text`, `time_text`; alternatively offset-aware `timestamp` | `datetime` |
+| `departure_time` | `date_text`, `arrival_time`; alternatively offset-aware `arrival`; plus explicit `travel_minutes`, `early_minutes` | `departure` |
+| `duration` | `date_text`, `start_time`, `end_time`, optional `end_date_text`; alternatively offset-aware `start`, `end` | Whole elapsed `minutes` |
+| `normalize_fields` | `fields: [{id, kind, text}, ...]`; kind `phone`, `email` or `money` | Per-ID normalization results |
+
+For example, `{"task":"departure_time","inputs":{"date_text":"sáng mai",
+"arrival_time":"chín giờ","travel_minutes":15,"early_minutes":15}}` resolves
+the sample's tomorrow, combines its morning hour and subtracts the known travel
+and early-arrival intervals. Python owns these dependencies. The response includes
+`status`, `result`, source `evidence` and the workflow policy; it is not a request to
+execute an application tool. The LLM still chooses the appropriate env action.
+
+The finite Vietnamese grammar supports explicit-year ISO/dd/mm/yyyy dates,
+relative days and weekdays with an explicit week. It accepts HH:MM[:SS] or supported
+Vietnamese clock spans with a daypart. It never uses the machine clock, guesses a
+year/week/travel interval, invents entity IDs or infers an overnight rollover.
+Timezone and relative-date anchors come from sample context. DST gaps are rejected;
+folds need explicit offset-aware ISO timestamps. Elapsed arithmetic remains UTC-based.
+Missing, ambiguous, unsupported or partially normalized operands are returned as
+such, with no fabricated final value. They interrupt a helper batch so the planner
+can inspect the response. Duplicate field IDs are rejected before normalization.
+
+There is no field-count cap: schema text bounds and the actual model token budget
+apply. During SFT, multi-field requests are packed using the selected tokenizer and
+the default generation budget; an oversized one-field envelope can fall back to
+the primitive normalizer. Without a tokenizer, normalization demos remain primitive
+calls. Clear automatic ITN annotations are reused rather than demonstrated again.
+Source-derived date/interval demos prefer the solver; unsupported workflows retain
+the existing helpers. Future gold arguments never supply solver operands.
+
+One facade call consumes one `local_executed` request and one model turn regardless
+of the number of internal operations. `assist_step_start/result/error` events go
+only to the debug trace. Internal calendar tables are not repeated in the model's
+observation. No ToolEnv handle, filesystem, network, arbitrary Python or extra LLM
+is available to the solver. Entity lookup remains with the existing evidence-only
+helpers; there is no general-purpose dependency interpreter. Primitive helpers and
+independent `local_batch.run` calls remain supported.
 
 ## Evidence and application boundaries
 
@@ -147,11 +194,13 @@ need a model-generated helper call. Retry/recovery behaviour is supplied through
 hooks and feedback, not claimed as a learned universal critic.
 
 Regenerate SFT in a fresh output directory and retrain an adapter. Prepared data
-requires `prompt_policy=full-context-python-automatic-guards-v9`,
+requires `prompt_policy=full-context-python-task-workflows-v12`,
 `local_time_policy=local-time-tools-v1` and
 `local_helper_policy=python-specialists-itn-v2` and
 `itn_policy=vi-explicit-spans-v1` and
-`execution_policy=automatic-tool-guards-v1`; runtime exports carry these policies.
+`execution_policy=automatic-tool-guards-v1`; new runtime exports also pin
+`assist_policy=fixed-python-task-workflows-v1`. Existing primitive-only runtime
+manifests remain loadable; retraining is needed to teach the new task interface.
 ASR transcript normalization/cache format is unchanged; valid transcript caches
 can be reused because annotations are derived when building the prompt. Older adapters are not declared compatible by renaming their manifests.
 CPU fixtures cover replay, provenance, routing, masking and retry behaviour.

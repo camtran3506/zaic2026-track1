@@ -17,11 +17,14 @@ from .execution_policy import EXECUTION_POLICY, LoopMonitor
 from .tool_execution import precheck_call, attempt_env_call, result_observation
 from .specialist_training import specialist_demonstrations
 from .temporal_training import helper_demonstrations
+from .assist_training import task_demonstrations
+from .local_assist import ASSIST_TOOL, ASSIST_POLICY
+from .context import DEFAULT_MAX_NEW_TOKENS
 from .text import TEXT_NORMALIZATION, normalize_transcript
 from .itn import ITN_POLICY
 
 
-SFT_PROMPT_POLICY = "full-context-token-bounded-helpers-v11"
+SFT_PROMPT_POLICY = "full-context-python-task-workflows-v12"
 VALIDATION_ROLLOUT_POLICY = "asr-only-paired-clean-v1"
 DEFAULT_ASR_TRANSCRIPT_RATIO = 0.5
 
@@ -52,6 +55,7 @@ def validate_prompt_policy(manifest):
             or manifest.get("text_normalization") != TEXT_NORMALIZATION
             or manifest.get("local_time_policy") != LOCAL_TIME_POLICY
             or manifest.get("local_helper_policy") != LOCAL_HELPER_POLICY
+            or manifest.get("assist_policy") != ASSIST_POLICY
             or manifest.get("itn_policy") != ITN_POLICY
             or manifest.get("execution_policy") != EXECUTION_POLICY):
         raise ValueError("Prepared SFT data uses an older prompt/text-normalization/evaluation policy; "
@@ -126,7 +130,7 @@ def prepare_validation_transcripts(item, split_dir, asr, prepared_transcript):
     return asr_prepared, clean_prepared
 
 
-def replay_sample(item, catalog, env, split_dir, asr=None, prepared_transcript=None):
+def replay_sample(item, catalog, env, split_dir, asr=None, prepared_transcript=None, *, tokenizer=None):
     """Replay TRAIN gold in order; never expose future calls in earlier prompts."""
     calls = item.get("label", {}).get("tool_calls")
     if not isinstance(calls, list):
@@ -151,6 +155,40 @@ def replay_sample(item, catalog, env, split_dir, asr=None, prepared_transcript=N
             {"role": "assistant", "content": json.dumps(target, ensure_ascii=False, separators=(",", ":"))},
         ]}
 
+    def helper_rows(helper):
+        """Pack field normalization by actual completion tokens, never a count cap."""
+        if helper['name'] != ASSIST_TOOL or helper['arguments']['task'] != 'normalize_fields':
+            yield helper
+            return
+        remaining = list(helper['arguments']['inputs']['fields'])
+        while remaining:
+            _, prompt = build_step_prompt(transcript, context, history, enabled, observations)
+            messages = [{'role': 'system', 'content': SYSTEM_PROMPT}, {'role': 'user', 'content': prompt}]
+            prefix = chat_token_ids(tokenizer, messages, True)
+
+            def fits(candidate):
+                target = {'action': 'call', **candidate}
+                full = chat_token_ids(tokenizer, messages+[{'role': 'assistant', 'content': json.dumps(target, ensure_ascii=False)}], False)
+                return full[:len(prefix)] == prefix and 0 < len(full)-len(prefix) <= DEFAULT_MAX_NEW_TOKENS
+
+            chunk = []
+            for field in remaining:
+                candidate = {'name': ASSIST_TOOL, 'arguments': {'task': 'normalize_fields', 'inputs': {'fields': chunk+[field]}}}
+                if not fits(candidate):
+                    break
+                chunk.append(field)
+            if chunk:
+                yield {'name': ASSIST_TOOL, 'arguments': {'task': 'normalize_fields', 'inputs': {'fields': chunk}}}
+                remaining = remaining[len(chunk):]
+            else:
+                # A one-field facade can exceed the generation budget due to its
+                # envelope. Preserve the supported primitive interface as fallback.
+                field = remaining.pop(0)
+                candidate = {'name': 'local_text.normalize', 'arguments': {k: field[k] for k in ('kind', 'text')}}
+                if not fits(candidate):
+                    raise ValueError(f"{item['id']}: normalization source exceeds the generation token budget; use a shorter source span")
+                yield candidate
+
     for step, call in enumerate(calls):
         name, args = call.get("name"), call.get("arguments")
         rejection = precheck_call(name, args, catalog, enabled, monitor)
@@ -163,10 +201,13 @@ def replay_sample(item, catalog, env, split_dir, asr=None, prepared_transcript=N
         # history and previous results, never from this gold action's operands.
         helpers = helper_demonstrations(transcript, context, history, enabled, observations)
         helpers += specialist_demonstrations(transcript, context, history, enabled, observations, pending=helpers)
+        helpers = task_demonstrations(transcript, context, enabled, observations, helpers,
+                                      normalize_fields=tokenizer is not None)
         for helper in helpers:
-            examples.append(example({"action": "call", **helper}, len(examples)))
-            local_result = execute_helper(helper["name"], helper["arguments"], context, history, enabled, observations)
-            observations.append({**helper, "scope": "local", "result": full_json(local_result)})
+            for packed in helper_rows(helper):
+                examples.append(example({"action": "call", **packed}, len(examples)))
+                local_result = execute_helper(packed["name"], packed["arguments"], context, history, enabled, observations)
+                observations.append({**packed, "scope": "local", "result": full_json(local_result)})
         examples.append(example({"action": "call", "name": name, "arguments": args}, len(examples)))
         outcome = attempt_env_call(env, name, args, enabled[name].get("kind", "unknown"), monitor, step)
         if not outcome["executed"]:

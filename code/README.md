@@ -94,7 +94,7 @@ Other model families keep the portable JSON-decision protocol. Runtime manifests
 record `qwen35-native-fc-v1` for Qwen3.5; an old Qwen3.5 JSON-protocol adapter is
 rejected instead of silently mixing protocols. Regenerate SFT in a fresh directory
 and retrain that adapter. The current preparation policy is
-`full-context-token-bounded-helpers-v11`. Production never replaces the checkpoint template;
+`full-context-python-task-workflows-v12`. Production never replaces the checkpoint template;
 tests use a pinned upstream Qwen3.5 template fixture without downloading weights.
 
 ## Group independent helpers and reads into one LLM turn
@@ -173,7 +173,7 @@ of the old 8-call truncation; deduplication of already executed demos remains. T
 null. Larger output budgets permit larger helper groups, not a fixed helper count.
 
 Create a new run/SFT directory and fine-tune on policy
-`full-context-token-bounded-helpers-v11` to teach the controller format. Single-call
+`full-context-python-task-workflows-v12` to teach the controller format. Single-call
 inference remains supported for existing compatible adapters; adding the controller
 does not establish that an older adapter will use batches effectively. Regenerate
 old SFT before training/resuming with this policy. No additional LLM, runtime package
@@ -181,6 +181,40 @@ or extra CLI flag is required. Rollout validation uses the same batched agent an
 still scores the original env call log/state hash. GPU latency and accuracy gains
 require measurement on the actual model; fewer planning turns alone is not a
 guarantee of the same percentage reduction in wall time.
+
+## Resolve helper chains in Python
+
+`local_assist.solve` accepts one `task` with source `inputs` instead of a model-written
+sequence of helper calls. Fixed workflows resolve dates/datetimes, departure times,
+intervals and multiple phone/email/money fields. Python passes intermediate values
+between calendar, date/time parsing and arithmetic/normalization functions. The LLM
+receives the final result and source evidence in one local observation; detailed
+internal steps stay in the debug trace. No additional model, package, ToolEnv call,
+hidden state read or automatic env write is involved.
+
+For example, `task=departure_time` with `date_text="sáng mai"`,
+`arrival_time="chín giờ"`, `travel_minutes=15`, `early_minutes=15` resolves the sample's
+local tomorrow and returns the departure timestamp. It does not require a separate
+calendar call or LLM arithmetic. Missing travel minutes, an ambiguous weekday/time,
+a DST gap/fold or an unstated overnight date return explicit unresolved feedback;
+no default operand is invented. Zero travel/early minutes must be explicit operands.
+
+The [helper contracts](HELPERS.md#python-task-orchestration) list supported tasks,
+fields and limitations. Entity/context/arithmetic helpers remain available, as does
+`local_batch.run` for independent tasks. The solver is a fixed task dispatcher, not
+an interpreter for arbitrary steps. One facade request counts as one local helper
+regardless of its internal operations; the official call budget/log is unchanged.
+
+SFT demonstrates supported source-derived workflows using the same implementation
+as inference. It waits for genuine earlier read results, never future gold operands.
+Multi-field normalization is split by actual completion tokens when necessary,
+without a numeric field-count cap. It retains primitives when the source/workflow
+is unsupported, or when untokenized preparation cannot establish a field budget.
+Gold replay order and final state are unchanged. The preparation policy is now
+`full-context-python-task-workflows-v12`; create a fresh SFT/run directory and retrain
+to teach the new interface. Valid transcript caches can be reused; no new CLI flag
+is needed. Existing compatible primitive-only adapters still load, but efficient
+use of the solver and GPU latency gains require training and held-out measurement.
 
 ## Internal date and time tools
 
@@ -231,10 +265,11 @@ coverage for the chosen clean/ASR mixture. Helper demonstrations are conditional
 so adding schemas does not guarantee that every input supplies all three targets.
 
 Regenerate prepared SFT in a fresh directory: the manifest must record
-`prompt_policy=full-context-token-bounded-helpers-v11` and
+`prompt_policy=full-context-python-task-workflows-v12` and
 `local_time_policy=local-time-tools-v1` and
 `local_helper_policy=python-specialists-itn-v2` and
 `itn_policy=vi-explicit-spans-v1` and
+`assist_policy=fixed-python-task-workflows-v1` and
 `execution_policy=automatic-tool-guards-v1`. Existing runtime artifacts must carry
 these same local policies; adding tool schemas alone does not establish that an old
 adapter learned to use them. Unit and fixture tests cover these paths; real
@@ -274,7 +309,7 @@ SFT adds conservative demonstrations from visible inputs and prior actual result
 with the same local execution and assistant-only loss path used at inference.
 Schema-repair demonstrations require a prior rejected proposal; result verification
 and retry monitoring also run automatically. Rebuild prepared SFT and retrain an
-adapter for policy `full-context-token-bounded-helpers-v11`. Manifests with a different
+adapter for policy `full-context-python-task-workflows-v12`. Manifests with a different
 helper policy are rejected; legacy adapters without a manifest emit an explicit
 warning and have no verified helper training. Accuracy and added
 LLM-turn latency must be measured on held-out Qwen GPU evaluation.
@@ -455,7 +490,7 @@ including tool-only turns. Tool results are not clipped. The on-disk transcript
 cache retains this same full history, so compatible caches can be reused.
 Regenerate older SFT datasets in a new output directory: shortened data cannot
 be recovered by the trainer. Training and rollout evaluation reject manifests
-without the current `prompt_policy: full-context-token-bounded-helpers-v11` marker.
+without the current `prompt_policy: full-context-python-task-workflows-v12` marker.
 `--use-train-transcript` still requires `split=train`; test request audio is always
 transcribed rather than read from a possible `audio_text` field.
 

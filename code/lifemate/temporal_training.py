@@ -10,31 +10,16 @@ import re
 from zoneinfo import ZoneInfo
 
 from .local_time import execute_local_tool
+from .temporal_text import NUMBER as _NUMBER, CLOCK as _CLOCK, number as _number
 
 
 TEMPORAL_TRAINING_POLICY = "observable-temporal-helpers-v1"
-_UNITS = {"không": 0, "một": 1, "hai": 2, "ba": 3, "bốn": 4, "tư": 4,
-          "năm": 5, "lăm": 5, "sáu": 6, "bảy": 7, "tám": 8, "chín": 9}
-_UNIT_PATTERN = "(?:" + "|".join(_UNITS) + ")"
-_NUMBER = rf"(?:\d{{1,2}}|mười(?:\s+{_UNIT_PATTERN})?|{_UNIT_PATTERN}\s+mươi(?:\s+{_UNIT_PATTERN})?|{_UNIT_PATTERN})"
-_CLOCK = re.compile(rf"(?<!\w)(?P<hour>{_NUMBER})\s*(?:(?P<half>rưỡi)|(?:giờ|:|h)\s*(?P<minute>{_NUMBER})?)(?!\w)")
 _DATE_WORDS = re.compile(r"\b(?:hôm|mai|mốt|ngày|tuần|thứ|chủ nhật)\b")
 _EARLY = re.compile(rf"(?:đến|tới)\s+sớm\s+(?P<minutes>{_NUMBER})\s+phút")
 _ALARM_BEFORE = re.compile(rf"báo thức trước đó\s+(?P<offset>một tiếng|nửa tiếng|{_NUMBER}\s+phút)")
 _TEMPORAL_REQUEST = re.compile(r"nhắc|báo thức|đặt.*(?:vé|chuyến|lịch)|lịch|hẹn|giờ|thời gian|học|tiến độ|đi bộ|chạy bộ|thời tiết|dự báo|mưa")
 _TEMPORAL_ENV = {"calendar", "alarm", "reminders", "weather", "flights",
                  "learning", "fitness", "maps", "medication", "tv"}
-
-
-def _number(value):
-    if value.isdigit():
-        return int(value)
-    words = value.split()
-    if words[0] == "mười":
-        return 10 + (_UNITS[words[1]] if len(words) == 2 else 0)
-    if len(words) > 1 and words[1] == "mươi":
-        return _UNITS[words[0]] * 10 + (_UNITS[words[2]] if len(words) == 3 else 0)
-    return _UNITS[words[0]]
 
 
 def _clocks(text):

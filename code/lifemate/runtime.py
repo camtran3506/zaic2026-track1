@@ -11,6 +11,7 @@ from .context import DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_NEW_TOKENS, MAX_CONTE
 from .function_calling import JSON_PROTOCOL, NATIVE_PROTOCOL
 from .local_time import LOCAL_TIME_POLICY
 from .local_helpers import LOCAL_HELPER_POLICY
+from .local_assist import ASSIST_POLICY
 from .text import TEXT_NORMALIZATION
 from .itn import ITN_POLICY
 from .execution_policy import EXECUTION_POLICY
@@ -126,6 +127,7 @@ def make_runtime_manifest(model_path, tokenizer, seed=DEFAULT_SEED, policy=None)
             "execution_policy": EXECUTION_POLICY,
             "local_time_policy": LOCAL_TIME_POLICY,
             "local_helper_policy": LOCAL_HELPER_POLICY,
+            "assist_policy": ASSIST_POLICY,
             "model_fingerprint": model_fingerprint(model_path),
             "tokenizer_fingerprint": tokenizer_fingerprint(tokenizer),
             "chat_template_kwargs": dict(getattr(tokenizer, "lifemate_template_kwargs", {})),
@@ -169,6 +171,9 @@ def load_runtime_manifest(model_path, tokenizer, artifact_path=None):
         raise ValueError("Local time tool policy differs from training/export; regenerate SFT and retrain the adapter")
     if manifest.get("local_helper_policy") != LOCAL_HELPER_POLICY:
         raise ValueError("Python specialist helper policy differs from training/export; regenerate SFT and retrain the adapter")
+    # Existing primitive-only adapters remain loadable; new exports pin workflows.
+    if manifest.get("assist_policy", ASSIST_POLICY) != ASSIST_POLICY:
+        raise ValueError("Python task workflow policy differs from training/export; regenerate SFT and retrain the adapter")
     if manifest.get("itn_policy") != ITN_POLICY:
         raise ValueError("ITN policy differs from training/export; regenerate SFT and retrain the adapter")
     if manifest.get("execution_policy") != EXECUTION_POLICY:

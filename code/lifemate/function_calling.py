@@ -9,6 +9,7 @@ import re
 
 from .execution_policy import AUTOMATIC_GUARD_INSTRUCTIONS
 from .batching import BATCH_TOOL, BATCH_INSTRUCTIONS
+from .local_assist import ASSIST_TOOL, ASSIST_INSTRUCTIONS
 
 
 NATIVE_PROTOCOL = "qwen35-native-fc-v1"
@@ -42,7 +43,7 @@ NATIVE_SYSTEM_PROMPT = """Bạn là AI Agent LifeMate. Hoàn tất yêu cầu ti
 """
 
 
-NATIVE_SYSTEM_PROMPT += AUTOMATIC_GUARD_INSTRUCTIONS + BATCH_INSTRUCTIONS
+NATIVE_SYSTEM_PROMPT += AUTOMATIC_GUARD_INSTRUCTIONS + BATCH_INSTRUCTIONS + ASSIST_INSTRUCTIONS
 
 
 def _json(value):
@@ -157,6 +158,10 @@ _CALL = re.compile(
 _PARAMETER = re.compile(r"<parameter=([^>\n]+)>(.*?)</parameter>\s*(?=<parameter=|$)", re.DOTALL)
 _BATCH_PREFIX = re.compile(r'<tool_call>\s*<function=' + re.escape(BATCH_TOOL) + r'>\s*<parameter=calls>\s*')
 _BATCH_END = re.compile(r'\s*</parameter>\s*</function>\s*</tool_call>')
+_ASSIST_PREFIX = re.compile(r'<tool_call>\s*<function=' + re.escape(ASSIST_TOOL) + r'>\s*')
+_PARAMETER_OPEN = re.compile(r'<parameter=([^>\n]+)>')
+_PARAMETER_END = re.compile(r'\s*</parameter>\s*')
+_FUNCTION_END = re.compile(r'</function>\s*</tool_call>')
 
 
 def _batch_parts(visible, start):
@@ -174,11 +179,49 @@ def _batch_parts(visible, start):
     return calls, closing.end()
 
 
+def _assist_parts(visible, start):
+    """The solver's inputs object owns any XML-looking strings nested in it."""
+    prefix = _ASSIST_PREFIX.match(visible, start)
+    if prefix is None:
+        return None
+    fields, pos = [], prefix.end()
+    while True:
+        closing = _FUNCTION_END.match(visible, pos)
+        if closing:
+            return fields, closing.end()
+        parameter = _PARAMETER_OPEN.match(visible, pos)
+        if parameter is None:
+            return None
+        key, pos = parameter[1], parameter.end()
+        if key == 'inputs':
+            # Do not search for XML closers until the JSON value is complete.
+            pos += len(visible[pos:])-len(visible[pos:].lstrip())
+            try:
+                value, end = json.JSONDecoder().raw_decode(visible, pos)
+            except ValueError:
+                return None
+            closing = _PARAMETER_END.match(visible, end)
+            if closing is None:
+                return None
+            fields.append((key, value))
+            pos = closing.end()
+        else:
+            end = visible.find('</parameter>', pos)
+            if end < 0:
+                return None
+            fields.append((key, _parameter_value(visible[pos:end], {'type': 'string'})))
+            pos = end+len('</parameter>')
+            pos += len(visible[pos:])-len(visible[pos:].lstrip())
+
+
 def complete_native_call(text):
     visible = visible_output(text)
     start = _native_start(visible)
     if start is not None and _BATCH_PREFIX.match(visible, start):
         parts = _batch_parts(visible, start)
+        return visible[start:parts[1]] if parts else None
+    if start is not None and _ASSIST_PREFIX.match(visible, start):
+        parts = _assist_parts(visible, start)
         return visible[start:parts[1]] if parts else None
     match = _first_native_match(visible)
     return match.group(0) if match else None
@@ -243,6 +286,16 @@ def parse_native_call(text, catalog):
         if parts is None or visible[parts[1]:].strip().removesuffix('<|im_end|>').strip():
             raise ValueError('Expected one complete batch call with a JSON calls argument and no suffix')
         return {'action': 'call', 'name': BATCH_TOOL, 'arguments': {'calls': parts[0]}}
+    if start is not None and _ASSIST_PREFIX.match(visible, start):
+        parts = _assist_parts(visible, start)
+        if parts is None or visible[parts[1]:].strip().removesuffix('<|im_end|>').strip():
+            raise ValueError('Expected one complete task call with JSON inputs and no suffix')
+        arguments = {}
+        for key, value in parts[0]:
+            if key in arguments:
+                raise ValueError(f'Duplicate native parameter: {key}')
+            arguments[key] = value
+        return {'action': 'call', 'name': ASSIST_TOOL, 'arguments': arguments}
     match = _first_native_match(visible)
     if not match or visible[match.end():].strip().removesuffix("<|im_end|>").strip():
         raise ValueError("Expected exactly one complete native tool call with no suffix")

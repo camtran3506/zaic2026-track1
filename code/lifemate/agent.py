@@ -11,6 +11,7 @@ from .catalog import allowed_tools
 from .eval_trace import exception_details
 from .history import prompt_history, resolve_history
 from .local_helpers import execute_helper, helper_tool_schemas, with_local_tools
+from .local_assist import ASSIST_INSTRUCTIONS
 from .local_checks import inspect_call
 from .execution_policy import AUTOMATIC_GUARD_INSTRUCTIONS, LoopMonitor
 from .tool_execution import precheck_call, attempt_env_call, result_observation
@@ -59,7 +60,7 @@ QUY TẮC BẮT BUỘC:
 """
 
 
-SYSTEM_PROMPT += AUTOMATIC_GUARD_INSTRUCTIONS + BATCH_INSTRUCTIONS
+SYSTEM_PROMPT += AUTOMATIC_GUARD_INSTRUCTIONS + BATCH_INSTRUCTIONS + ASSIST_INSTRUCTIONS
 
 
 def parse_decision(raw: str, catalog=None) -> dict:
@@ -263,7 +264,8 @@ class LifeMateAgent:
                 local_executed += 1
                 emit('local_call_start', name=name, arguments=args, local_call_index=local_executed-1)
                 try:
-                    result = execute_helper(name, args, context, history, enabled, observation_children(observations))
+                    result = execute_helper(name, args, context, history, enabled,
+                                            observation_children(observations), trace=emit)
                     if result.get('status') == 'invalid_request':
                         reject(str(result.get('warnings', 'Invalid helper request')), 'local_validate', name=name, arguments=args)
                 except ValueError as exc:
