@@ -230,7 +230,7 @@ Các cell dưới ghi mã vào `/kaggle/working/lifemate_app` để chạy trong
 for rel in ['lifemate/__init__.py', 'lifemate/catalog.py', 'lifemate/models.py', 'lifemate/agent.py', 'lifemate/transcripts.py', 'lifemate/decoding.py',
             'lifemate/gpu.py', 'lifemate/context.py', 'lifemate/text.py', 'lifemate/function_calling.py', 'lifemate/asr.py', 'lifemate/llm.py', 'lifemate/prefix_cache.py', 'lifemate/prompt_session.py', 'lifemate/runtime.py', 'lifemate/history.py', 'lifemate/scoring.py', 'lifemate/evaluation.py', 'lifemate/eval_diagnostics.py', 'lifemate/eval_trace.py',
             'lifemate/local_time.py', 'lifemate/temporal_text.py', 'lifemate/temporal_training.py', 'lifemate/batching.py',
-            'lifemate/schema_prompt.py', 'lifemate/schema_cache.py',
+            'lifemate/schema_prompt.py', 'lifemate/schema_cache.py', 'lifemate/numerics.py',
             'lifemate/local_assist.py', 'lifemate/assist_training.py',
             'lifemate/itn.py', 'lifemate/local_helpers.py', 'lifemate/local_knowledge.py', 'lifemate/local_checks.py',
             'lifemate/execution_policy.py', 'lifemate/tool_execution.py', 'lifemate/specialist_training.py',
@@ -240,7 +240,7 @@ for rel in ['lifemate/__init__.py', 'lifemate/catalog.py', 'lifemate/models.py',
             'tests/test_staged_pipeline.py', 'tests/test_decoding.py', 'tests/test_stopping_filters.py', 'tests/test_scoring.py', 'tests/test_evaluation.py', 'tests/test_batching.py', 'tests/test_data_generalization.py', 'tests/test_rollout_cache_lifecycle.py',
             'tests/test_transcript_normalization.py', 'tests/test_text.py', 'tests/test_runtime_parity.py', 'tests/test_runtime_config.py',
             'tests/test_native_function_calling.py', 'tests/test_prefix_cache.py', 'tests/test_prompt_session.py', 'tests/test_transcript_mixing.py', 'tests/test_eval_diagnostics.py', 'tests/test_eval_trace.py',
-            'tests/test_schema_prompt.py', 'tests/test_schema_cache.py',
+            'tests/test_schema_prompt.py', 'tests/test_schema_cache.py', 'tests/test_numerics.py',
             'tests/test_tool_validation.py',
             'tests/test_local_time.py', 'tests/test_local_time_runtime.py',
             'tests/test_local_tools_agent.py', 'tests/test_temporal_training.py', 'tests/test_local_time_evaluation.py', 'tests/test_local_assist.py',
@@ -422,6 +422,9 @@ if TRAIN_LLM:
         run_logged(train_command, OUT / "training_pipeline.log", cwd=APP, env=FT_ENV)
     finally:
         if FT_RUN.is_dir():
+            numerics_debug = FT_RUN / "training/debug_numerics"
+            if numerics_debug.is_dir():
+                shutil.copytree(numerics_debug, OUT / "training_debug_numerics", dirs_exist_ok=True)
             for filename in ("prepare_sft.log", "train_lora.log", "base_model.json",
                              "training/training_config.json", "training/eval_results.json",
                              "training/train_results.json", "training/trainer_state.json", "training/validation_scores.jsonl", "sft/manifest.json",

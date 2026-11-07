@@ -11,6 +11,7 @@ from lifemate.context import MAX_CONTEXT_TOKENS, validate_training_length
 from lifemate.llm import is_qwen35, model_loader, lora_targets, configure_tokenizer
 from lifemate.runtime import (make_runtime_manifest, runtime_save_callback,
                               save_runtime_manifest, training_dtype)
+from lifemate.numerics import NUMERICS_POLICY, guarded_trainer_class
 
 
 def main():
@@ -117,7 +118,8 @@ def main():
         ids[part] = {e["sample_id"] for e in examples}
         if ids[part] != set(manifest["partitions"][part]["sample_ids"]):
             raise ValueError(f"{part} sample IDs disagree with manifest")
-        data[part] = SupervisedDataset(examples, tokenizer, args.max_length)
+        data[part] = SupervisedDataset(examples, tokenizer, args.max_length,
+                                      include_debug_metadata=True, source_path=path)
     if ids["train"] & ids["validation"]:
         raise ValueError("Train/validation sample leakage")
     from lifemate.evaluation import StateToolEvaluator, score_callback
@@ -139,6 +141,7 @@ def main():
         "selection_transcript_source": "asr",
         "runtime": runtime,
         "training_dtype": str(dtype),
+        "numerics_guard": NUMERICS_POLICY,
     }
     if args.resume_from_checkpoint:
         original_path = args.resume_from_checkpoint.parent / "training_config.json"
@@ -186,12 +189,15 @@ def main():
         weight_decay=0.01, max_grad_norm=1.0, optim="adamw_torch",
         bf16=bf16, fp16=False, use_cpu=not cuda,
         gradient_checkpointing=args.backend != "unsloth", gradient_checkpointing_kwargs={"use_reentrant": False},
-        logging_steps=1, eval_strategy=args.eval_strategy, eval_steps=args.save_steps,
+        logging_steps=1, logging_nan_inf_filter=False, eval_strategy=args.eval_strategy, eval_steps=args.save_steps,
         save_strategy=args.eval_strategy, save_steps=args.save_steps, save_total_limit=2,
         load_best_model_at_end=True, metric_for_best_model="state_tool_score", greater_is_better=True,
         prediction_loss_only=True, report_to="none", seed=args.seed, data_seed=args.seed,
         dataloader_num_workers=0, remove_unused_columns=False)
-    trainer = Trainer(model=model, args=training_args, processing_class=tokenizer,
+    GuardedTrainer = guarded_trainer_class(Trainer)
+    trainer = GuardedTrainer(model=model, args=training_args, processing_class=tokenizer,
+        numerics_context={'backend': args.backend, 'sft_dir': str(args.sft_dir.resolve()),
+                          'training_config': str(config_path.resolve())},
         train_dataset=data["train"], eval_dataset=data["validation"],
         data_collator=AssistantCollator(tokenizer.pad_token_id),
         callbacks=[score_callback(evaluator, tokenizer, args.output_dir, FastLanguageModel,

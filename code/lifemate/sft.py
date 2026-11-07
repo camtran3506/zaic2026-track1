@@ -23,6 +23,7 @@ from .context import DEFAULT_MAX_NEW_TOKENS
 from .text import TEXT_NORMALIZATION, normalize_transcript
 from .itn import ITN_POLICY
 from .schema_prompt import SCHEMA_PROMPT_POLICY
+from .numerics import DEBUG_BATCH_KEY
 
 
 SFT_PROMPT_POLICY = "compact-schemas-shared-prefix-v13"
@@ -235,8 +236,14 @@ def encode_example(example, tokenizer, max_length):
 
 
 class SupervisedDataset:
-    def __init__(self, examples, tokenizer, max_length):
+    def __init__(self, examples, tokenizer, max_length, *, include_debug_metadata=False, source_path=None):
         self.rows = [encode_example(e, tokenizer, max_length) for e in examples]
+        if include_debug_metadata:
+            for index, (row, example) in enumerate(zip(self.rows, examples)):
+                row[DEBUG_BATCH_KEY] = {'sample_id': example['sample_id'], 'sft_step': example['step'],
+                    'row_index': index, 'source_line': index+1, 'source_path': str(source_path) if source_path else None,
+                    'transcript_source': example.get('transcript_source'),
+                    'augmentation_variant': example.get('augmentation', {}).get('variant')}
         if not self.rows:
             raise ValueError("Empty SFT dataset")
 
@@ -254,8 +261,11 @@ class AssistantCollator:
     def __call__(self, rows):
         import torch
         length = max(len(r["input_ids"]) for r in rows)
-        return {key: torch.tensor([r[key] + [padding] * (length - len(r[key])) for r in rows])
-                for key, padding in (("input_ids", self.pad), ("attention_mask", 0), ("labels", -100))}
+        batch = {key: torch.tensor([r[key] + [padding] * (length - len(r[key])) for r in rows])
+                 for key, padding in (("input_ids", self.pad), ("attention_mask", 0), ("labels", -100))}
+        if any(DEBUG_BATCH_KEY in row for row in rows):
+            batch[DEBUG_BATCH_KEY] = [deepcopy(row.get(DEBUG_BATCH_KEY, {})) for row in rows]
+        return batch
 
 
 def file_sha256(path):

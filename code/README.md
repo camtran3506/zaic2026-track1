@@ -1095,6 +1095,57 @@ checkpoints (optimizer/scheduler/RNG), `training/{train,eval}_results.json`,
 `training/trainer_state.json`, training config, resolved base-model SHA (for HF IDs),
 and logs for every stage.
 
+### Stop nonfinite training before optimizer updates
+
+Training enables `finite-loss-and-gradients-v1` automatically, for both Unsloth
+and Transformers backends; no new command-line option is needed. The guard checks
+the raw loss before backward, accumulated gradients after **each microbatch** and
+before clipping, and the gradient norm before an update. A Trainer callback and a
+pre-step hook on the underlying optimizer check again before parameter mutation,
+including when Accelerate wraps AdamW. It does not replace Unsloth's training step.
+Only the healthy path continues. Nothing sanitizes NaN/Inf or silently skips a bad
+sample. `logging_nan_inf_filter=False` also avoids masking invalid loss as zero.
+
+A nonfinite loss/gradient/norm raises `NonFiniteTrainingError` and exits nonzero.
+The failing step cannot update AdamW or create a new checkpoint/final adapter;
+earlier successful optimizer steps/checkpoints stay intact. The parent finetune
+pipeline stops too. Nonfinite teacher-forced validation loss also aborts before
+checkpoint selection. This detects failure; it does not fix the underlying kernel,
+data or numerical problem, or certify an already-corrupt checkpoint as safe.
+
+Diagnostics are written under:
+
+```text
+training/debug_numerics/step-000003-<id>/
+  failure.json
+  batches.safetensors
+```
+
+`failure.json` records the stage, number of completed optimizer steps, target step,
+epoch, accumulation setting, offending gradient parameter names/shapes/dtypes,
+NaN/Inf element counts, versions, GPU details, loss and context/config paths.
+For every microbatch in the current accumulation window it includes sample ID,
+SFT step, source JSONL path/line, transcript source, augmentation variant, tensor
+shapes and supervised-token count. This identifies candidate inputs, not proof
+that every sample in the window independently caused the failure. The first bad
+microbatch stops the window rather than continuing until its end.
+
+`batches.safetensors` saves exact input_ids, attention_mask and labels as CPU tensors
+(`microbatch_001.input_ids`, etc.) for replay without recreating ToolEnv. No model
+or optimizer state is overwritten by this debug dump. If writing diagnostics fails,
+the guard still aborts and the original stage/sample/parameter information appears
+in the exception/log. Tokenized inputs contain user data; share them deliberately.
+The notebook copies this directory to `OUT/training_debug_numerics` on failure.
+
+Debug sample metadata is attached in memory after encoding and removed before
+forward; it never becomes model arguments, prompt tokens or supervised labels.
+There is no SFT policy bump for the guard. Clean runs retain the same loss masks,
+updates and checkpoint-selection metric. Checks introduce GPU synchronization for
+numerical validation; actual overhead on a full Unsloth/GPU run needs measurement.
+Tests cover unchanged finite training, NaN/Inf loss and gradients, accumulation,
+failure after two healthy updates, saved batch replay, clipping/norm failures,
+optimizer-wrapper hooks, report I/O failure and real hybrid Qwen3.5 LoRA backward.
+
 ### Best-checkpoint selection: state match + tool-call F1
 
 The default selection metric is **`eval_state_tool_score` (0–100), higher is better**,

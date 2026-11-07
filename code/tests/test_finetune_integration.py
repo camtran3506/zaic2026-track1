@@ -141,6 +141,8 @@ class OfflineRecognizer:
     assert config['max_length'] == 16384
     assert config['batch_size'] == 1
     assert config['eval_strategy'] == 'epoch'
+    assert config['numerics_guard'] == 'finite-loss-and-gradients-v1'
+    assert not (run/'training/debug_numerics').exists()
     assert config['eval_schema_cache'] == 'auto' and config['eval_schema_cache_mb'] == 256
     prepared_manifest = json.loads((run/'sft/manifest.json').read_text())
     assert prepared_manifest['training_augmentation']['rename_variants'] == 2
