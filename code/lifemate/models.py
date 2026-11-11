@@ -8,7 +8,7 @@ from .context import DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_NEW_TOKENS, validate_
 from .asr import LocalASR
 from .gpu import model_device_map
 from .llm import model_loader, configure_tokenizer, render_prompt
-from .prefix_cache import PrefixCache, stable_prefix_ids
+from .prefix_cache import PrefixCache, stable_prefix_ids, committed_prefix_ids
 from .schema_cache import SchemaCache, DEFAULT_SCHEMA_CACHE_MB
 from .prompt_session import PreparedPrompt
 from .runtime import (DEFAULT_LLM_DTYPE, DEFAULT_SEED, generation_policy,
@@ -21,7 +21,8 @@ class LocalLLM:
                  adapter_path: Path | None = None, device_map: str = "single",
                  seed: int = DEFAULT_SEED,
                  prefix_cache: str = "auto", prompt_cache: str = "auto",
-                 schema_cache: str = "auto", schema_cache_mb: float = DEFAULT_SCHEMA_CACHE_MB):
+                 schema_cache: str = "auto", schema_cache_mb: float = DEFAULT_SCHEMA_CACHE_MB,
+                 schema_cache_eager: bool = False):
         validate_inference_budget(max_input_tokens, max_new_tokens)
         if device_map != 'single':
             raise ValueError('Only explicit single-device placement is supported; auto/balanced offload is disabled')
@@ -29,7 +30,7 @@ class LocalLLM:
             raise ValueError("prompt_cache must be auto or off")
         self.prompt_cache_mode = prompt_cache
         self.prefix_cache = PrefixCache(prefix_cache)
-        self.schema_cache = SchemaCache(schema_cache, schema_cache_mb)
+        self.schema_cache = SchemaCache(schema_cache, schema_cache_mb, eager=schema_cache_eager)
         import torch
         from transformers import AutoTokenizer
         if not model_path.is_dir():
@@ -68,7 +69,8 @@ class LocalLLM:
     @classmethod
     def from_loaded_model(cls, model, tokenizer, max_input_tokens=DEFAULT_MAX_INPUT_TOKENS,
                           max_new_tokens=DEFAULT_MAX_NEW_TOKENS, *, prefix_cache="off", prompt_cache="off",
-                          schema_cache="off", schema_cache_mb=DEFAULT_SCHEMA_CACHE_MB):
+                          schema_cache="off", schema_cache_mb=DEFAULT_SCHEMA_CACHE_MB,
+                          schema_cache_eager: bool = False):
         """Run identical agent decoding on current training weights without a second model."""
         validate_inference_budget(max_input_tokens, max_new_tokens)
         if prompt_cache not in {"auto", "off"}:
@@ -80,7 +82,7 @@ class LocalLLM:
         # Training callbacks may patch forwards/change weights. Leave their
         # existing rollout path intact unless explicitly requested by a caller.
         obj.prefix_cache = PrefixCache(prefix_cache)
-        obj.schema_cache = SchemaCache(schema_cache, schema_cache_mb)
+        obj.schema_cache = SchemaCache(schema_cache, schema_cache_mb, eager=schema_cache_eager)
         obj.generation_policy = dict(getattr(model, "lifemate_generation_policy", None)
                                      or generation_policy(tokenizer))
         obj.generation_policy.update(max_input_tokens=max_input_tokens, max_new_tokens=max_new_tokens)
@@ -147,12 +149,16 @@ class LocalLLM:
                     prefix = prepared_prefix or stable_prefix_ids(
                         tokenizer, messages, token_ids, memo=self.prefix_cache.prefix_memo)
                     if prefix:
+                        commit_ids = ()
+                        if self.prefix_cache.snapshot is not None:
+                            commit_ids = committed_prefix_ids(tokenizer, messages, token_ids)
                         schema_prefix = ()
                         if self.prefix_cache.snapshot is None or self.prefix_cache.tokens != tuple(prefix):
                             head = user.session.schema_head(tokenizer, system) if isinstance(user, PreparedPrompt) and prepared is not None else None
                             schema_prefix = self.schema_cache.prefix_ids(tokenizer, messages, token_ids, head=head)
                         with self.prefix_cache.restore(self.model, input_ids, prefix,
-                                schema_cache=self.schema_cache, schema_prefix=schema_prefix) as cached:
+                                schema_cache=self.schema_cache, schema_prefix=schema_prefix,
+                                commit_ids=commit_ids) as cached:
                             ids = self.model.generate(
                                 **encoded, **cached, generation_config=config,
                                 stopping_criteria=StoppingCriteriaList([stop]))

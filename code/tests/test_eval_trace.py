@@ -57,7 +57,7 @@ def test_tracing_keeps_prompts_outputs_validation_and_execution_identical(tmp_pa
             return outputs[len(self.requests) - 1]
     def run(trace=None):
         llm, env = LLM(), Env()
-        stats = LifeMateAgent(StubASR(), llm, CATALOG, AgentConfig()).run(
+        stats = LifeMateAgent(StubASR(), llm, CATALOG, AgentConfig(enforce_observed_xref=False)).run(
             item(), env, Path('/unused'), 'train', trace=trace)
         return llm.requests, env, stats
     untraced_requests, untraced_env, untraced_stats = run()

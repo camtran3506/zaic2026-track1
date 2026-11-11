@@ -64,8 +64,8 @@ def test_asr_error_is_not_replaced_by_existing_audio_text(tmp_path):
 
 
 @pytest.mark.parametrize('script', ['finetune.py', 'prepare_sft.py'])
-@pytest.mark.parametrize('ratio', [0, 0.5])
-def test_validation_requires_asr_at_every_mix_ratio_before_creating_output(script, ratio, tmp_path):
+@pytest.mark.parametrize('ratio', [0.5, 1])
+def test_asr_mix_requires_asr_before_creating_output(script, ratio, tmp_path):
     app = Path(__file__).resolve().parents[1]
     output = tmp_path / 'run'
     command = [sys.executable, app / script, '--data-root', 'unused', '--output-dir', output,
@@ -77,7 +77,7 @@ def test_validation_requires_asr_at_every_mix_ratio_before_creating_output(scrip
     assert not output.exists()
 
 
-@pytest.mark.parametrize('samples,validation_fraction', [(20, 0.2), (10, 0.1)])
+@pytest.mark.parametrize('samples,validation_fraction', [(20, 0), (1, 0), (20, 0.2), (10, 0.1)])
 def test_preparation_keeps_sft_mix_and_uses_asr_for_every_validation_rollout(
         tmp_path, monkeypatch, samples, validation_fraction):
     import prepare_sft
@@ -116,6 +116,7 @@ def test_preparation_keeps_sft_mix_and_uses_asr_for_every_validation_rollout(
         output = tmp_path / f'sft-{attempt}'
         monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--data-root', str(source),
             '--output-dir', str(output), '--asr-model', 'stub-asr',
+            '--transcript-mode', 'mix',
             '--validation-fraction', str(validation_fraction)])
         prepare_sft.main()
         saved = json.loads((output / 'manifest.json').read_text())
@@ -123,7 +124,7 @@ def test_preparation_keeps_sft_mix_and_uses_asr_for_every_validation_rollout(
         assert saved['transcript_mixing']['unit'] == 'sample'
         assert saved['asr']['model'] == 'stub-asr'
         sources = {}
-        for partition in ('train', 'validation'):
+        for partition in saved['partitions']:
             info = saved['partitions'][partition]
             assert not set(sources) & set(info['sample_ids'])
             sources.update(info['transcript_sources'])
@@ -143,12 +144,21 @@ def test_preparation_keeps_sft_mix_and_uses_asr_for_every_validation_rollout(
                 decision = json.loads(step['messages'][-1]['content'])
                 if decision['action'] == 'call':
                     assert decision['name'] == golds[sample_id][step['step']]['name']
-        assert Counter(sources.values()) == {'asr': samples // 2, 'audio_text': samples // 2}
-        expected_asr_ids = {sid for sid, source in sources.items() if source == 'asr'} | set(saved['partitions']['validation']['sample_ids'])
+        asr_count = int(samples * 0.5 + 0.5)
+        assert Counter(sources.values()) == Counter({'asr': asr_count, 'audio_text': samples - asr_count})
+        validation_ids = set(saved['partitions'].get('validation', {}).get('sample_ids', []))
+        expected_asr_ids = {sid for sid, source in sources.items() if source == 'asr'} | validation_ids
         # Selected SFT ASR + every held-out request, each transcribed once.
         assert Counter(transcribed[transcribed_before:]) == {sid: 1 for sid in expected_asr_ids}
         transcribed_after_preparation = len(transcribed)
         assignments.append(sources)
+        if validation_fraction == 0:
+            assert set(saved['partitions']) == {'train'}
+            assert set(saved['partitions']['train']['sample_ids']) == {row['id'] for row in records}
+            assert not list(output.glob('*rollouts*'))
+            assert not (output / 'validation.jsonl').exists()
+            manifest_path.write_text(''.join(json.dumps(r) + '\n' for r in reversed(records)))
+            continue
         evaluator = StateToolEvaluator(output, saved)
         rollout_transcripts = []
         class LLM:
@@ -175,3 +185,37 @@ def test_preparation_keeps_sft_mix_and_uses_asr_for_every_validation_rollout(
 def test_explicit_single_source_ablation(ratio, source):
     records = [{'id': f'train_{i}'} for i in range(6)]
     assert set(assign_transcript_sources(records, ratio).values()) == {source}
+
+
+def test_default_dual_mode_replays_both_gold_and_asr(tmp_path, monkeypatch):
+    import lifemate.models
+    import lifemate.transcripts
+    import prepare_sft
+    source = tmp_path / 'train'
+    source.mkdir()
+    records = [dict(labeled(), id=f'train_{i}', audio=f'train_{i}.wav',
+                    audio_text=f'Human {i}') for i in range(4)]
+    for i in range(4):
+        (source / f'train_{i}.wav').write_bytes(b'audio')
+    (source / 'train_tools_catalog.json').write_text(json.dumps({'apps': [{'tools': list(CATALOG.values())}]}))
+    (source / 'train.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in records))
+    class ASR:
+        def __init__(self, *a, **kw): pass
+        def transcribe(self, path): return f'ASR {path.stem}'
+    class Env(FakeEnv):
+        def __init__(self, *a, **kw): super().__init__()
+        def get_state_hash(self): return 'fixture-state'
+    monkeypatch.setattr(lifemate.models, 'LocalASR', ASR)
+    monkeypatch.setattr(lifemate.transcripts, 'asr_identity', lambda *a: {'model': 'stub-asr', 'precision': 'int8'})
+    monkeypatch.setitem(sys.modules, 'zaic_tools', SimpleNamespace(ToolEnv=Env))
+    output = tmp_path / 'sft-dual'
+    monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--data-root', str(source),
+        '--output-dir', str(output), '--asr-model', 'stub-asr', '--validation-fraction', '0'])
+    prepare_sft.main()
+    saved = json.loads((output / 'manifest.json').read_text())
+    info = saved['partitions']['train']
+    assert saved['sft_format']['transcript_mode'] == 'dual'
+    assert info['transcript_source_counts'] == {'audio_text': 4, 'asr': 4}
+    rows = [json.loads(line) for line in (output / 'train.jsonl').read_text().splitlines()]
+    assert {(r['sample_id'], r['transcript_source']) for r in rows} == {
+        (f'train_{i}', src) for i in range(4) for src in ('audio_text', 'asr')}

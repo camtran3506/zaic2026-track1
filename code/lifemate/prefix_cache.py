@@ -8,6 +8,7 @@ from contextlib import contextmanager
 from copy import deepcopy
 import json
 import logging
+import sys
 from pathlib import Path
 from types import MethodType
 
@@ -42,6 +43,56 @@ def stable_prefix_ids(tokenizer, messages, full_ids, *, memo=None):
     return candidate
 
 
+def executed_observation_run(observations):
+    """Leading observations that are real, executed tool results.
+
+    Rejected proposals (`agent_feedback`) have no `result` and disappear from the
+    prompt as soon as the next call executes, so they must never be committed
+    into an incremental snapshot. The run stops at the first such entry because
+    token order cannot skip a message.
+    """
+    run = []
+    for observation in observations or []:
+        if isinstance(observation, dict) and all(key in observation for key in ("name", "arguments", "result")):
+            run.append(observation)
+        else:
+            break
+    return run
+
+
+def committed_prefix_ids(tokenizer, messages, full_ids):
+    """Exact tokens of the closed prompt through the last leading executed observation.
+
+    Unlike `stable_prefix_ids` this includes executed tool calls/results (but not
+    the generation prompt), so the next turn can continue from this boundary
+    instead of re-prefilling every earlier observation. The candidate is rendered
+    independently and must be an exact token prefix of `full_ids`; a template
+    boundary that does not match is a miss, never a guessed offset. The caller
+    additionally revalidates the prefix against the NEXT prompt before reuse,
+    because Qwen's template re-renders earlier assistant turns when a later user
+    message arrives.
+    """
+    if getattr(tokenizer, "lifemate_native_fc", False) is not True:
+        return []
+    try:
+        payload = json.loads(messages[1]["content"])
+    except (ValueError, TypeError):
+        return []
+    if not isinstance(payload, dict) or "available_tools" not in payload:
+        return []
+    run = executed_observation_run(payload.get("previous_actions_and_results"))
+    if not run:
+        return []
+    from .llm import render_prompt
+    payload["previous_actions_and_results"] = run
+    content = json.dumps(payload, ensure_ascii=False)
+    _, candidate = render_prompt(tokenizer, [messages[0], {"role": "user", "content": content}],
+                                 add_generation_prompt=False)
+    if not candidate or len(candidate) >= len(full_ids) or full_ids[:len(candidate)] != candidate:
+        return []
+    return candidate
+
+
 def _continue_qwen54_chunk(layer, hidden_states, cache):
     """Extend BOTH linear-attention states for a multi-token cached suffix.
 
@@ -58,7 +109,7 @@ def _continue_qwen54_chunk(layer, hidden_states, cache):
     mixed = layer.in_proj_qkv(hidden_states).transpose(1, 2)
     convolution_input = torch.cat((cache.conv_states[index], mixed), dim=-1)
     cache.conv_states[index] = convolution_input[..., -layer.conv_kernel_size:].clone()
-    if layer.causal_conv1d_fn is not None:
+    if layer.causal_conv1d_fn is not None and convolution_input.is_cuda:
         mixed = layer.causal_conv1d_fn(
             x=convolution_input, weight=layer.conv1d.weight.squeeze(1),
             bias=layer.conv1d.bias, activation=layer.activation, seq_idx=None)
@@ -112,7 +163,16 @@ def qwen54_continuation(layers):
 
 
 class PrefixCache:
-    """One immutable GPU snapshot; clone before use and release between samples."""
+    """One immutable GPU snapshot; clone before use and release between samples.
+
+    `snapshot` is the sample-static prefix (system/tools/history/request) and is
+    never written after it is built. `chain` is an additional, privately owned
+    snapshot that advances in place through the leading executed observations of
+    consecutive turns, so turn k only prefills the observations added since turn
+    k-1 instead of every observation again. Hybrid recurrent state cannot be
+    cropped: the chain is reused only when its tokens are an exact prefix of the
+    new prompt and is otherwise rebuilt from the static snapshot.
+    """
     def __init__(self, mode="auto"):
         if mode not in {"auto", "off"}:
             raise ValueError("prefix_cache must be auto or off")
@@ -124,12 +184,16 @@ class PrefixCache:
     def clear(self):
         self.tokens = ()
         self.snapshot = None
+        self.chain = None
+        self.chain_tokens = ()
         self.prefix_memo = {}
 
     def begin_sample(self):
         self.clear()
         self.stats = {"mode": self.mode, "hits": 0, "misses": 0,
-                      "reused_tokens": 0, "snapshot_tokens": 0, "fallbacks": 0}
+                      "reused_tokens": 0, "snapshot_tokens": 0, "fallbacks": 0,
+                      "chain_hits": 0, "chain_resets": 0, "chain_reused_tokens": 0,
+                      "chain_advanced_tokens": 0, "commit_errors": 0}
 
     def eligible(self, model):
         if self.mode == "off" or self.disabled_reason:
@@ -164,6 +228,8 @@ class PrefixCache:
             trusted_root = Path(transformers.__file__).resolve().parent
             import torch
             context_decorator = Path(torch.__file__).resolve().parent / "utils/_contextlib.py"
+            unsloth = sys.modules.get("unsloth")
+            unsloth_root = Path(unsloth.__file__).resolve().parent if unsloth is not None and getattr(unsloth, "__file__", None) else None
             for module in base.modules():
                 if not type(module).__module__.startswith("transformers.models.qwen3_5."):
                     continue
@@ -173,9 +239,13 @@ class PrefixCache:
                     return False
                 while fn is not None:
                     code = getattr(fn, "__code__", None)
-                    source = Path(code.co_filename).resolve() if code is not None else None
-                    torch_context = source == context_decorator and hasattr(fn, "__wrapped__")
-                    if source is None or not (source.is_relative_to(trusted_root) or torch_context):
+                    source = Path(code.co_filename) if code is not None else None
+                    torch_context = source is not None and source.resolve() == context_decorator and hasattr(fn, "__wrapped__")
+                    unsloth_ok = (unsloth_root is not None and source is not None and
+                                  (str(source).startswith("<unsloth") or source.name.startswith("<unsloth") or
+                                   (source.is_absolute() and source.resolve().is_relative_to(unsloth_root))) and
+                                  not getattr(model, "training", True))
+                    if source is None or not ((source.is_absolute() and source.resolve().is_relative_to(trusted_root)) or torch_context or unsloth_ok):
                         self.disable("Qwen forward is patched by an unverified runtime")
                         return False
                     fn = getattr(fn, "__wrapped__", None)
@@ -194,15 +264,69 @@ class PrefixCache:
     def report(self):
         return {**self.stats, "disabled_reason": self.disabled_reason}
 
+    @staticmethod
+    def _extend(model, cache, input_ids, start, end):
+        """Advance a privately owned hybrid cache over input_ids[:, start:end] in place."""
+        import torch
+        from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
+        # Explicit 4-channel text positions, as everywhere else in this module.
+        positions = torch.arange(start, end, device=input_ids.device).view(1, 1, -1).expand(4, 1, -1)
+        output = model(input_ids=input_ids[:, start:end], attention_mask=torch.ones_like(input_ids[:, :end]),
+                       position_ids=positions, past_key_values=cache, use_cache=True,
+                       logits_to_keep=1, return_dict=True)
+        result = output.past_key_values
+        if type(result) is not Qwen3_5DynamicCache or result.get_seq_length() != end:
+            raise ValueError('Unexpected hybrid cache type or committed prefix length')
+        return result
+
+    def _committed_snapshot(self, model, input_ids, commit_ids):
+        """Cache holding the longest verified committed prefix; the static snapshot if none.
+
+        Never reads a token the NEXT prompt does not contain: the committed ids must
+        extend the static prefix and be an exact prefix of `input_ids`, and the chain
+        is kept only while its own tokens remain an exact prefix of the new commit.
+        """
+        commit = tuple(commit_ids)
+        count, base = len(commit), len(self.tokens)
+        if (count <= base or commit[:base] != self.tokens
+                or input_ids[0, :count].tolist() != list(commit)):
+            return self.snapshot
+        chain = len(self.chain_tokens)
+        if self.chain is not None and chain <= count and commit[:chain] == self.chain_tokens:
+            self.stats["chain_hits"] += 1
+            self.stats["chain_reused_tokens"] += chain
+            start = chain
+        else:
+            self.chain, self.chain_tokens = deepcopy(self.snapshot), ()
+            self.stats["chain_resets"] += 1
+            start = base
+        if start < count:
+            try:
+                self.chain = self._extend(model, self.chain, input_ids, start, count)
+            except BaseException:
+                # A half-advanced recurrent state is unusable; drop it and let the
+                # caller's existing failure path fall back to full prefill.
+                self.chain, self.chain_tokens = None, ()
+                raise
+            self.chain_tokens = commit
+            self.stats["chain_advanced_tokens"] += count - start
+        return self.chain
+
     @contextmanager
-    def restore(self, model, input_ids, prefix_ids, *, schema_cache=None, schema_prefix=()):
-        """Build/restore at an exact boundary, then shield snapshot from writes."""
+    def restore(self, model, input_ids, prefix_ids, *, schema_cache=None, schema_prefix=(), commit_ids=()):
+        """Build/restore at an exact boundary, then shield snapshot from writes.
+
+        `commit_ids` optionally names a longer exact prefix (through the leading
+        executed observations); generation then starts from the incrementally
+        advanced chain instead of the static prefix.
+        """
         import torch
         from transformers.models.qwen3_5.modeling_qwen3_5 import Qwen3_5DynamicCache
         tokens = tuple(prefix_ids)
         with qwen54_continuation(self._layers):
             if self.snapshot is None or self.tokens != tokens:
                 self.snapshot, self.tokens = None, ()
+                self.chain, self.chain_tokens = None, ()
                 self.stats["misses"] += 1
                 prefix = input_ids[:, :len(tokens)]
                 if tuple(input_ids[0, :len(tokens)].tolist()) != tokens:
@@ -237,8 +361,9 @@ class PrefixCache:
             else:
                 self.stats["hits"] += 1
                 self.stats["reused_tokens"] += len(tokens)
+            source = self._committed_snapshot(model, input_ids, commit_ids) if commit_ids else self.snapshot
             # Includes key/value, conv_states and recurrent_states on their own devices.
-            working = deepcopy(self.snapshot)
+            working = deepcopy(source)
             positions = torch.arange(input_ids.shape[1], device=input_ids.device).view(1, -1)
             # Explicit text positions avoid dependence on model-global mRoPE deltas.
             positions = positions.unsqueeze(0).expand(4, -1, -1)

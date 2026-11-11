@@ -18,8 +18,11 @@ def model_loader(model_path):
 def lora_targets(model_path):
     targets = ['q_proj', 'k_proj', 'v_proj', 'o_proj', 'gate_proj', 'up_proj', 'down_proj']
     if is_qwen35(model_path):
-        # Exclude the vision tower; retain the same attention/MLP projection set.
-        return r'.*language_model\..*\.(' + '|'.join(targets) + ')'
+        # Exclude the vision tower; include Qwen3.5 GatedDeltaNet linear_attn projections.
+        qwen35_targets = ['q_proj', 'k_proj', 'v_proj', 'o_proj',
+                          'in_proj_qkv', 'in_proj_z', 'out_proj',
+                          'gate_proj', 'up_proj', 'down_proj']
+        return r'.*language_model\..*\.(' + '|'.join(qwen35_targets) + ')'
     return targets
 
 

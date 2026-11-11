@@ -803,7 +803,7 @@ apply the mix; older prepared data is rejected by the current preparation policy
 | `--heldout-apps` | `auto` | Reserve every sample exposed to one selected app, before making the regular train/validation split. |
 | `--heldout-fraction` | `0.1` | Auto selection targets 10% of original source IDs by app exposure; it does not reserve 10% of app names. |
 
-Names use deterministic opaque aliases such as `app_<hash>.tool_<hash>`, forcing
+Names use deterministic short numeric aliases such as `app_17.tool_42`, forcing
 the model to use descriptions and parameter schemas. Tool references in targets,
 history calls, observations, schema references and `sys.ask_missing_info.tool_name`
 are renamed together. Parameter names/types, entity IDs, free-form user text and

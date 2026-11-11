@@ -9,12 +9,12 @@ from typing import Any
 
 from .catalog import allowed_tools
 from .eval_trace import exception_details
-from .history import prompt_history, resolve_history
+from .history import extract_observed_ids, prompt_history, resolve_history
 from .local_helpers import execute_helper, helper_tool_schemas, with_local_tools
 from .local_assist import ASSIST_INSTRUCTIONS
 from .local_checks import inspect_call
 from .execution_policy import AUTOMATIC_GUARD_INSTRUCTIONS, LoopMonitor
-from .tool_execution import precheck_call, attempt_env_call, result_observation
+from .tool_execution import precheck_call, attempt_env_call, prepare_call_arguments, result_observation
 from .text import normalize_transcript
 from .prompt_session import InferenceSession, fixed_prompt_payload
 from .batching import (BATCH_TOOL, BATCH_INSTRUCTIONS, batch_error, batch_observation,
@@ -35,12 +35,11 @@ QUY TẮC BẮT BUỘC:
   Dùng action call với arguments đúng schema; không đoán tham số.
 - Với x-ref, dùng ID từ kết quả read tool thành công trong history hoặc lượt hiện tại;
   nếu chưa có thì gọi read tool tương ứng để tìm ID thực; KHÔNG bịa ID.
+- Dùng `user_context.date_reference` đổi ngày tương đối ra YYYY-MM-DD (không cần gọi calendar_reference) và `user_context.apps` để đối chiếu tên tiếng Việt của app.
+- Tìm kiếm rỗng: rút gọn từ khóa (bỏ danh xưng, giữ tên chính), bỏ trống query hoặc gọi tool danh sách; không đưa ngày giờ vào từ khóa, không lặp call cũ; vẫn rỗng mới gọi sys.ask_missing_info.
 - Nếu cần kết hợp nhiều hành động, hoàn tất từng hành động theo thứ tự phụ thuộc.
 - Dùng user context (current_time/timezone/location/profile) và lịch sử để giải quyết tham chiếu.
-- local_time.* là các hàm Python nội bộ: dùng calendar_reference để tra ngày,
-  departure_time để trừ thời gian đi/đến sớm, duration_between để tính số phút.
-  Lấy toán hạng từ yêu cầu/context/kết quả đã có; đọc kết quả rồi mới gọi tool ứng dụng.
-  Các helper thời gian không đổi trạng thái ứng dụng, không cung cấp ID x-ref, không tự hoàn tất tác vụ.
+- local_time.* (departure_time, duration_between) là hàm nội bộ đọc toán hạng đã có; không đổi trạng thái app hay cấp ID x-ref.
 - local_context.lookup và local_entity.resolve chỉ tra context/history đã có; dùng nguồn
   được trả về để đối chiếu đúng collection. Không tìm thấy không chứng minh entity không tồn tại.
 - local_text.normalize chuẩn hóa email/số điện thoại/số tiền; local_checks.evaluate tính/so sánh
@@ -159,6 +158,9 @@ class AgentConfig:
     # Only env/invalid planning decisions spend this budget. Valid helper-only
     # turns have no count ceiling; model input/output token limits still apply.
     max_total_steps: int = 32
+    max_llm_steps: int = 64
+    empty_read_limit: int = 2
+    enforce_observed_xref: bool = True
 
 
 def build_step_prompt(transcript, context, history, enabled, observations):
@@ -217,7 +219,7 @@ class LifeMateAgent:
         enabled = allowed_tools(self.catalog, context.get("installed_apps", {}))
         planner_tools = with_local_tools(enabled)
         local_names = helper_tool_schemas().keys()
-        monitor = LoopMonitor()
+        monitor = LoopMonitor(empty_read_limit=self.cfg.empty_read_limit)
         if len(enabled) == 1:  # only sys.ask_missing_info; no app can act
             emit("stop", reason="no_available_tools", executed=0, invalid_proposals=0)
             return {"transcript": normalize_transcript(prepared_transcript["transcript"]) if prepared_transcript else "",
@@ -236,6 +238,7 @@ class LifeMateAgent:
                 transcript = self.asr.transcribe(audio_path(split_dir, item["audio"]))
             history = history_text(item.get("history", []), split_dir, self.asr, t0, self.cfg.sample_seconds)
         transcript = normalize_transcript(transcript)
+        observed_ids = extract_observed_ids(context, history)
         if session is not None:
             session.prepare(transcript, context, history, enabled)
         observations: list[dict] = []
@@ -257,6 +260,8 @@ class LifeMateAgent:
 
         def execute_one(name, args, *, in_batch=False):
             nonlocal executed, local_executed, stop_reason
+            if isinstance(name, str) and name in enabled:
+                args = prepare_call_arguments(name, args, enabled[name], context, transcript)
             rejection = precheck_call(name, args, self.catalog, enabled, monitor, local_names)
             if rejection:
                 if rejection['stage'] == 'loop_guard':
@@ -276,11 +281,18 @@ class LifeMateAgent:
                     reject(str(exc), 'local_validate', name=name, arguments=args)
                 emit('local_call_result', name=name, arguments=args, result=result, local_call_index=local_executed-1)
                 observation = {'name': name, 'arguments': args, 'result': full_json(result), 'scope': 'local'}
-                observations.append(observation)
+                if not any(o.get('scope') == 'local' and o.get('name') == name and o.get('arguments') == args for o in observations):
+                    observations.append(observation)
+                if not in_batch and successful(observation):
+                    observations[:] = [o for o in observations if 'result' in o]
                 return successful(observation)
             advisory = inspect_call(name, args, enabled)
             emit('schema_inspection', name=name, inspection=advisory)
-            outcome = attempt_env_call(env, name, args, enabled[name].get('kind', 'unknown'), monitor, executed, emit=emit)
+            outcome = attempt_env_call(
+                env, name, args, enabled[name].get('kind', 'unknown'), monitor, executed,
+                emit=emit, spec=enabled[name],
+                observed_ids=(observed_ids if self.cfg.enforce_observed_xref else None),
+            )
             if not outcome['executed']:
                 reject(**outcome['feedback'])
                 return False
@@ -294,7 +306,8 @@ class LifeMateAgent:
             return successful(observation)
 
         while (executed < self.cfg.max_calls and invalid < self.cfg.max_invalid
-               and non_helper_steps < self.cfg.max_total_steps):
+               and non_helper_steps < self.cfg.max_total_steps
+               and step < self.cfg.max_llm_steps):
             if time.monotonic() - t0 > self.cfg.sample_seconds - self.cfg.reserve_seconds:
                 stop_reason = "time_limit"
                 break
@@ -307,6 +320,13 @@ class LifeMateAgent:
             emit("llm_start", request={"system": SYSTEM_PROMPT, "user": user_prompt})
             try:
                 raw = self.llm.generate(SYSTEM_PROMPT, user_prompt)
+            except ValueError as exc:
+                if ("exceeds" in str(exc) and "max-input-tokens" in str(exc)) and step > 1:
+                    emit("context_limit_reached", step=step, error=str(exc))
+                    stop_reason = "max_input_tokens"
+                    break
+                emit("llm_error", exception=exception_details(exc))
+                raise
             except Exception as exc:
                 emit("llm_error", exception=exception_details(exc))
                 raise
@@ -326,6 +346,16 @@ class LifeMateAgent:
                 break
             name, args = decision.get("name"), decision.get("arguments")
             if name == BATCH_TOOL:
+                if isinstance(args, dict) and isinstance(args.get('calls'), list):
+                    args = {
+                        **args,
+                        'calls': [
+                            {**c, 'arguments': prepare_call_arguments(c['name'], c['arguments'], enabled[c['name']], context, transcript)}
+                            if isinstance(c, dict) and isinstance(c.get('name'), str) and c['name'] in enabled and isinstance(c.get('arguments'), dict)
+                            else c
+                            for c in args['calls']
+                        ],
+                    }
                 payload = json.loads(user_prompt)
                 error = batch_error(args, planner_tools, local_names, payload,
                     env_remaining=self.cfg.max_calls-executed)
@@ -374,7 +404,9 @@ class LifeMateAgent:
                 break
         if stop_reason is None:
             stop_reason = ("max_calls" if executed >= self.cfg.max_calls else
-                           "max_invalid" if invalid >= self.cfg.max_invalid else "max_total_steps")
+                           "max_invalid" if invalid >= self.cfg.max_invalid else
+                           "max_llm_steps" if step >= self.cfg.max_llm_steps else
+                           "max_total_steps")
         emit("stop", reason=stop_reason, executed=executed, local_executed=local_executed,
              invalid_proposals=invalid, batches=batches, non_helper_steps=non_helper_steps)
         return {"transcript": transcript, "elapsed_seconds": round(time.monotonic() - t0, 3),

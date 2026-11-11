@@ -11,10 +11,10 @@ from lifemate.sft import replay_sample
 from test_baseline import CATALOG, FakeEnv, StubASR, StubLLM, item
 
 
-def run_agent(calls, env):
+def run_agent(calls, env, config=None):
     outputs = [json.dumps({'action': 'call', **call}) for call in calls]
     outputs.append('{"action":"done"}')
-    return LifeMateAgent(StubASR(), StubLLM(outputs), CATALOG, AgentConfig()).run(
+    return LifeMateAgent(StubASR(), StubLLM(outputs), CATALOG, config or AgentConfig()).run(
         item(), env, Path('/unused'), 'train')
 
 
@@ -42,10 +42,15 @@ def test_toolenv_accepted_ids_and_read_after_write_are_executed_in_both_paths():
         {'name': 'smart_home.light_set', 'arguments': {'device_id': 'not_previously_read', 'power': 'off'}},
         {'name': 'smart_home.get_status', 'arguments': {}},
     ]
-    for runner in (run_agent, replay):
+    for runner in (lambda c, e: run_agent(c, e, AgentConfig(enforce_observed_xref=False)), replay):
         env = FakeEnv()
         runner(calls, env)
         assert env.calls == calls
+    # With the default P1 x-ref guard enabled, an unobserved device_id is blocked before env.call.
+    guarded_env = FakeEnv()
+    guarded_report = run_agent(calls, guarded_env)
+    assert [c['name'] for c in guarded_env.calls] == ['smart_home.get_status']
+    assert guarded_report['executed'] == 1
 
 
 def test_arguments_rejected_by_toolenv_are_never_coerced_or_executed():
@@ -59,7 +64,7 @@ def test_arguments_rejected_by_toolenv_are_never_coerced_or_executed():
     rejected = {'name': 'smart_home.light_set', 'arguments': {'device_id': '2'}}
     corrected = {'name': 'smart_home.light_set', 'arguments': {'device_id': 2}}
     env = Env()
-    report = run_agent([rejected, corrected], env)
+    report = run_agent([rejected, corrected], env, AgentConfig(enforce_observed_xref=False))
     assert report['invalid_proposals'] == 1
     assert env.calls == [corrected]
     assert env.validations == [rejected['arguments'], corrected['arguments']]
@@ -106,8 +111,10 @@ def test_full_rejected_arguments_and_validation_reach_next_native_planning_step(
                                 'arguments': proposed if self.count == 1 else corrected})
                     if self.count < 3 else '{"action":"done"}')
     env, llm = Env(), LLM()
+    entry = item()
+    entry['context']['collections'] = {'smart_home.devices': [{'id': 'Device_A'}]}
     report = LifeMateAgent(StubASR(), llm, CATALOG, AgentConfig()).run(
-        item(), env, Path('/unused'), 'train')
+        entry, env, Path('/unused'), 'train')
     assert report['invalid_proposals'] == 1 and report['executed'] == 1
     assert env.validations == [proposed, corrected]
     assert env.calls == [{'name': 'smart_home.light_set', 'arguments': corrected}]
@@ -162,8 +169,10 @@ def test_rejection_expires_after_execution_but_call_failure_remains_visible(outc
             return json.dumps({'action': 'call', 'name': 'smart_home.light_set',
                                'arguments': proposed if self.count == 1 else corrected})
     env = Env()
+    entry = item()
+    entry['context']['collections'] = {'smart_home.devices': [{'id': 'Device_A'}]}
     report = LifeMateAgent(StubASR(), LLM(), CATALOG, AgentConfig()).run(
-        item(), env, Path('/unused'), 'train')
+        entry, env, Path('/unused'), 'train')
     assert env.calls == [{'name': 'smart_home.light_set', 'arguments': corrected}]
     assert report['executed'] == 1 and report['invalid_proposals'] == 1
 
@@ -264,7 +273,7 @@ def test_execution_error_is_returned_to_model_after_successful_validation():
             assert 'ID does not exist' in user
             return '{"action":"done"}'
     env = Env()
-    report = LifeMateAgent(StubASR(), LLM(), CATALOG, AgentConfig()).run(
+    report = LifeMateAgent(StubASR(), LLM(), CATALOG, AgentConfig(enforce_observed_xref=False)).run(
         item(), env, Path('/unused'), 'train')
     assert report['executed'] == 1 and report['invalid_proposals'] == 0
     assert len(env.calls) == 1

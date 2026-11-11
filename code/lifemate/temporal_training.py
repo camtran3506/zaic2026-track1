@@ -150,7 +150,7 @@ def _rescheduled_event_interval(text, observations):
     return None
 
 
-def helper_demonstrations(transcript, context, history, enabled, observations):
+def helper_demonstrations(transcript, context, history, enabled, observations, *, include_calendar=True):
     """Return eligible helper calls without reading current/future gold actions.
 
     Idempotence is based on executed local observations; callers invoke this
@@ -172,7 +172,7 @@ def helper_demonstrations(transcript, context, history, enabled, observations):
         clocks = [] if re.search(r"\bkém\b", text) else _clocks(text)
     except (ValueError, KeyError, TypeError):
         return []
-    candidates = [{"name": "local_time.calendar_reference", "arguments": {}}]
+    candidates = [{"name": "local_time.calendar_reference", "arguments": {}}] if include_calendar else []
     interval = _rescheduled_event_interval(text, observations)
     if interval is not None:
         candidates.append({"name": "local_time.duration_between", "arguments": interval})

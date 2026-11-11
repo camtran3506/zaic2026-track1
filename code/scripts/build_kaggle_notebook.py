@@ -42,11 +42,8 @@ TRAIN_LLM = True
 TRAIN_BACKEND = "unsloth"  # backend mặc định; cần CUDA
 # Loader đặt toàn bộ model trên GPU đã chọn; thiếu VRAM dừng bằng OOM, không auto offload.
 TRAIN_ASR_TRANSCRIPT_RATIO = 0.5  # 50% sample dùng audio_text, 50% dùng ASR; chọn theo SEED
-TRAIN_EVAL_CLEAN_TRANSCRIPTS = False  # True: eval thêm text gốc; checkpoint luôn chọn bằng ASR
 TRAIN_RENAME_VARIANTS = 2  # giữ mẫu gốc + tối đa 2 biến thể đổi tên app/tool
 TRAIN_DISTRACTOR_PROBABILITY = 0.5  # thêm 1-3 app khác nhóm vào biến thể nếu có ứng viên
-TRAIN_HELDOUT_APPS = "auto"  # một app chưa xuất hiện trong train; hoặc CSV app IDs / "none"
-TRAIN_HELDOUT_GROUPS = ""  # CSV nhóm chức năng, ví dụ "learning"; tắt chọn app auto
 TRAIN_APP_GROUPS_FILE = None  # JSON group -> app IDs trong TRAIN catalog, nếu muốn tùy chỉnh
 TRAIN_MISSING_TOOL_POLICY = "error"  # toàn bộ schema được giữ; lỗi schema không mặc định bỏ mẫu
 TRAIN_DATA_ROOT = None  # None: tự tìm train/train.jsonl trong /kaggle/input
@@ -57,7 +54,6 @@ TRAIN_MAX_LENGTH = MAX_CONTEXT_TOKENS
 TRAIN_BATCH_SIZE = 1
 TRAIN_QUANTIZATION = "none"
 TRAIN_GRAD_ACCUMULATION = 8
-TRAIN_VALIDATION_FRACTION = 0.1
 
 ASR_REPO = "g-group-ai-lab/gipformer1.5-68M-rnnt"
 ASR_FORMAT = "onnx"
@@ -372,9 +368,9 @@ print("ASR process has exited; LLM will read and verify cache before loading wei
 
 md('''## 6. Fine-tune tool calling trên TRAIN (LoRA/QLoRA)
 
-Mặc định `TRAIN_LLM=True`, `TRAIN_ASR_TRANSCRIPT_RATIO=0.5`: chia train/validation theo sample ID trước, rồi phân bổ sample dùng audio_text và ASR theo tỉ lệ 50:50, có làm tròn theo số mẫu. SEED quyết định việc chọn nguồn cho loss SFT; mọi bước SFT của một sample dùng cùng transcript. Rollout chọn checkpoint luôn dùng transcript ASR cho toàn bộ held-out, độc lập với nguồn SFT. Dù TRAIN_ASR_TRANSCRIPT_RATIO=0 vẫn cần ASR cho eval. ASR không tự quay về audio_text khi lỗi; nguồn và số lượng được ghi trong manifest. Transcript của cả hai nguồn và text của mọi lượt history được chuẩn hóa chung: NFC, lowercase, gộp khoảng trắng, viết hoa chữ cái đầu lượt, thêm dấu chấm nếu chưa có dấu kết câu. History giữ đầy đủ theo resolver chung. Sau đó huấn luyện LoRA/QLoRA, rồi tự chuyển sang **base model + adapter vừa train** cho task chính. Nhãn phải là `label.tool_calls` theo thứ tự thực thi. Replay dùng `ToolEnv` thật của train; kết quả tool trước được đưa vào prompt bước sau. Chỉ tính loss trên assistant JSON, split theo sample ID trước khi tạo các bước, không đọc nhãn test.
+Mặc định `TRAIN_LLM=True`: dùng toàn bộ sample trong TRAIN để huấn luyện, không tạo tập validation hay app-held-out. `TRAIN_ASR_TRANSCRIPT_RATIO=0.5` phân bổ sample dùng audio_text và ASR theo tỉ lệ 50:50, có làm tròn theo số mẫu. SEED quyết định nguồn transcript; mọi bước SFT của một sample dùng cùng nguồn. ASR không tự quay về audio_text khi lỗi; nguồn và số lượng được ghi trong manifest. Transcript của cả hai nguồn và text của mọi lượt history được chuẩn hóa chung: NFC, lowercase, gộp khoảng trắng, viết hoa chữ cái đầu lượt, thêm dấu chấm nếu chưa có dấu kết câu. History giữ đầy đủ theo resolver chung. Sau đó huấn luyện LoRA/QLoRA, rồi tự chuyển sang **base model + adapter ở epoch cuối cùng** cho task chính. Nhãn phải là `label.tool_calls` theo thứ tự thực thi. Replay dùng `ToolEnv` thật của train; kết quả tool trước được đưa vào prompt bước sau. Chỉ tính loss trên assistant JSON, không đọc nhãn test.
 
-Mặc định `TRAIN_HELDOUT_APPS="auto"` giữ riêng mọi sample có tiếp xúc với một app, nhắm khoảng 10% source IDs; schema app đã cài nhưng không dùng và tham chiếu trong history cũng tính là tiếp xúc. Phần còn lại mới chia train/validation 90:10. Có thể chọn app IDs hoặc `TRAIN_HELDOUT_GROUPS`; dataset không thể tách app sẽ ghi rõ unavailable. App-held-out chỉ báo cáo `eval_app_heldout_*` (và clean nếu bật), không chọn checkpoint. Chỉ TRAIN được bổ sung tối đa `TRAIN_RENAME_VARIANTS=2` biến thể đổi tên app/tool nhất quán; với xác suất `TRAIN_DISTRACTOR_PROBABILITY=0.5` mỗi biến thể thêm 1–3 app khác nhóm từ TRAIN, loại app held-out. Không đổi tên tham số, ID, văn bản hay giá trị arguments; giữ tên helper/sys. Demo local_entity/local_context phụ thuộc tên app chỉ giữ ở bản gốc. Biến thể vượt token budget bị bỏ toàn bộ, không cắt nội dung. Canonical gold chỉ replay một lần mỗi sample, aliases không gọi ToolEnv. Số bước SFT có thể tăng gần 3 lần; app-held-out thêm chi phí eval. Manifest lưu cấu hình, exposure, partitions và thống kê biến thể.
+TRAIN được bổ sung tối đa `TRAIN_RENAME_VARIANTS=2` biến thể đổi tên app/tool nhất quán; với xác suất `TRAIN_DISTRACTOR_PROBABILITY=0.5` mỗi biến thể thêm 1–3 app khác nhóm từ TRAIN. Không đổi tên tham số, ID, văn bản hay giá trị arguments; giữ tên helper/sys. Demo local_entity/local_context phụ thuộc tên app chỉ giữ ở bản gốc. Biến thể vượt token budget bị bỏ toàn bộ, không cắt nội dung. Canonical gold chỉ replay một lần mỗi sample, aliases không gọi ToolEnv. Số bước SFT có thể tăng gần 3 lần. Manifest lưu cấu hình, sample IDs và thống kê biến thể.
 
 `tool_schemas` giữ toàn bộ schema của mọi tool được phép ngay từ bước đầu, gồm đầy đủ description, returns và metadata. History và mọi kết quả tool được giữ nguyên, không giới hạn lượt/ký tự hoặc giảm theo độ dài prompt. SFT tạo trực tiếp action call/done. Mọi schema đều có sẵn; local_schema.inspect chỉ kiểm tra arguments và góp ý, không mở khóa tool. Vượt giới hạn token sẽ báo lỗi, không tự cắt dữ liệu. Cần tạo lại SFT cũ trong thư mục mới; manifest phải có `prompt_policy=full-context-token-bounded-helpers-v11`. Mặc định `TRAIN_MISSING_TOOL_POLICY="error"`, không tự bỏ mẫu lỗi schema.
 
@@ -382,7 +378,7 @@ Mặc định agent có controller `local_batch.run`: một native call chứa c
 
 Muốn dùng adapter đã có: đặt `TRAIN_LLM=False`, `LOCAL_ADAPTER` tới thư mục adapter. Muốn dùng model đã merge: đặt `TRAIN_LLM=False`, `LOCAL_ADAPTER=None`, `LOCAL_LLM` tới model merged. Nếu thiếu train data khi bật training, cell sẽ dừng rõ ràng thay vì dùng model gốc âm thầm.
 
-Backend huấn luyện mặc định là **Unsloth FastVisionModel (text-only LoRA)** với LoRA không lượng tử hóa, max length 16.384 token, batch size 1, LoRA dropout=0 và gradient checkpointing `unsloth`. Import Unsloth trước Transformers/PEFT trong subprocess riêng. GPU phải hỗ trợ BF16; không tự chuyển sang FP16. Cấu hình batch 1 × 16K cần nhiều VRAM, chưa được xác nhận chạy vừa GPU Kaggle/T4. Prompt hoặc JSON target quá dài sẽ bị báo lỗi, không bị cắt âm thầm. Checkpoint tốt nhất được chọn bằng `eval_state_tool_score` (0–100) sau mỗi epoch: rollout agent với ASR trên toàn bộ validation tách từ TRAIN, gate bằng state hash rồi tính tool-call F1. Gold hash được lấy qua `ToolEnv.get_state_hash()` sau replay gold calls; dự đoán dùng môi trường mới. `eval_loss` chỉ để theo dõi. Sau mỗi rollout, evaluator ghi lỗi sai hash, thiếu/dư call, sai arguments và dấu hiệu dừng sớm, cùng nguyên nhân dừng. Các báo cáo `.jsonl` và `.diagnostics.json` được chép ra Output; trace `.trace.jsonl` tự động ghi từng lượt LLM, validate và call (kèm output đầy đủ). Nếu eval lỗi, phần đã ghi vẫn nằm trong `.trace.partial.jsonl` và cũng được chép ra Output; nguồn transcript được ghi rõ. Phân tích lỗi sau rollout không gọi thêm model/tool. Đặt TRAIN_EVAL_CLEAN_TRANSCRIPTS=True để chạy thêm các rollout text gốc trên cùng held-out IDs, mỗi rollout có đúng một ToolEnv mới cho mỗi sample; phần này tăng chi phí eval, lưu báo cáo riêng và metrics eval_clean_*. Chỉ eval_state_tool_score từ ASR được dùng chọn checkpoint. Đây là điểm validation với transcript ASR đã chuẩn bị; tokenizer fuzzy dùng lowercase + NFC + tách khoảng trắng, kết quả BTC vẫn là quyết định cuối cùng. Checkpoint/adapter nằm dưới `/kaggle/working/lifemate_finetunes`; không nhét model nhiều GB vào ZIP logs. Nếu mất session, gắn lại base weights + adapter hoặc dùng checkpoint để resume bằng `train_lora.py`.''')
+Backend huấn luyện mặc định là **Unsloth FastVisionModel (text-only LoRA)** với LoRA không lượng tử hóa, max length 16.384 token, batch size 1, LoRA dropout=0 và gradient checkpointing `unsloth`. Import Unsloth trước Transformers/PEFT trong subprocess riêng. GPU phải hỗ trợ BF16; không tự chuyển sang FP16. Cấu hình batch 1 × 16K cần nhiều VRAM, chưa được xác nhận chạy vừa GPU Kaggle/T4. Prompt hoặc JSON target quá dài sẽ bị báo lỗi, không bị cắt âm thầm. Không chạy validation loss hay rollout cuối mỗi epoch hoặc sau khi train. Checkpoint vẫn được lưu mỗi epoch; adapter xuất ra là trạng thái cuối quá trình training, không nạp lại checkpoint theo điểm validation. Khi đặt `TRAIN_MAX_STEPS > 0`, adapter lấy ở bước train cuối cùng theo giới hạn đó. Checkpoint/adapter nằm dưới `/kaggle/working/lifemate_finetunes`; không nhét model nhiều GB vào ZIP logs. Nếu mất session, gắn lại base weights + adapter hoặc dùng checkpoint để resume bằng `train_lora.py`.''')
 code('''ADAPTER_PATH = Path(LOCAL_ADAPTER) if LOCAL_ADAPTER else None
 if TRAIN_LLM:
     if TRAIN_DATA_ROOT:
@@ -398,13 +394,9 @@ if TRAIN_LLM:
     train_command = [sys.executable, "-u", APP / "finetune.py",
         "--data-root", training_data, "--base-model", LLM_PATH, "--output-dir", FT_RUN,
         "--backend", TRAIN_BACKEND,
-        "--eval-schema-cache", SCHEMA_CACHE_MODE, "--eval-schema-cache-mb", str(SCHEMA_CACHE_MB),
-        "--validation-fraction", str(TRAIN_VALIDATION_FRACTION),
         "--asr-transcript-ratio", str(TRAIN_ASR_TRANSCRIPT_RATIO),
         "--rename-variants", str(TRAIN_RENAME_VARIANTS),
         "--distractor-probability", str(TRAIN_DISTRACTOR_PROBABILITY),
-        "--heldout-apps", TRAIN_HELDOUT_APPS,
-        "--heldout-groups", TRAIN_HELDOUT_GROUPS,
         "--seed", str(SEED),
         "--missing-tool-policy", TRAIN_MISSING_TOOL_POLICY,
         "--epochs", str(TRAIN_EPOCHS), "--max-steps", str(TRAIN_MAX_STEPS),
@@ -414,8 +406,6 @@ if TRAIN_LLM:
         "--quantization", TRAIN_QUANTIZATION]
     train_command.extend(["--asr-model", ASR_PATH, "--asr-device", "cpu",
                           "--asr-precision", ASR_PRECISION, "--asr-threads", str(ASR_THREADS)])
-    if TRAIN_EVAL_CLEAN_TRANSCRIPTS:
-        train_command.append("--eval-clean-transcripts")
     if TRAIN_APP_GROUPS_FILE:
         train_command.extend(["--app-groups-file", TRAIN_APP_GROUPS_FILE])
     try:
@@ -426,17 +416,12 @@ if TRAIN_LLM:
             if numerics_debug.is_dir():
                 shutil.copytree(numerics_debug, OUT / "training_debug_numerics", dirs_exist_ok=True)
             for filename in ("prepare_sft.log", "train_lora.log", "base_model.json",
-                             "training/training_config.json", "training/eval_results.json",
-                             "training/train_results.json", "training/trainer_state.json", "training/validation_scores.jsonl", "sft/manifest.json",
-                             "sft/train_skipped.jsonl", "sft/validation_skipped.jsonl", "sft/app_heldout_skipped.jsonl"):
+                             "training/training_config.json",
+                             "training/train_results.json", "training/trainer_state.json", "sft/manifest.json",
+                             "sft/train_skipped.jsonl"):
                 path = FT_RUN / filename
                 if path.is_file():
                     shutil.copy2(path, OUT / ("training_" + filename.replace("/", "_")))
-            for path in sorted((FT_RUN / "training/validation_rollouts").glob("*")):
-                if (path.is_file() and (path.name.endswith(".trace.partial.jsonl")
-                        or (".partial." not in path.name
-                            and (path.suffix == ".jsonl" or path.name.endswith(".diagnostics.json"))))):
-                    shutil.copy2(path, OUT / ("training_validation_" + path.name))
     ADAPTER_PATH = FT_RUN / "training" / "adapter"
 if ADAPTER_PATH is not None and not (ADAPTER_PATH / "adapter_config.json").is_file():
     raise FileNotFoundError(f"Không có adapter hợp lệ: {ADAPTER_PATH}")

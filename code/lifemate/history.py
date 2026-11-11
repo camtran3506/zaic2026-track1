@@ -68,3 +68,41 @@ def prompt_history(history):
             row["tool_results"] = deepcopy([value for _, value in pairs])
         result.append(row)
     return result
+
+
+def collect_ids(value, observed: dict[str, set[str]], app: str, *, parent_key: str = "") -> None:
+    """Collect nonempty id / *_id string values into per-app and cross-app buckets."""
+    if isinstance(value, dict):
+        for key, child in value.items():
+            if (key == "id" or key.endswith("_id")) and isinstance(child, str) and child:
+                observed.setdefault(app, set()).add(child)
+                if key == "contact_id" or (key == "id" and parent_key == "contact"):
+                    observed.setdefault("contacts", set()).add(child)
+            collect_ids(child, observed, app, parent_key=key)
+    elif isinstance(value, list):
+        for child in value:
+            collect_ids(child, observed, app, parent_key=parent_key)
+
+
+def extract_observed_ids(context, history) -> dict[str, set[str]]:
+    """Gather known entity IDs from visible context and verified history calls/results."""
+    observed: dict[str, set[str]] = {}
+    for turn in history if isinstance(history, list) else []:
+        if not isinstance(turn, dict):
+            continue
+        for call, result in history_tool_pairs(turn):
+            if isinstance(result, dict) and result.get("ok") is True and result.get("done") is not False:
+                app = call["name"].split(".", 1)[0]
+                collect_ids(result, observed, app)
+                collect_ids(call.get("arguments"), observed, app)
+    if isinstance(context, dict):
+        collections = context.get("collections")
+        if isinstance(collections, dict):
+            for col_name, col_value in collections.items():
+                collect_ids(col_value, observed, str(col_name).split(".", 1)[0])
+        for key, value in context.items():
+            if key in {"installed_apps", "collections", "date_reference", "apps", "current_time", "timezone"}:
+                continue
+            if isinstance(value, (dict, list)):
+                collect_ids(value, observed, str(key))
+    return observed

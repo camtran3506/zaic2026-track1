@@ -1,15 +1,18 @@
 #!/usr/bin/env python3
-"""Convert TRAIN gold calls to observed next-action dialogues; split by sample ID."""
+"""Convert all TRAIN gold calls to observed next-action dialogues."""
 import argparse
 import json
 from pathlib import Path
 import sys
 
 from main import resolve_data_layout
+from lifemate.agent import _train_transcript
 from lifemate.catalog import load_catalog
+from lifemate.recovery import build_recovery_trajectory
 from lifemate.sft import (DEFAULT_ASR_TRANSCRIPT_RATIO, SFT_PROMPT_POLICY, VALIDATION_ROLLOUT_POLICY, UnexposedToolError,
-                         asr_transcript_ratio, assign_transcript_sources, file_sha256,
-                         prepare_train_transcript, prepare_validation_transcripts, replay_sample)
+                         asr_transcript_ratio, assign_transcript_sources, collapse_trajectory, file_sha256,
+                         is_asr_argument_damaged, prepare_train_transcript, prepare_validation_transcripts,
+                         pretranscribe_sft_partition, replay_sample)
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
 from lifemate.text import TEXT_NORMALIZATION
 from lifemate.itn import ITN_POLICY
@@ -32,16 +35,32 @@ def main():
     add_cuda_device_argument(p)
     p.add_argument("--data-root", type=Path, required=True)
     p.add_argument("--output-dir", type=Path, required=True)
-    p.add_argument("--validation-fraction", type=float, default=0.1)
+    p.add_argument("--validation-fraction", type=float, default=0.0,
+                   help="Optional standalone diagnostic split; default uses all samples for training")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--missing-tool-policy", choices=["error", "skip"], default="error",
                    help="Skip/report whole samples whose gold tools are absent from prompts, or stop")
     p.add_argument("--asr-transcript-ratio", type=asr_transcript_ratio, default=DEFAULT_ASR_TRANSCRIPT_RATIO,
-                   help="Fraction of SFT sample IDs using ASR instead of audio_text (default 0.5); rollout selection always uses ASR")
-    p.add_argument("--asr-model", type=Path, help="Required for ASR validation rollouts at every training mix ratio")
+                   help="Fraction of SFT sample IDs using ASR in mix mode; 0 disables ASR, 1 uses ASR only")
+    p.add_argument("--transcript-mode", choices=["dual", "mix"], default="dual",
+                   help="dual creates 100%% Gold + 100%% ASR copies when 0 < ratio < 1; mix splits by ratio")
+    p.add_argument("--include-date-helpers", action="store_true",
+                   help="Demonstrate calendar_reference / date helper calls despite user_context.date_reference")
+    p.add_argument("--no-inject-recovery", dest="inject_recovery", action="store_false",
+                   help="Disable injecting failed-search + recovery trajectories on eligible TRAIN samples")
+    p.add_argument("--step-wise-sft", action="store_true",
+                   help="Keep separate per-step SFT rows instead of full-trajectory packing")
+    p.add_argument("--asr-model", type=Path, help="Required when using ASR transcripts or standalone diagnostic splits")
     p.add_argument("--device", choices=["cpu"], default="cpu", help="ASR is CPU-only")
-    p.add_argument("--asr-precision", choices=["int8", "fp32"], default="int8")
+    p.add_argument("--asr-precision", choices=["auto", "int8", "fp32"], default="auto")
+    p.add_argument("--asr-decoding-method", choices=["modified_beam_search", "greedy_search"],
+                   default="modified_beam_search")
+    p.add_argument("--asr-beam-size", type=int, default=4)
     p.add_argument("--asr-threads", type=int, default=4)
+    p.add_argument("--asr-batch-size", type=int, default=16,
+                   help="Batch size for offline ASR stream decoding during SFT data prep")
+    p.add_argument("--filter-damaged-asr", action="store_true",
+                   help="Drop contradictory TRAIN ASR copies when spoken exact-match gold arguments are lost in ASR")
     add_arguments(p)
     p.add_argument("--tokenizer", type=Path, help="Local base model/tokenizer, required for augmentation token-budget checks")
     p.add_argument("--max-length", type=int, default=MAX_CONTEXT_TOKENS)
@@ -49,10 +68,13 @@ def main():
     configure_cuda_device(args)
     validate_options(args)
     validate_training_length(args.max_length)
+    if args.asr_batch_size < 1:
+        p.error("--asr-batch-size must be positive")
     if (args.rename_variants or args.distractor_probability) and args.tokenizer is None:
         p.error("--tokenizer is required for app/tool augmentation")
-    if args.asr_model is None:
-        p.error("--asr-model is required for ASR validation rollouts, even when --asr-transcript-ratio is 0")
+    if args.asr_model is None and (args.asr_transcript_ratio > 0 or args.validation_fraction > 0
+                                 or args.heldout_apps != "none" or args.heldout_groups):
+        p.error("--asr-model is required for ASR transcripts or standalone diagnostic splits")
     split_dir, env_root, holder = resolve_data_layout(args.data_root, "train")
     source = split_dir / "train.jsonl"
     records = [json.loads(line) for line in source.read_text(encoding="utf-8").splitlines() if line.strip()]
@@ -87,10 +109,25 @@ def main():
     asr = None
     asr_settings = None
     if args.asr_model:
+        from lifemate.asr import (
+            DEFAULT_ASR_DECODING_METHOD,
+            DEFAULT_ASR_MAX_ACTIVE_PATHS,
+            resolve_asr_precision,
+        )
         from lifemate.models import LocalASR
         from lifemate.transcripts import asr_identity
-        asr_settings = asr_identity(args.asr_model, args.asr_precision, args.asr_threads)
-        asr = LocalASR(args.asr_model, precision=args.asr_precision, num_threads=args.asr_threads)
+        precision = (
+            resolve_asr_precision(args.asr_model, args.asr_precision)
+            if args.asr_precision == "auto" and Path(args.asr_model).expanduser().is_dir()
+            else args.asr_precision
+        )
+        extra = {}
+        if args.asr_decoding_method != DEFAULT_ASR_DECODING_METHOD:
+            extra["decoding_method"] = args.asr_decoding_method
+        if args.asr_beam_size != DEFAULT_ASR_MAX_ACTIVE_PATHS:
+            extra["max_active_paths"] = args.asr_beam_size
+        asr_settings = asr_identity(args.asr_model, precision, args.asr_threads, **extra)
+        asr = LocalASR(args.asr_model, precision=precision, num_threads=args.asr_threads, **extra)
     metadata = dict(source=str(source), source_sha256=file_sha256(source),
                     catalog_sha256=file_sha256(catalog_path), seed=args.seed,
                     prompt_policy=SFT_PROMPT_POLICY, missing_tool_policy=args.missing_tool_policy,
@@ -105,7 +142,8 @@ def main():
                     temporal_helper_training_policy=TEMPORAL_TRAINING_POLICY,
                     transcript_mixing={"policy": "seeded-sample-v1", "unit": "sample",
                                        "asr_ratio": args.asr_transcript_ratio, "seed": args.seed,
-                                       "rounding": ("nearest-total-train-validation-app-heldout-remainder"
+                                       "rounding": ("nearest-total" if not validation and not partitions['app_heldout'] else
+                                                    "nearest-total-train-validation-app-heldout-remainder"
                                                     if partitions['app_heldout'] else
                                                     "nearest-total-and-train-validation-remainder")},
                     asr=asr_settings,
@@ -113,100 +151,161 @@ def main():
     metadata['batching'] = {'policy': BATCH_POLICY, 'max_read_calls': MAX_READ_BATCH_CALLS,
                            'max_helper_calls': None, 'max_helpers_per_sample': None,
                            'token_budget_checked': tokenizer is not None, 'max_new_tokens': DEFAULT_MAX_NEW_TOKENS}
+    full_trajectory_sft = (not args.step_wise_sft) and (getattr(tokenizer, "lifemate_native_fc", False) is True)
+    metadata['sft_format'] = {
+        'full_trajectory': full_trajectory_sft,
+        'transcript_mode': args.transcript_mode,
+        'include_date_helpers': args.include_date_helpers,
+        'inject_recovery': args.inject_recovery,
+    }
     rollout_rows = {"validation": [], "app_heldout": []}
     for partition, rows in partitions.items():
         if not rows:
             continue
+        dual_train = (partition == "train" and args.transcript_mode == "dual" and 0 < args.asr_transcript_ratio < 1)
         sources = assign_transcript_sources(rows, args.asr_transcript_ratio, args.seed,
                                             count=asr_counts[partition])
-        requested_counts = {name: list(sources.values()).count(name) for name in ("audio_text", "asr")}
-        print(f"{partition} transcript assignment: {requested_counts}", flush=True)
+        if dual_train:
+            requested_counts = {"audio_text": len(rows), "asr": len(rows)}
+            print(f"{partition} transcript assignment: dual (100% audio_text + 100% asr, {len(rows)} samples)", flush=True)
+            if asr is not None:
+                pretranscribe_sft_partition(rows, split_dir, asr, partition, {r["id"]: "asr" for r in rows},
+                                            batch_size=args.asr_batch_size)
+        else:
+            requested_counts = {name: list(sources.values()).count(name) for name in ("audio_text", "asr")}
+            print(f"{partition} transcript assignment: {requested_counts}", flush=True)
+            if asr is not None:
+                pretranscribe_sft_partition(rows, split_dir, asr, partition, sources,
+                                            batch_size=args.asr_batch_size)
         path = args.output_dir / f"{partition}.jsonl"
         count = 0
+        trajectory_count = 0
+        recovery_count = 0
         helper_count = 0
         batch_count = 0
         ungrouped_count = 0
+        asr_damaged_filtered = 0
+        written_source_counts = {"audio_text": 0, "asr": 0}
         helper_counts = {name: 0 for name in helper_tool_schemas()}
         retained_ids = []
         skipped = []
         # Partial preparations stay marked .partial and are never consumed by the trainer.
         with path.with_suffix(".partial").open("w", encoding="utf-8") as f:
             for i, record in enumerate(rows):
-                env = ToolEnv("train", record["id"], root=str(env_root))
-                try:
-                    prepared = prepare_train_transcript(record, split_dir, asr,
-                                                        transcript_source=sources[record["id"]])
-                    if partition != "train":
-                        asr_prepared, clean_prepared = prepare_validation_transcripts(record, split_dir, asr, prepared)
-                    examples = replay_sample(record, catalog, env, split_dir, asr,
-                                             prepared_transcript=prepared, tokenizer=tokenizer)
-                except UnexposedToolError as exc:
-                    if args.missing_tool_policy == "error":
-                        raise
-                    reason = {"sample_id": record["id"], "reason": str(exc)}
-                    skipped.append(reason)
-                    with (args.output_dir / f"{partition}_skipped.jsonl").open("a", encoding="utf-8") as report:
-                        report.write(json.dumps(reason, ensure_ascii=False) + "\n")
-                    print(f"WARNING skipped entire {partition} sample: {exc}", flush=True)
-                    continue
-                if partition != "train":
-                    gold_hash = env.get_state_hash()
-                    if not isinstance(gold_hash, str) or not gold_hash:
-                        raise ValueError(f"{record['id']}: ToolEnv returned an invalid gold state hash")
-                    supplied_hash = record.get("label", {}).get("state_hash")
-                    if supplied_hash is not None and supplied_hash != gold_hash:
-                        raise ValueError(f"{record['id']}: replayed gold hash differs from the provided gold hash")
-                    rollout_rows[partition].append({
-                        "item": {k: v for k, v in record.items() if k not in ("label", "audio_text")},
-                        "prepared_transcript": asr_prepared,
-                        "clean_prepared_transcript": clean_prepared,
-                        "gold_tool_calls": record["label"]["tool_calls"], "gold_state_hash": gold_hash,
-                    })
-                retained_ids.append(record["id"])
-                if partition == 'train':
-                    for example in examples:
-                        assert_no_heldout(example, holdout['apps'])
-                    augmented = augmenter.augment(record, examples)
+                if dual_train:
+                    variant_sources = (["audio_text", "asr"] if _train_transcript(record) is not None else ["asr"])
                 else:
-                    augmented = []
-                # Group after augmentation so aliases, helper omissions and token
-                # budgets are evaluated on the actual trajectory being trained.
-                trajectories = [examples]
-                for row in augmented:
-                    if len(trajectories) == 1 or trajectories[-1][-1]['augmentation']['variant'] != row['augmentation']['variant']:
-                        trajectories.append([])
-                    trajectories[-1].append(row)
-                ungrouped_count += sum(map(len, trajectories))
-                examples = [row for trajectory in trajectories
-                            for row in group_examples(trajectory, tokenizer=tokenizer, max_length=args.max_length)]
-                for example in examples:
-                    target = json.loads(example["messages"][-1]["content"])
-                    if target.get('name') == BATCH_TOOL:
-                        batch_count += 1
-                        targets = target['arguments']['calls']
+                    variant_sources = [sources[record["id"]]]
+                variant_runs = []
+                sample_skipped = False
+                for src in variant_sources:
+                    env = ToolEnv("train", record["id"], root=str(env_root))
+                    try:
+                        prepared = prepare_train_transcript(record, split_dir, asr, transcript_source=src)
+                        if (partition == "train" and args.filter_damaged_asr and src == "asr"
+                                and is_asr_argument_damaged(record, prepared, catalog)):
+                            asr_damaged_filtered += 1
+                            continue
+                        if partition != "train" and not variant_runs:
+                            asr_prepared, clean_prepared = prepare_validation_transcripts(record, split_dir, asr, prepared)
+                        examples = replay_sample(
+                            record, catalog, env, split_dir, asr,
+                            prepared_transcript=prepared, tokenizer=tokenizer,
+                            include_date_helpers=args.include_date_helpers,
+                        )
+                    except UnexposedToolError as exc:
+                        if args.missing_tool_policy == "error":
+                            raise
+                        reason = {"sample_id": record["id"], "reason": str(exc)}
+                        skipped.append(reason)
+                        with (args.output_dir / f"{partition}_skipped.jsonl").open("a", encoding="utf-8") as report:
+                            report.write(json.dumps(reason, ensure_ascii=False) + "\n")
+                        print(f"WARNING skipped entire {partition} sample: {exc}", flush=True)
+                        sample_skipped = True
+                        break
+                    if partition != "train":
+                        gold_hash = env.get_state_hash()
+                        if not isinstance(gold_hash, str) or not gold_hash:
+                            raise ValueError(f"{record['id']}: ToolEnv returned an invalid gold state hash")
+                        supplied_hash = record.get("label", {}).get("state_hash")
+                        if supplied_hash is not None and supplied_hash != gold_hash:
+                            raise ValueError(f"{record['id']}: replayed gold hash differs from the provided gold hash")
+                        rollout_rows[partition].append({
+                            "item": {k: v for k, v in record.items() if k not in ("label", "audio_text")},
+                            "prepared_transcript": asr_prepared,
+                            "clean_prepared_transcript": clean_prepared,
+                            "gold_tool_calls": record["label"]["tool_calls"], "gold_state_hash": gold_hash,
+                        })
+                    variant_runs.append((prepared, examples))
+                if sample_skipped or not variant_runs:
+                    continue
+                retained_ids.append(record["id"])
+                for prepared, examples in variant_runs:
+                    if partition == 'train':
+                        for example in examples:
+                            assert_no_heldout(example, holdout['apps'])
+                        augmented = augmenter.augment(record, examples)
                     else:
-                        targets = [target]
-                    for child in targets:
-                        if child.get('name') in helper_counts:
-                            helper_count += 1
-                            helper_counts[child['name']] += 1
-                    example["transcript_source"] = prepared["transcript_source"]
-                    f.write(json.dumps(example, ensure_ascii=False) + "\n")
-                    count += 1
-                print(f"{partition}: {i+1}/{len(rows)} samples, {count} SFT steps", flush=True)
+                        augmented = []
+                    # Group after augmentation so aliases, helper omissions and token
+                    # budgets are evaluated on the actual trajectory being trained.
+                    trajectories = [(examples, False)]
+                    if partition == "train" and args.inject_recovery:
+                        recovery_res = build_recovery_trajectory(
+                            record, prepared, examples, catalog,
+                            lambda rid=record["id"]: ToolEnv("train", rid, root=str(env_root)),
+                        )
+                        if recovery_res is not None:
+                            rec_steps, _ = recovery_res
+                            trajectories.append((rec_steps, True))
+                            recovery_count += 1
+                    aug_buckets = []
+                    for row in augmented:
+                        if not aug_buckets or aug_buckets[-1][-1]['augmentation']['variant'] != row['augmentation']['variant']:
+                            aug_buckets.append([])
+                        aug_buckets[-1].append(row)
+                    for bucket in aug_buckets:
+                        trajectories.append((bucket, False))
+                    ungrouped_count += sum(len(t) for t, _ in trajectories)
+                    for traj, is_recovery in trajectories:
+                        grouped = traj if is_recovery else group_examples(traj, tokenizer=tokenizer, max_length=args.max_length)
+                        for example in grouped:
+                            target = json.loads(example["messages"][-1]["content"])
+                            if target.get('name') == BATCH_TOOL:
+                                batch_count += 1
+                                targets = target['arguments']['calls']
+                            else:
+                                targets = [target]
+                            for child in targets:
+                                if child.get('name') in helper_counts:
+                                    helper_count += 1
+                                    helper_counts[child['name']] += 1
+                            example["transcript_source"] = prepared["transcript_source"]
+                        rows_to_write = [collapse_trajectory(grouped)] if full_trajectory_sft else grouped
+                        trajectory_count += 1
+                        written_source_counts[prepared["transcript_source"]] += 1
+                        for row_out in rows_to_write:
+                            row_out["transcript_source"] = prepared["transcript_source"]
+                            f.write(json.dumps(row_out, ensure_ascii=False) + "\n")
+                            count += 1
+                print(f"{partition}: {i+1}/{len(rows)} samples, {count} SFT rows", flush=True)
         if not retained_ids:
             raise ValueError(f"No usable {partition} samples; inspect skipped report and candidate selection")
         path.with_suffix(".partial").replace(path)
+        source_summary = (written_source_counts if dual_train
+                          else {name: sum(sources[sample_id] == name for sample_id in retained_ids)
+                                for name in ("audio_text", "asr")})
         metadata["partitions"][partition] = dict(sample_ids=retained_ids,
             samples=len(retained_ids), source_samples=len(rows), skipped_samples=skipped,
-            transcript_sources={sample_id: sources[sample_id] for sample_id in retained_ids},
-            transcript_source_counts={name: sum(sources[sample_id] == name for sample_id in retained_ids)
-                                      for name in ("audio_text", "asr")},
+            transcript_sources={sample_id: ("dual" if dual_train else sources[sample_id]) for sample_id in retained_ids},
+            transcript_source_counts=source_summary,
             requested_transcript_source_counts=requested_counts,
-            examples=count, ungrouped_examples=ungrouped_count, batch_examples=batch_count,
+            examples=count, trajectories=trajectory_count, recovery_trajectories=recovery_count,
+            asr_damaged_filtered=asr_damaged_filtered,
+            ungrouped_examples=ungrouped_count, batch_examples=batch_count,
             local_helper_examples=helper_count,
             local_helper_examples_by_tool=helper_counts, sha256=file_sha256(path))
-        print(f"{partition} summary: kept {len(retained_ids)}/{len(rows)}, skipped {len(skipped)}, {count} steps; "
+        print(f"{partition} summary: kept {len(retained_ids)}/{len(rows)}, skipped {len(skipped)}, {count} rows ({trajectory_count} trajectories, {recovery_count} recovery); "
               f"transcript sources: {metadata['partitions'][partition]['transcript_source_counts']}", flush=True)
     for partition, rows in rollout_rows.items():
         if not rows:

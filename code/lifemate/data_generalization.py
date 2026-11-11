@@ -34,7 +34,7 @@ def add_arguments(parser, *, enabled=False):
                         help="Additional app/tool-name variants per TRAIN sample; local_*/sys names stay fixed")
     parser.add_argument("--distractor-probability", type=float, default=.5 if enabled else 0.,
                         help="Probability of adding 1-3 unrelated TRAIN-catalog apps to an augmented variant")
-    parser.add_argument("--heldout-apps", default="auto" if enabled else "none",
+    parser.add_argument("--heldout-apps", default="none",
                         help="Comma-separated app IDs, auto (one feasible app), or none")
     parser.add_argument("--heldout-fraction", type=float, default=.1,
                         help="Target fraction of source IDs exposed to the auto-selected held-out app")
@@ -275,9 +275,9 @@ class AppAugmenter:
         installed = exposed_apps(record, self.catalog)
         candidates = sorted(a for a in self.pool - installed - related
                             if intent and active_groups and any(a in v for v in self.groups.values()))
+        used_apps, used_tools = set(), set()
         for index in range(max(self.variants, 1)):
-            digest = hashlib.sha256(f'{self.seed}:{record["id"]}:{index}'.encode()).hexdigest()
-            rng = random.Random(digest)
+            rng = random.Random(f'{self.seed}:{record["id"]}:{index}')
             extras = rng.sample(candidates, rng.randint(1, min(3, len(candidates)))) if candidates and rng.random() < self.probability else []
             if not self.variants and not extras:
                 continue
@@ -297,12 +297,20 @@ class AppAugmenter:
                 if namespace_refs(literal, app_ids(self.catalog)):
                     self.stats['variants_skipped_literal_tool_reference'] += 1
                     continue
-                for app in sorted(installed | set(extras)):
-                    app_map[app] = 'app_' + hashlib.sha256(f'{digest}:{app}'.encode()).hexdigest()[:12]
-                for name in self.catalog:
-                    app = name.split('.')[0]
-                    if app in app_map:
-                        tool_map[name] = app_map[app] + '.tool_' + hashlib.sha256(f'{digest}:{name}'.encode()).hexdigest()[:12]
+                # Short numeric aliases (app_17.tool_42): a handful of tokens each,
+                # unlike 34-char hex hashes. Numbers are drawn without replacement
+                # across variants so each sample/variant is deterministic and unique.
+                chosen = sorted(installed | set(extras))
+                app_pool = [n for n in range(1, 100) if n not in used_apps]
+                for app, number in zip(chosen, rng.sample(app_pool, len(chosen))):
+                    used_apps.add(number)
+                    app_map[app] = f'app_{number}'
+                for app in chosen:
+                    names = sorted(n for n in self.catalog if n.split('.')[0] == app)
+                    tool_pool = [n for n in range(1, 100) if (app, n) not in used_tools]
+                    for name, number in zip(names, rng.sample(tool_pool, len(names))):
+                        used_tools.add((app, number))
+                        tool_map[name] = f'{app_map[app]}.tool_{number}'
             rows, removed = [], 0
             for example in examples:
                 row = deepcopy(example)

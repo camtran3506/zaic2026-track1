@@ -70,8 +70,7 @@ def test_train_adapter_reload_and_merge(tmp_path, architecture):
         'context': {'installed_apps': {'home': {'tools': ['home.read', 'home.other_read']}}}, 'history': [],
         'label': {'tool_calls': [{'name': name, 'arguments': {}} for name in ('home.read', 'home.other_read')]},
     } for i in range(4)]
-    # Exercise the third partition through real training/reload on hybrid Qwen.
-    # The single-app Qwen3 fixture also verifies explicit unavailable reporting.
+    # Every app stays in train, including the single-sample library app.
     if architecture == 'qwen3_5':
         # Real assistant-only SFT contains a >8-helper batch, not just executor mocks.
         for row in source_rows:
@@ -101,8 +100,7 @@ def test_train_adapter_reload_and_merge(tmp_path, architecture):
     def get_tool_calls(self): return self.calls
     def get_state_hash(self): return 'fixture-unchanged-state'
 ''')
-    # Real audio loading/model provenance with a stubbed recognizer: no ONNX
-    # downloads are needed to exercise ASR-only held-out checkpoint selection.
+    # Local ASR fixtures do not require model downloads.
     import numpy as np
     import soundfile as sf
     for i in range(len(source_rows)):
@@ -130,9 +128,8 @@ class OfflineRecognizer:
            'PYTHONPATH': str(stubs) + os.pathsep + os.environ.get('PYTHONPATH', '')}
     result = subprocess.run([sys.executable, app / 'finetune.py', '--data-root', data.parent,
         '--base-model', base, '--output-dir', run, '--backend', 'transformers',
-        '--asr-transcript-ratio', '0', '--asr-model', asr, '--eval-clean-transcripts',
-        '--heldout-apps', 'library' if architecture == 'qwen3_5' else 'auto',
-        '--max-steps', '2', '--gradient-accumulation', '1', '--save-steps', '1',
+        '--asr-transcript-ratio', '0',
+        '--max-steps', '2', '--gradient-accumulation', '1', '--save-strategy', 'steps', '--save-steps', '1',
         '--learning-rate', '0.01', '--export-merged'],
         env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
     assert result.returncode == 0, result.stdout
@@ -140,20 +137,28 @@ class OfflineRecognizer:
     assert config['quantization'] == 'none'
     assert config['max_length'] == 16384
     assert config['batch_size'] == 1
-    assert config['eval_strategy'] == 'epoch'
+    assert config['eval_strategy'] == 'no'
+    assert config['validation_steps'] == 0
+    assert config['checkpoint_selection'] == 'last'
     assert config['numerics_guard'] == 'finite-loss-and-gradients-v1'
     assert not (run/'training/debug_numerics').exists()
-    assert config['eval_schema_cache'] == 'auto' and config['eval_schema_cache_mb'] == 256
+    assert config['fuzzy_weight'] == 0.3
+    assert config['epochs'] == 2
     prepared_manifest = json.loads((run/'sft/manifest.json').read_text())
-    assert prepared_manifest['training_augmentation']['rename_variants'] == 2
-    assert prepared_manifest['training_augmentation']['variants_kept'] == 6
-    assert prepared_manifest['partitions']['train']['batch_examples'] == (18 if architecture == 'qwen3_5' else 9)
+    assert prepared_manifest['training_augmentation']['rename_variants'] == 0
+    assert prepared_manifest['training_augmentation']['variants_kept'] == 0
+    assert prepared_manifest['training_augmentation']['distractor_probability'] == 0.0
+    assert set(prepared_manifest['partitions']) == {'train'}
+    assert set(prepared_manifest['partitions']['train']['sample_ids']) == {row['id'] for row in source_rows}
+    assert prepared_manifest['partitions']['train']['batch_examples'] >= (8 if architecture == 'qwen3_5' else 4)
     assert prepared_manifest['batching']['max_helper_calls'] is None
     assert prepared_manifest['batching']['max_helpers_per_sample'] is None
     assert prepared_manifest['batching']['max_read_calls'] == 4
     if architecture == 'qwen3_5':
-        assert prepared_manifest['partitions']['train']['local_helper_examples'] == 189
-        assert prepared_manifest['partitions']['train']['local_helper_examples_by_tool']['local_assist.solve'] == 9
+        assert prepared_manifest['partitions']['train']['trajectories'] == len(source_rows)
+        assert prepared_manifest['partitions']['train']['examples'] == len(source_rows)
+        assert prepared_manifest['partitions']['train']['local_helper_examples'] >= 84
+        assert prepared_manifest['partitions']['train']['local_helper_examples_by_tool']['local_assist.solve'] >= 4
     assert prepared_manifest['assist_policy'] == 'fixed-python-task-workflows-v1'
     assert prepared_manifest['schema_prompt_policy'] == 'redundant-schema-metadata-v1'
     # Real preparation/training sees compact schemas, while the file consumed by
@@ -166,7 +171,9 @@ class OfflineRecognizer:
             assert 'app' not in spec and 'returns' not in spec
             assert spec['parameters']['properties']['limit'] == {'type': 'integer', 'minimum': 1}
     assert prepared_manifest['partitions']['train']['ungrouped_examples'] > prepared_manifest['partitions']['train']['examples']
-    assert prepared_manifest['app_holdout']['status'] == ('enabled' if architecture == 'qwen3_5' else 'unavailable')
+    assert prepared_manifest['app_holdout']['status'] == 'off'
+    assert not (run / 'sft/validation.jsonl').exists()
+    assert not (run / 'sft/validation_rollouts.jsonl').exists()
     adapter = run / 'training' / 'adapter'
     assert (adapter / 'adapter_model.safetensors').is_file()
     runtime = json.loads((adapter / 'lifemate_runtime.json').read_text())
@@ -182,42 +189,22 @@ class OfflineRecognizer:
     weights = load_file(str(adapter / 'adapter_model.safetensors'))
     if architecture == 'qwen3_5':
         assert all('visual' not in name and 'language_model' in name for name in weights)
-    # The selected first checkpoint may precede nonzero LR during warmup when
-    # all rollout scores tie at zero. Training must still have updated LoRA.
+    # The exported adapter contains the last optimizer step's weights.
     latest_weights = load_file(str(run / 'training/checkpoint-2/adapter_model.safetensors'))
     assert any(torch.count_nonzero(v).item() > 0 for k, v in latest_weights.items() if 'lora_B' in k)
-    selected_weights = load_file(str(Path(config['best_checkpoint']) / 'adapter_model.safetensors'))
-    assert weights.keys() == selected_weights.keys()
-    assert all(torch.equal(weights[k], selected_weights[k]) for k in weights)
-    metrics = json.loads((run / 'training/eval_results.json').read_text())
-    assert 0 < metrics['eval_loss'] < 100
-    assert 0 <= metrics['eval_state_tool_score'] <= 100
-    assert metrics['eval_rollout_samples'] == 1
-    assert config['selection_metric'] == 'eval_state_tool_score'
-    assert config['selection_transcript_source'] == 'asr'
-    assert metrics['eval_clean_rollout_samples'] == metrics['eval_rollout_samples']
-    if architecture == 'qwen3_5':
-        assert metrics['eval_app_heldout_rollout_samples'] == metrics['eval_app_heldout_clean_rollout_samples'] == 1
-    rollouts = [json.loads(line) for line in (run / 'sft/validation_rollouts.jsonl').read_text().splitlines()]
-    assert all(row['prepared_transcript']['transcript_source'] == 'asr' for row in rollouts)
-    assert all(row['clean_prepared_transcript']['transcript_source'] == 'audio_text' for row in rollouts)
+    assert weights.keys() == latest_weights.keys()
+    assert all(torch.equal(weights[k], latest_weights[k]) for k in weights)
+    assert config['selection_metric'] is None
+    assert config['final_step'] == 2
+    assert not (run / 'training/eval_results.json').exists()
+    assert not (run / 'training/validation_scores.jsonl').exists()
+    assert not (run / 'training/validation_rollouts').exists()
     trainer_state = json.loads((run / 'training/trainer_state.json').read_text())
-    assert config['best_state_tool_score'] == trainer_state['best_metric']
-    assert (run / 'training/validation_scores.jsonl').is_file()
-    attempts = [json.loads(line) for line in (run / 'training/validation_scores.jsonl').read_text().splitlines()]
-    assert attempts
-    for attempt in attempts:
-        assert attempt['selection_transcript_source'] == 'asr'
-        assert Path(attempt['clean_rollouts']).is_file()
-        assert Path(attempt['clean_trace']).is_file()
-        if architecture == 'qwen3_5':
-            assert Path(attempt['app_heldout_rollouts']).is_file()
-            assert Path(attempt['app_heldout_clean_trace']).is_file()
-        trace_path = Path(attempt['trace'])
-        assert trace_path.is_file()
-        events = [json.loads(line) for line in trace_path.read_text().splitlines()]
-        assert events[0]['event'] == 'sample_start' and events[-1]['event'] == 'sample_end'
-        assert any(event['event'] == 'llm_output' for event in events)
+    assert trainer_state['best_metric'] is None
+    assert trainer_state['best_model_checkpoint'] is None
+    assert all(not any(key.startswith('eval_') for key in row) for row in trainer_state['log_history'])
+    metrics = json.loads((run / 'training/train_results.json').read_text())
+    assert 0 < metrics['train_loss'] < 100
     llm = LocalLLM(base, device='cpu', dtype='float32', adapter_path=adapter, max_new_tokens=2)
     merged_runtime = json.loads((run / 'merged/lifemate_runtime.json').read_text())
     assert merged_runtime['generation'] == runtime['generation']
@@ -237,9 +224,8 @@ class OfflineRecognizer:
     assert (run / 'training/checkpoint-2/trainer_state.json').is_file()
     resume = subprocess.run([sys.executable, app / 'train_lora.py', '--base-model', base,
         '--sft-dir', run / 'sft', '--output-dir', run / 'training', '--backend', 'transformers',
-        '--max-steps', '3', '--gradient-accumulation', '1', '--save-steps', '1',
+        '--max-steps', '3', '--gradient-accumulation', '1', '--save-strategy', 'steps', '--save-steps', '1',
         '--learning-rate', '0.01',
-        '--eval-clean-transcripts',
         '--resume-from-checkpoint', run / 'training/checkpoint-2'],
         env=env, text=True, stdout=subprocess.PIPE, stderr=subprocess.STDOUT, timeout=180)
     assert resume.returncode == 0, resume.stdout

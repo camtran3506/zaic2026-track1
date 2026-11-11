@@ -49,6 +49,32 @@ def test_terminal_missing_info_does_not_add_done():
     assert len(replay_sample(entry, CATALOG, FakeEnv(), Path('/unused'))) == 1
 
 
+def test_empty_calls_with_temporal_words_demonstrates_helpers_then_done():
+    entry = item()
+    entry['context']['current_time'] = '2026-10-14T08:00:00+07:00'
+    entry['context']['installed_apps']['reminders'] = {'tools': ['reminders.create']}
+    entry['audio_text'] = 'Nhắc tôi ngày mai có việc gì không?'
+    entry['label'] = {'tool_calls': []}
+    catalog = {
+        **CATALOG,
+        'reminders.create': {
+            'name': 'reminders.create', 'kind': 'write', 'description': 'Tạo nhắc nhở',
+            'parameters': {'type': 'object', 'properties': {'content': {'type': 'string'}}, 'required': ['content']},
+        }
+    }
+    steps = replay_sample(entry, catalog, FakeEnv(), Path('/unused'))
+    assert len(steps) >= 2
+    step0 = json.loads(steps[0]['messages'][-1]['content'])
+    assert step0['action'] == 'call'
+    assert step0['name'] in ('local_time.calendar_reference', 'local_assist.solve')
+    step_last = json.loads(steps[-1]['messages'][-1]['content'])
+    assert step_last == {'action': 'done'}
+    last_prompt = json.loads(steps[-1]['messages'][1]['content'])
+    obs = last_prompt['previous_actions_and_results']
+    assert len(obs) == 1
+    assert obs[0]['name'] in ('local_time.calendar_reference', 'local_assist.solve')
+
+
 def test_gold_tool_must_exist_in_complete_prompt(monkeypatch):
     import lifemate.sft as sft
     monkeypatch.setattr(sft, 'build_step_prompt', lambda *args: (
@@ -106,11 +132,20 @@ def test_prepare_skip_reports_whole_samples_and_retains_partition_ids(tmp_path, 
 
 def test_split_is_grouped_deterministic_and_order_independent():
     records = [{'id': str(i)} for i in range(20)]
-    train, valid = split_records(records)
+    train, valid = split_records(records, 0.1)
     assert not {r['id'] for r in train} & {r['id'] for r in valid}
-    assert (train, valid) == split_records(records[::-1])
+    assert (train, valid) == split_records(records[::-1], 0.1)
     with pytest.raises(ValueError, match='Duplicate'):
         split_records([{'id': 'x'}, {'id': 'x'}])
+
+
+@pytest.mark.parametrize('count', [1, 20])
+def test_default_split_keeps_all_samples_in_train(count):
+    records = [{'id': str(i)} for i in range(count)]
+    train, valid = split_records(records)
+    assert valid == []
+    assert {row['id'] for row in train} == {row['id'] for row in records}
+    assert (train, valid) == split_records(records[::-1])
 
 
 class TemplateTokenizer:

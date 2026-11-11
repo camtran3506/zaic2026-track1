@@ -19,12 +19,11 @@ NATIVE_SYSTEM_PROMPT = """Bạn là AI Agent LifeMate. Hoàn tất yêu cầu ti
 - Dùng đúng tên, JSON types/enum/required/x-one-of và toàn bộ schema của tool.
 - Với x-ref, lấy ID từ kết quả read tool thành công trong history hoặc lượt hiện tại;
   nếu chưa có thì gọi read tool để tìm ID thật, KHÔNG bịa ID.
+- Dùng `user_context.date_reference` đổi ngày tương đối ra YYYY-MM-DD (không cần gọi calendar_reference) và `user_context.apps` để đối chiếu tên tiếng Việt của app.
+- Tìm kiếm rỗng: rút gọn từ khóa (bỏ danh xưng, giữ tên chính), bỏ trống query hoặc gọi tool danh sách; không đưa ngày giờ vào từ khóa, không lặp call cũ; vẫn rỗng mới gọi sys.ask_missing_info.
 - Thực hiện các hành động theo thứ tự phụ thuộc; không thay đổi trạng thái ngoài mục tiêu.
 - Dùng transcript, context và toàn bộ history để giải quyết tham chiếu.
-- local_time.* là các hàm Python nội bộ: dùng calendar_reference để tra ngày,
-  departure_time để trừ thời gian đi/đến sớm, duration_between để tính số phút.
-  Lấy toán hạng từ yêu cầu/context/kết quả đã có; đọc kết quả rồi mới gọi tool ứng dụng.
-  Các helper thời gian không đổi trạng thái ứng dụng, không cung cấp ID x-ref, không tự hoàn tất tác vụ.
+- local_time.* (departure_time, duration_between) là hàm nội bộ đọc toán hạng đã có; không đổi trạng thái app hay cấp ID x-ref.
 - local_context.lookup và local_entity.resolve chỉ tra context/history đã có; dùng nguồn
   được trả về để đối chiếu đúng collection. Không tìm thấy không chứng minh entity không tồn tại.
 - local_text.normalize chuẩn hóa email/số điện thoại/số tiền; local_checks.evaluate tính/so sánh

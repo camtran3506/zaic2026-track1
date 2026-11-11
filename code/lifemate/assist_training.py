@@ -19,7 +19,7 @@ def _key(call):
     return call['name'], json.dumps(call['arguments'], ensure_ascii=False, sort_keys=True)
 
 
-def task_demonstrations(transcript, context, enabled, observations, primitives, *, normalize_fields=True):
+def task_demonstrations(transcript, context, enabled, observations, primitives, *, normalize_fields=True, include_date_tasks=True):
     """Prefer a fixed solver workflow; retain unrelated/unsupported primitives.
 
     Exact request spans, sample date anchors and genuine earlier read outputs are
@@ -86,9 +86,9 @@ def task_demonstrations(transcript, context, enabled, observations, primitives, 
                 if add('duration', {'date_text': date_text, 'start_time': a[0], 'end_time': b[0]}):
                     covered_calendar = True
                     consumed.update(i for i, p in enumerate(primitives) if p['name'] == 'local_time.duration_between')
-        elif len(clocks) == 1:
+        elif len(clocks) == 1 and include_date_tasks:
             covered_calendar = add('datetime', {'date_text': date_text, 'time_text': clocks[0][0]}) or covered_calendar
-        elif not clocks:
+        elif not clocks and include_date_tasks:
             covered_calendar = add('date', {'date_text': date_text}) or covered_calendar
 
     if covered_calendar:

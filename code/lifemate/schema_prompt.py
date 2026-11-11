@@ -41,6 +41,7 @@ def _compact_parameters(schema):
 @lru_cache(maxsize=512)
 def _compiled(policy, serialized):
     tool = json.loads(serialized)
+    tool.pop('_app', None)
     if tool.get('app') == tool.get('name', '').partition('.')[0]:
         tool.pop('app', None)
     if tool.get('returns') == '':

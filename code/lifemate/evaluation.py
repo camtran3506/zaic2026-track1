@@ -80,16 +80,19 @@ class StateToolEvaluator:
         if any(not row.get(prepared_key) for row in self.rows):
             raise ValueError("Clean diagnostic evaluation requires audio_text for every held-out sample")
         output_path = Path(output_path)
-        scores, f1s, hashes = [], [], []
+        from .schema_cache import schedule_by_schema, restore_original_order
+        orig_indices, _, sched_rows = schedule_by_schema([r["item"] for r in self.rows], self.rows)
+        sched_scores, sched_f1s, sched_hashes = [], [], []
+        sched_records = []
         diagnostics = DiagnosticSummary()
         agent = LifeMateAgent(None, llm, self.catalog, self.config)
         partial = output_path.with_suffix(".partial.jsonl")
         trace_path = output_path.with_suffix(".trace.jsonl")
         trace_partial = output_path.with_suffix(".trace.partial.jsonl")
         logging.info("Validation debug trace (in progress): %s", trace_partial)
-        with partial.open("w", encoding="utf-8") as output, trace_partial.open("w", encoding="utf-8") as trace_stream:
+        with partial.open("w", encoding="utf-8") as partial_stream, trace_partial.open("w", encoding="utf-8") as trace_stream:
             trace = EvalTraceWriter(trace_stream)
-            for row in self.rows:
+            for row in sched_rows:
                 # Golds are used only below for scoring, never passed into the agent.
                 item = copy.deepcopy(row["item"])
                 item.pop("label", None)
@@ -111,15 +114,17 @@ class StateToolEvaluator:
                     diagnostic = analyze_rollout(calls, row["gold_tool_calls"], state_hash,
                         row["gold_state_hash"], self.catalog, stats.get("stop_reason", "unknown"))
                     diagnostics.add(diagnostic, source)
-                    scores.append(score)
-                    f1s.append(f1)
-                    hashes.append(state_hash == row["gold_state_hash"])
-                    output.write(json.dumps({"id": item["id"], "tool_calls": calls,
+                    sched_scores.append(score)
+                    sched_f1s.append(f1)
+                    sched_hashes.append(state_hash == row["gold_state_hash"])
+                    record = {"id": item["id"], "tool_calls": calls,
                         "state_hash": state_hash, "gold_state_hash": row["gold_state_hash"],
                         "gold_tool_calls": row["gold_tool_calls"], "transcript_source": source,
                         "score": score, "tool_call_f1": f1, "agent_stats": stats,
-                        "trace_file": trace_path.name, "diagnostics": diagnostic}, ensure_ascii=False) + "\n")
-                    output.flush()
+                        "trace_file": trace_path.name, "diagnostics": diagnostic}
+                    sched_records.append(record)
+                    partial_stream.write(json.dumps(record, ensure_ascii=False) + "\n")
+                    partial_stream.flush()
                     emit({"event": "sample_end", "agent_stats": stats, "tool_calls": calls,
                           "state_hash": state_hash})
                 except Exception as exc:
@@ -127,7 +132,14 @@ class StateToolEvaluator:
                     logging.exception("Validation sample %s failed; partial trace: %s", item["id"], trace_partial)
                     raise
                 logging.info("Validation rollout %d/%d %s: score %.4f, hash_match=%s",
-                             len(scores), len(self.rows), item["id"], score, hashes[-1])
+                             len(sched_scores), len(self.rows), item["id"], score, sched_hashes[-1])
+        scores = restore_original_order(orig_indices, sched_scores)
+        f1s = restore_original_order(orig_indices, sched_f1s)
+        hashes = restore_original_order(orig_indices, sched_hashes)
+        records = restore_original_order(orig_indices, sched_records)
+        with partial.open("w", encoding="utf-8") as output:
+            for rec in records:
+                output.write(json.dumps(rec, ensure_ascii=False) + "\n")
         n = len(scores)
         metrics = {"eval_state_tool_score": 100 * sum(scores) / n,
                 "eval_tool_call_f1": 100 * sum(f1s) / n,
@@ -213,7 +225,8 @@ def score_callback(evaluator, tokenizer, output_dir, fast_language_model=None, *
                 # checkpoints, transcript views, or the return to backward().
                 llm = LocalLLM.from_loaded_model(model, tokenizer,
                     prefix_cache=eval_prefix_cache, prompt_cache=eval_prompt_cache,
-                    schema_cache=eval_schema_cache, schema_cache_mb=eval_schema_cache_mb)
+                    schema_cache=eval_schema_cache, schema_cache_mb=eval_schema_cache_mb,
+                    schema_cache_eager=True)
                 try:
                     def view(ev, target, source=None):
                         try:

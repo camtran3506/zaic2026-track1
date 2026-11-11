@@ -237,7 +237,8 @@ def prepared_generalization(tmp_path, monkeypatch, bpe_tokenizer):
     (tokenizer_path/'config.json').write_text('{"model_type":"qwen3_5"}')
     output = tmp_path/'sft'
     monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--data-root', str(source), '--output-dir', str(output),
-        '--asr-model', 'stub', '--heldout-apps', 'library', '--rename-variants', '2', '--distractor-probability', '1',
+        '--asr-model', 'stub', '--transcript-mode', 'mix', '--validation-fraction', '0.1',
+        '--heldout-apps', 'library', '--rename-variants', '2', '--distractor-probability', '1',
         '--tokenizer', str(tokenizer_path)])
     prepare_sft.main()
     return output, catalog, source_rows, instances

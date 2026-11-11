@@ -59,10 +59,96 @@ def test_onnx_cpu_recognizer_receives_model_files_and_normalizes_cached_text(tmp
     assert accepted[0][0] == 8000 and accepted[0][1].dtype == np.float32
     assert options['provider'] == 'cpu' and options['num_threads'] == 2
     assert options['sample_rate'] == 16000 and options['feature_dim'] == 80
-    assert options['decoding_method'] == 'greedy_search'
+    assert options['decoding_method'] == 'modified_beam_search'
+    assert options['max_active_paths'] == 4
     for part in ('encoder', 'decoder', 'joiner'):
         assert options[part] == str(tmp_path / (part + suffix))
     assert options['tokens'] == str(tmp_path / 'tokens.txt')
+    # Explicit greedy_search remains selectable for ablations.
+    options.clear()
+    asr_greedy = LocalASR(tmp_path, precision=precision, num_threads=2, decoding_method='greedy_search')
+    assert asr_greedy.decoding_method == 'greedy_search'
+    assert options['decoding_method'] == 'greedy_search'
+
+
+def test_transcribe_batch_batches_offline_audio_and_populates_cache(tmp_path, monkeypatch):
+    import sherpa_onnx
+    write_models(tmp_path, 'int8')
+    audios = []
+    for i in range(5):
+        audio = tmp_path / f'speech_{i}.wav'
+        sf.write(audio, np.zeros(2000, dtype=np.float32), 16000)
+        audios.append(audio)
+
+    decode_calls = []
+
+    class MockStream:
+        def __init__(self, text):
+            self.result = SimpleNamespace(text=text)
+
+        def accept_waveform(self, rate, samples):
+            pass
+
+    stream_idx = 0
+
+    def create_stream():
+        nonlocal stream_idx
+        stream = MockStream(f' câu số {stream_idx}! ')
+        stream_idx += 1
+        return stream
+
+    def decode_streams(streams):
+        decode_calls.append(list(streams))
+
+    recognizer = SimpleNamespace(create_stream=create_stream, decode_streams=decode_streams)
+    monkeypatch.setattr(sherpa_onnx.OfflineRecognizer, 'from_transducer', lambda **kw: recognizer)
+
+    asr = LocalASR(tmp_path, precision='int8', num_threads=2)
+    assert asr.transcribe_batch([]) == []
+    with pytest.raises(ValueError, match="batch_size"):
+        asr.transcribe_batch(audios, batch_size=0)
+
+    # Batch decode 5 audios with batch_size=2 -> 3 chunks of sizes [2, 2, 1]
+    results = asr.transcribe_batch(audios, batch_size=2)
+    assert len(results) == 5
+    assert len(decode_calls) == 3
+    assert [len(call) for call in decode_calls] == [2, 2, 1]
+    assert results == [f'Câu số {i}!' for i in range(5)]
+
+    # Subsequent single-stream transcribe calls hit cache without invoking decode_streams
+    decode_calls.clear()
+    for i, audio in enumerate(audios):
+        assert asr.transcribe(audio) == f'Câu số {i}!'
+    assert len(decode_calls) == 0
+
+
+def test_pretranscribe_sft_partition_batches_audio_and_history(tmp_path):
+    from lifemate.sft import pretranscribe_sft_partition
+    split_dir = tmp_path / 'train'
+    split_dir.mkdir()
+    for name in ['req1.wav', 'req2.wav', 'hist1.wav']:
+        (split_dir / name).write_bytes(b'mock audio')
+
+    batched_paths = []
+
+    class MockASR:
+        def transcribe_batch(self, paths, batch_size=16):
+            batched_paths.extend(paths)
+            return [p.name for p in paths]
+
+    records = [
+        {'id': 's1', 'audio': 'req1.wav', 'history': [{'role': 'user', 'audio': 'hist1.wav'}]},
+        {'id': 's2', 'audio': 'req2.wav', 'history': [{'role': 'user', 'text': 'already text', 'audio': 'hist2.wav'}]},
+    ]
+    # For train partition, if sources only has s1 as 'asr', s2 uses audio_text so req2.wav is not transcribed
+    sources = {'s1': 'asr', 's2': 'audio_text'}
+    pretranscribe_sft_partition(records, split_dir, MockASR(), 'train', sources, batch_size=2)
+    assert [p.name for p in batched_paths] == ['req1.wav', 'hist1.wav']
+
+    # For validation partition, all sample audios are needed for rollout
+    batched_paths.clear()
+    pretranscribe_sft_partition(records, split_dir, MockASR(), 'validation', sources, batch_size=2)
+    assert [p.name for p in batched_paths] == ['req1.wav', 'hist1.wav', 'req2.wav']
 
 
 def test_missing_precision_files_do_not_fall_back_or_accept_whisper(tmp_path):

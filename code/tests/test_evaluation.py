@@ -1,3 +1,4 @@
+from copy import deepcopy
 import json
 import sys
 from types import SimpleNamespace
@@ -44,7 +45,7 @@ def prepared(tmp_path, monkeypatch):
     monkeypatch.setattr(lifemate.transcripts, 'asr_identity', lambda *a: {'model': 'stub-asr'})
     monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '')
     out = tmp_path / 'sft'
-    monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--asr-model', 'stub-asr', '--asr-transcript-ratio', '0', '--data-root', str(source), '--output-dir', str(out)])
+    monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--asr-model', 'stub-asr', '--asr-transcript-ratio', '0', '--data-root', str(source), '--output-dir', str(out), '--validation-fraction', '0.1'])
     prepare_sft.main()
     return out, instances, source, records
 
@@ -135,11 +136,11 @@ def test_mean_is_over_original_samples_not_sft_steps_or_calls(prepared, tmp_path
 def test_supplied_gold_hash_must_agree_with_replay(prepared, tmp_path, monkeypatch):
     import prepare_sft
     _, _, source, records = prepared
-    _, valid = split_records(records)
+    _, valid = split_records(records, 0.1)
     next(r for r in records if r['id'] == valid[0]['id'])['label']['state_hash'] = 'wrong-gold'
     (source / 'train.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in records))
     monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--asr-model', 'stub-asr', '--asr-transcript-ratio', '0', '--data-root', str(source),
-        '--output-dir', str(tmp_path / 'bad-hash')])
+        '--output-dir', str(tmp_path / 'bad-hash'), '--validation-fraction', '0.1'])
     with pytest.raises(ValueError, match='differs from the provided gold hash'):
         prepare_sft.main()
 
@@ -147,7 +148,7 @@ def test_supplied_gold_hash_must_agree_with_replay(prepared, tmp_path, monkeypat
 def test_validation_samples_cannot_be_silently_skipped(prepared, tmp_path, monkeypatch):
     import prepare_sft
     _, _, source, records = prepared
-    _, valid = split_records(records)
+    _, valid = split_records(records, 0.1)
     original = prepare_sft.replay_sample
 
     def replay(record, *args, **kwargs):
@@ -157,7 +158,7 @@ def test_validation_samples_cannot_be_silently_skipped(prepared, tmp_path, monke
 
     monkeypatch.setattr(prepare_sft, 'replay_sample', replay)
     monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--asr-model', 'stub-asr', '--asr-transcript-ratio', '0', '--data-root', str(source),
-        '--output-dir', str(tmp_path / 'skip'), '--missing-tool-policy', 'skip'])
+        '--output-dir', str(tmp_path / 'skip'), '--missing-tool-policy', 'skip', '--validation-fraction', '0.1'])
     with pytest.raises(ValueError):
         prepare_sft.main()
 
@@ -400,3 +401,40 @@ def test_failed_eval_does_not_publish_completed_reports(prepared, tmp_path, fail
     assert len(results) == int(fail_after_call)
     if fail_after_call:
         assert results[0]['result']['devices'][0]['id'] == 'light_living'
+
+
+def test_evaluator_schema_scheduling_order_restoration_and_partial(prepared, tmp_path):
+    out, instances, _, _ = prepared
+    evaluator = StateToolEvaluator(out, json.loads((out / 'manifest.json').read_text()))
+    base_row = evaluator.rows[0]
+    row_z = deepcopy(base_row)
+    row_z['item']['id'] = 'item_z'
+    row_z['item']['context'] = {'installed_apps': {'z_app': {}}}
+    row_a = deepcopy(base_row)
+    row_a['item']['id'] = 'item_a'
+    row_a['item']['context'] = {'installed_apps': {'a_app': {}}}
+    row_m = deepcopy(base_row)
+    row_m['item']['id'] = 'item_m'
+    row_m['item']['context'] = {'installed_apps': {'m_app': {}}}
+
+    evaluator.rows = [row_z, row_a, row_m]
+
+    class LLM:
+        def generate(self, system, user):
+            observations = json.loads(user)['previous_actions_and_results']
+            if not observations:
+                return '{"action":"call","name":"smart_home.get_status","arguments":{}}'
+            return '{"action":"done"}'
+
+    report_path = tmp_path / 'scheduled_eval.jsonl'
+    try:
+        metrics = evaluator.evaluate(LLM(), report_path)
+    finally:
+        evaluator.close()
+
+    assert report_path.exists()
+    assert not report_path.with_suffix('.partial.jsonl').exists()
+    records = [json.loads(line) for line in report_path.read_text().splitlines()]
+    assert [r['id'] for r in records] == ['item_z', 'item_a', 'item_m']
+    assert metrics['eval_rollout_samples'] == 3
+

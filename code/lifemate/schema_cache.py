@@ -21,6 +21,42 @@ def cache_budget_mb(value):
     return value
 
 
+def item_schema_signature(item):
+    """Normalized tuple of installed app names for grouping samples by toolset."""
+    context = item.get("context") if isinstance(item, dict) else None
+    if not isinstance(context, dict):
+        return ()
+    apps = context.get("installed_apps")
+    if isinstance(apps, dict):
+        return tuple(sorted(str(k) for k in apps.keys()))
+    if isinstance(apps, (list, tuple)):
+        return tuple(sorted(str(k) for k in apps))
+    return ()
+
+
+def schedule_by_schema(items, *companion_lists):
+    """Sort items stably by schema signature while returning original indices to restore order."""
+    n = len(items)
+    for c in companion_lists:
+        if len(c) != n:
+            raise ValueError("All companion lists must have the same length as items")
+    indexed = list(range(n))
+    indexed.sort(key=lambda i: item_schema_signature(items[i]))
+    scheduled_items = [items[i] for i in indexed]
+    scheduled_companions = [[c[i] for i in indexed] for c in companion_lists]
+    if companion_lists:
+        return (indexed, scheduled_items, *scheduled_companions)
+    return indexed, scheduled_items
+
+
+def restore_original_order(indexed, results):
+    """Restore results collected in scheduled order back to original order."""
+    restored = [None] * len(results)
+    for orig_idx, res in zip(indexed, results):
+        restored[orig_idx] = res
+    return restored
+
+
 def _json(value):
     return json.dumps(value, ensure_ascii=False, default=str, separators=(',', ':'))
 
@@ -69,13 +105,14 @@ def snapshot_bytes(snapshot):
 
 
 class SchemaCache:
-    def __init__(self, mode='auto', max_mb=DEFAULT_SCHEMA_CACHE_MB, *, max_entries=8):
+    def __init__(self, mode='auto', max_mb=DEFAULT_SCHEMA_CACHE_MB, *, max_entries=8, eager=False):
         if mode not in {'auto', 'off', 'shared'}:
             raise ValueError('schema_cache must be auto, off or shared')
         if type(max_entries) is not int or max_entries < 1:
             raise ValueError('Schema cache entry limit must be positive')
         self.mode, self.max_bytes = mode, int(cache_budget_mb(max_mb)*1024**2)
         self.max_entries = max_entries
+        self.eager = bool(eager)
         self.entries, self.seen, self.rendered = OrderedDict(), OrderedDict(), OrderedDict()
         self.signature = None
         self._model_ref = None
@@ -185,7 +222,7 @@ class SchemaCache:
         if oversized:
             self.stats['skipped_oversize'] += 1
             return None
-        if self.mode == 'auto' and previous_sample == self.sample:
+        if self.mode == 'auto' and previous_sample == self.sample and not self.eager:
             self.stats['skipped_unique'] += 1
             return None
         snapshot = build()

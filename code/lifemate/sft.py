@@ -5,11 +5,15 @@ from copy import deepcopy
 import hashlib
 import json
 import random
+import re
 import time
+import unicodedata
 
 from .agent import (SYSTEM_PROMPT, _train_transcript, audio_path, build_step_prompt,
                     full_json, history_text)
 from .catalog import allowed_tools
+from .function_calling import native_chat, native_observation_messages
+from .history import history_entries
 from .llm import chat_token_ids
 from .local_time import LOCAL_TIME_POLICY
 from .local_helpers import LOCAL_HELPER_POLICY, execute_helper
@@ -26,9 +30,12 @@ from .schema_prompt import SCHEMA_PROMPT_POLICY
 from .numerics import DEBUG_BATCH_KEY
 
 
-SFT_PROMPT_POLICY = "compact-schemas-shared-prefix-v13"
+SFT_PROMPT_POLICY = "full-trajectory-date-apps-v14"
 VALIDATION_ROLLOUT_POLICY = "asr-only-paired-clean-v1"
 DEFAULT_ASR_TRANSCRIPT_RATIO = 0.5
+_ASSISTANT_SPAN = re.compile(r"<\|im_start\|>assistant\n(?:<think>\n\n</think>\n\n)?(.*?<\|im_end\|>)(?=\n|$)", re.S)
+_FUNC_RE = re.compile(r"<function=([^>\n]+)>")
+_PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n(.*?)\n</parameter>", re.S)
 
 
 def asr_transcript_ratio(value):
@@ -69,16 +76,61 @@ class UnexposedToolError(ValueError):
     """A gold tool is absent from the actual prompt's complete schemas."""
 
 
-def split_records(records, validation_fraction=0.1, seed=42):
-    if not 0 < validation_fraction < 1 or len(records) < 2:
-        raise ValueError("Need >=2 unique samples and 0 < validation_fraction < 1")
+def split_records(records, validation_fraction=0.0, seed=42):
+    if not 0 <= validation_fraction < 1 or not records:
+        raise ValueError("Need nonempty samples and 0 <= validation_fraction < 1")
     ids = [r["id"] for r in records]
     if len(set(ids)) != len(ids):
         raise ValueError("Duplicate sample IDs")
     ordered = sorted(records, key=lambda r: str(r["id"]))
     random.Random(seed).shuffle(ordered)
+    if validation_fraction == 0:
+        return ordered, []
+    if len(ordered) < 2:
+        raise ValueError("Need >=2 unique samples for a validation split")
     count = min(len(ordered) - 1, max(1, round(len(ordered) * validation_fraction)))
     return ordered[count:], ordered[:count]
+
+
+def _fold_asr_text(value: str) -> str:
+    text = unicodedata.normalize("NFD", str(value)).lower().replace("đ", "d")
+    text = "".join(ch for ch in text if unicodedata.category(ch) != "Mn")
+    return " ".join(re.findall(r"[^\W_]+", text))
+
+
+def is_asr_argument_damaged(record, prepared_transcript, catalog) -> bool:
+    """True when an exact-match spoken gold parameter disappeared from the ASR transcript."""
+    clean = _train_transcript(record)
+    if not clean or not isinstance(prepared_transcript, dict):
+        return False
+    clean_folded = _fold_asr_text(clean)
+    asr_folded = _fold_asr_text(prepared_transcript.get("transcript", ""))
+    if not clean_folded:
+        return False
+    seen_folded = " ".join(
+        [_fold_asr_text(json.dumps(record.get("context", {}), ensure_ascii=False)),
+         _fold_asr_text(json.dumps(prepared_transcript.get("history", []), ensure_ascii=False)),
+         asr_folded]
+    )
+    for call in record.get("label", {}).get("tool_calls", []):
+        if not isinstance(call, dict):
+            continue
+        spec = catalog.get(call.get("name"), {}) if isinstance(catalog, dict) else {}
+        props = spec.get("parameters", {}).get("properties", {}) if isinstance(spec, dict) else {}
+        for key, val in (call.get("arguments") or {}).items():
+            if not isinstance(val, str) or len(val.strip()) < 2:
+                continue
+            prop = props.get(key, {}) if isinstance(props, dict) else {}
+            if prop.get("x-match") == "fuzzy" or prop.get("x-ref"):
+                continue
+            if re.fullmatch(r"[a-z]+_\w+", val.strip()):
+                continue
+            val_folded = _fold_asr_text(val)
+            if not val_folded or len(val_folded) < 2:
+                continue
+            if f" {val_folded} " in f" {clean_folded} " and f" {val_folded} " not in f" {seen_folded} ":
+                return True
+    return False
 
 
 def _current_train_transcript(item, split_dir, asr, transcript_source):
@@ -133,7 +185,24 @@ def prepare_validation_transcripts(item, split_dir, asr, prepared_transcript):
     return asr_prepared, clean_prepared
 
 
-def replay_sample(item, catalog, env, split_dir, asr=None, prepared_transcript=None, *, tokenizer=None):
+def pretranscribe_sft_partition(records, split_dir, asr, partition, sources, batch_size=16):
+    """Pre-transcribe uncached partition audios using batched decode streams before sample replay."""
+    if asr is None or not hasattr(asr, "transcribe_batch"):
+        return
+    needed_audios = []
+    for record in records:
+        needs_current = (partition != "train") or (sources.get(record["id"]) == "asr")
+        if needs_current and record.get("audio"):
+            needed_audios.append(audio_path(split_dir, record["audio"]))
+        for _role, text, audio in history_entries(record.get("history", [])):
+            if text is None and audio:
+                needed_audios.append(audio_path(split_dir, audio))
+    unique_needed = list(dict.fromkeys(needed_audios))
+    if unique_needed:
+        asr.transcribe_batch(unique_needed, batch_size=batch_size)
+
+
+def replay_sample(item, catalog, env, split_dir, asr=None, prepared_transcript=None, *, tokenizer=None, include_date_helpers=True):
     """Replay TRAIN gold in order; never expose future calls in earlier prompts."""
     calls = item.get("label", {}).get("tool_calls")
     if not isinstance(calls, list):
@@ -192,6 +261,28 @@ def replay_sample(item, catalog, env, split_dir, asr=None, prepared_transcript=N
                     raise ValueError(f"{item['id']}: normalization source exceeds the generation token budget; use a shorter source span")
                 yield candidate
 
+    def _filter_date_helpers(helpers):
+        if include_date_helpers:
+            return helpers
+        return [
+            h for h in helpers
+            if h.get("name") != "local_time.calendar_reference"
+            and not (h.get("name") == ASSIST_TOOL and (h.get("arguments") or {}).get("task") in ("date", "datetime"))
+        ]
+
+    if not calls:
+        helpers = helper_demonstrations(transcript, context, history, enabled, observations)
+        helpers += specialist_demonstrations(transcript, context, history, enabled, observations, pending=helpers)
+        helpers = _filter_date_helpers(task_demonstrations(
+            transcript, context, enabled, observations, helpers, normalize_fields=tokenizer is not None))
+        for helper in helpers:
+            for packed in helper_rows(helper):
+                examples.append(example({"action": "call", **packed}, len(examples)))
+                local_result = execute_helper(packed["name"], packed["arguments"], context, history, enabled, observations)
+                observations.append({**packed, "scope": "local", "result": full_json(local_result)})
+        examples.append(example({"action": "done"}, len(examples)))
+        return examples
+
     for step, call in enumerate(calls):
         name, args = call.get("name"), call.get("arguments")
         rejection = precheck_call(name, args, catalog, enabled, monitor)
@@ -204,8 +295,8 @@ def replay_sample(item, catalog, env, split_dir, asr=None, prepared_transcript=N
         # history and previous results, never from this gold action's operands.
         helpers = helper_demonstrations(transcript, context, history, enabled, observations)
         helpers += specialist_demonstrations(transcript, context, history, enabled, observations, pending=helpers)
-        helpers = task_demonstrations(transcript, context, enabled, observations, helpers,
-                                      normalize_fields=tokenizer is not None)
+        helpers = _filter_date_helpers(task_demonstrations(
+            transcript, context, enabled, observations, helpers, normalize_fields=tokenizer is not None))
         for helper in helpers:
             for packed in helper_rows(helper):
                 examples.append(example({"action": "call", **packed}, len(examples)))
@@ -221,23 +312,133 @@ def replay_sample(item, catalog, env, split_dir, asr=None, prepared_transcript=N
     return examples
 
 
-def encode_example(example, tokenizer, max_length):
+def collapse_trajectory(steps, *, extra=None):
+    """Collapse a trajectory's step-wise SFT rows into one multi-turn SFT row."""
+    if not steps:
+        raise ValueError("Cannot collapse an empty trajectory")
+    last = deepcopy(steps[-1])
+    payload = json.loads(last["messages"][1]["content"])
+    observations = payload.get("previous_actions_and_results", [])
+    if len(observations) != len(steps) - 1:
+        raise ValueError(
+            f"{last.get('sample_id')}: expected {len(steps) - 1} cumulative observations, got {len(observations)}"
+        )
+    collapsed = {
+        "sample_id": last["sample_id"],
+        "step": 0,
+        "full_trajectory": True,
+        "assistant_train_mask": [row.get("train", True) is not False for row in steps],
+        "messages": last["messages"],
+    }
+    for key in ("transcript_source", "augmentation", "recovery"):
+        if key in last:
+            collapsed[key] = deepcopy(last[key])
+    if extra:
+        collapsed.update(deepcopy(extra))
+    return collapsed
+
+
+def _fuzzy_ranges(text, spans, tools):
+    fuzzy_by_fn = {
+        t["function"]["name"]: {
+            k for k, p in (t["function"].get("parameters") or {}).get("properties", {}).items()
+            if isinstance(p, dict) and p.get("x-match") == "fuzzy"
+        }
+        for t in tools or []
+    }
+    ranges = []
+    for s0, e0 in spans:
+        body = text[s0:e0]
+        fn = _FUNC_RE.search(body)
+        keys = fuzzy_by_fn.get(fn.group(1), set()) if fn else set()
+        if not keys:
+            continue
+        for param in _PARAM_RE.finditer(body):
+            if param.group(1) in keys:
+                ranges.append((s0 + param.start(2), s0 + param.end(2)))
+    return ranges
+
+
+def _encode_native_with_spans(example, tokenizer, max_length, *, fuzzy_weight=None):
+    chat, tools = native_chat(example["messages"])
+    payload = json.loads(example["messages"][1]["content"])
+    obs_count = len(native_observation_messages(payload.get("previous_actions_and_results", [])))
+    pre_obs_chat = chat[:-obs_count - 1]
+    kwargs = dict(getattr(tokenizer, "lifemate_template_kwargs", {}))
+    kwargs.pop("tools", None)
+    pre_text = tokenizer.apply_chat_template(
+        pre_obs_chat, tokenize=False, add_generation_prompt=False, tools=tools, **kwargs
+    )
+    text = tokenizer.apply_chat_template(
+        chat, tokenize=False, add_generation_prompt=False, tools=tools, **kwargs
+    )
+    if not text.startswith(pre_text):
+        raise ValueError("Rendered chat diverges from pre-observation request prefix")
+    spans = [(m.start(1), m.end(1)) for m in _ASSISTANT_SPAN.finditer(text, pos=len(pre_text))]
+    if example.get("full_trajectory"):
+        trained = list(example.get("assistant_train_mask") or [])
+    else:
+        trained = [False] * (len(spans) - 1) + [example.get("train", True) is not False]
+    if not spans or len(spans) != len(trained):
+        raise ValueError(
+            f"{example.get('sample_id')}: assistant spans ({len(spans)}) do not match steps ({len(trained)})"
+        )
+    fuzzy = _fuzzy_ranges(text, spans, tools) if fuzzy_weight is not None else []
+    enc = tokenizer(
+        text, add_special_tokens=False, truncation=False,
+        return_offsets_mapping=True, return_token_type_ids=False,
+    )
+    ids, offs = enc["input_ids"], enc["offset_mapping"]
+    if len(ids) > max_length:
+        raise ValueError(
+            f"{example['sample_id']} step {example['step']}: {len(ids)} tokens > max_length={max_length}; "
+            "increase length, never truncate prompt or gold JSON"
+        )
+    labels = [-100] * len(ids)
+    weights = [0.0] * len(ids)
+    j = 0
+    for t, (s, e) in enumerate(offs):
+        while j < len(spans) and s >= spans[j][1]:
+            j += 1
+        if j < len(spans) and trained[j] and s >= spans[j][0] and e <= spans[j][1] and e > s:
+            labels[t] = ids[t]
+            if fuzzy_weight is not None:
+                weights[t] = float(fuzzy_weight) if any(a <= s < b for a, b in fuzzy) else 1.0
+    if not any(label != -100 for label in labels):
+        raise ValueError(f"{example.get('sample_id')}: trajectory produced zero supervised tokens")
+    row = {"input_ids": ids, "attention_mask": [1] * len(ids), "labels": labels}
+    if fuzzy_weight is not None:
+        row["loss_weights"] = weights
+    return row
+
+
+def encode_example(example, tokenizer, max_length, *, fuzzy_weight=None):
     messages = example["messages"]
     if [m["role"] for m in messages] != ["system", "user", "assistant"]:
         raise ValueError("SFT expects system/user/assistant messages")
+    native = getattr(tokenizer, "lifemate_native_fc", False) is True
+    if example.get("full_trajectory"):
+        if not native or not getattr(tokenizer, "is_fast", False):
+            raise ValueError("Full-trajectory SFT encoding requires a fast native-function-calling tokenizer")
+        return _encode_native_with_spans(example, tokenizer, max_length, fuzzy_weight=fuzzy_weight)
+    if fuzzy_weight is not None and native and getattr(tokenizer, "is_fast", False):
+        return _encode_native_with_spans(example, tokenizer, max_length, fuzzy_weight=fuzzy_weight)
     prefix = chat_token_ids(tokenizer, messages[:-1], add_generation_prompt=True)
     full = chat_token_ids(tokenizer, messages, add_generation_prompt=False)
     if full[:len(prefix)] != prefix or len(full) <= len(prefix):
         raise ValueError("Chat template cannot isolate assistant tokens safely")
     if len(full) > max_length:
         raise ValueError(f"{example['sample_id']} step {example['step']}: {len(full)} tokens > max_length={max_length}; increase length, never truncate prompt or gold JSON")
-    return {"input_ids": full, "attention_mask": [1] * len(full),
-            "labels": [-100] * len(prefix) + full[len(prefix):]}
+    labels = [-100] * len(prefix) + full[len(prefix):]
+    row = {"input_ids": full, "attention_mask": [1] * len(full), "labels": labels}
+    if fuzzy_weight is not None:
+        row["loss_weights"] = [0.0] * len(prefix) + [1.0] * (len(full) - len(prefix))
+    return row
 
 
 class SupervisedDataset:
-    def __init__(self, examples, tokenizer, max_length, *, include_debug_metadata=False, source_path=None):
-        self.rows = [encode_example(e, tokenizer, max_length) for e in examples]
+    def __init__(self, examples, tokenizer, max_length, *, include_debug_metadata=False, source_path=None, fuzzy_weight=None):
+        self.rows = [encode_example(e, tokenizer, max_length, fuzzy_weight=fuzzy_weight) for e in examples]
         if include_debug_metadata:
             for index, (row, example) in enumerate(zip(self.rows, examples)):
                 row[DEBUG_BATCH_KEY] = {'sample_id': example['sample_id'], 'sft_step': example['step'],
@@ -263,6 +464,15 @@ class AssistantCollator:
         length = max(len(r["input_ids"]) for r in rows)
         batch = {key: torch.tensor([r[key] + [padding] * (length - len(r[key])) for r in rows])
                  for key, padding in (("input_ids", self.pad), ("attention_mask", 0), ("labels", -100))}
+        if any("loss_weights" in r for r in rows):
+            batch["loss_weights"] = torch.tensor(
+                [
+                    r.get("loss_weights", [1.0 if lbl != -100 else 0.0 for lbl in r["labels"]])
+                    + [0.0] * (length - len(r["input_ids"]))
+                    for r in rows
+                ],
+                dtype=torch.float32,
+            )
         if any(DEBUG_BATCH_KEY in row for row in rows):
             batch[DEBUG_BATCH_KEY] = [deepcopy(row.get(DEBUG_BATCH_KEY, {})) for row in rows]
         return batch

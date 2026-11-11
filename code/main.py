@@ -54,10 +54,18 @@ def parse_args() -> argparse.Namespace:
                    help='Cross-sample system/tools GPU snapshots; auto admits repeated prefixes, shared admits immediately; requires prefix-cache auto')
     p.add_argument('--schema-cache-mb', type=cache_budget_mb, default=DEFAULT_SCHEMA_CACHE_MB,
                    help='Maximum retained schema snapshot storage in MiB (default 256)')
+    p.add_argument('--sample-schedule', choices=['schema', 'original'], default='schema',
+                   help='Group samples by installed_apps signature so identical schemas run adjacently; outputs preserve original line order')
     p.add_argument("--output", type=Path, default=Path("result/submission.jsonl"))
     p.add_argument("--log-path", type=Path, default=None, help="Optional diagnostic JSONL, never submitted")
     p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
-    p.add_argument("--asr-precision", default="int8", choices=["int8", "fp32"])
+    p.add_argument("--asr-precision", default="auto", choices=["auto", "int8", "fp32"])
+    p.add_argument("--asr-decoding-method", default="modified_beam_search",
+                   choices=["modified_beam_search", "greedy_search"])
+    p.add_argument("--asr-beam-size", type=int, default=4,
+                   help="Beam width (max_active_paths) for modified_beam_search")
+    p.add_argument("--asr-batch-size", type=int, default=16,
+                   help="Number of samples per batched offline ASR decode chunk")
     p.add_argument("--asr-threads", type=int, default=4, help="GIPformer CPU threads; independent of LLM device")
     p.add_argument("--llm-dtype", default=DEFAULT_LLM_DTYPE, choices=["float16", "bfloat16", "float32"])
     p.add_argument("--max-input-tokens", type=int, default=DEFAULT_MAX_INPUT_TOKENS)
@@ -131,13 +139,28 @@ def run_child_stage(args, stage):
 
 
 def run_asr_stage(args, items, split_dir, identity):
+    from lifemate.asr import (
+        DEFAULT_ASR_DECODING_METHOD,
+        DEFAULT_ASR_MAX_ACTIVE_PATHS,
+        resolve_asr_precision,
+    )
     from lifemate.transcripts import asr_identity, prepare_transcripts
     from lifemate.models import LocalASR
-    settings = asr_identity(args.asr_model, args.asr_precision, args.asr_threads)
+    precision = (
+        resolve_asr_precision(args.asr_model, args.asr_precision)
+        if args.asr_precision == "auto" and Path(args.asr_model).expanduser().is_dir()
+        else args.asr_precision
+    )
+    extra = {}
+    if args.asr_decoding_method != DEFAULT_ASR_DECODING_METHOD:
+        extra["decoding_method"] = args.asr_decoding_method
+    if args.asr_beam_size != DEFAULT_ASR_MAX_ACTIVE_PATHS:
+        extra["max_active_paths"] = args.asr_beam_size
+    settings = asr_identity(args.asr_model, precision, args.asr_threads, **extra)
     def factory():
-        return LocalASR(args.asr_model, precision=args.asr_precision, num_threads=args.asr_threads)
+        return LocalASR(args.asr_model, precision=precision, num_threads=args.asr_threads, **extra)
     prepare_transcripts(items, split_dir, args.transcript_cache, identity, settings, factory,
-                        refresh=args.refresh_transcripts)
+                        refresh=args.refresh_transcripts, batch_size=args.asr_batch_size)
 
 
 def run_llm_stage(args, items, transcript_rows, split_dir, env_root):
@@ -148,13 +171,20 @@ def run_llm_stage(args, items, transcript_rows, split_dir, env_root):
     seed_everything(args.seed)
     catalog = load_catalog(split_dir / f"{args.split}_tools_catalog.json")
     from lifemate.models import LocalLLM
+    from lifemate.schema_cache import schedule_by_schema, restore_original_order
+    enable_schedule = getattr(args, "sample_schedule", "schema") == "schema"
+    if enable_schedule:
+        orig_indices, sched_items, sched_rows = schedule_by_schema(items, transcript_rows)
+    else:
+        orig_indices, sched_items, sched_rows = list(range(len(items))), items, transcript_rows
     LOG.info("LLM-only stage: reading complete transcript cache; GIPformer is not loaded")
     llm = LocalLLM(args.llm_model, device=args.device, dtype=args.llm_dtype,
                    max_input_tokens=args.max_input_tokens, max_new_tokens=args.max_new_tokens,
                    adapter_path=args.llm_adapter, device_map=args.llm_device_map,
                    seed=args.seed,
                    prefix_cache=args.prefix_cache, prompt_cache=args.prompt_cache,
-                   schema_cache=args.schema_cache, schema_cache_mb=args.schema_cache_mb)
+                   schema_cache=args.schema_cache, schema_cache_mb=args.schema_cache_mb,
+                   schema_cache_eager=enable_schedule)
     cfg = AgentConfig(max_calls=args.max_calls, max_invalid=args.max_invalid,
                       sample_seconds=args.sample_seconds,
                       use_train_transcript=args.use_train_transcript)
@@ -162,46 +192,54 @@ def run_llm_stage(args, items, transcript_rows, split_dir, env_root):
         raise ValueError("--use-train-transcript is forbidden for test splits")
     agent = LifeMateAgent(asr=None, llm=llm, catalog=catalog, cfg=cfg)
     args.output.parent.mkdir(parents=True, exist_ok=True)
+    args.output.write_text("", encoding="utf-8")
     if args.log_path:
         args.log_path.parent.mkdir(parents=True, exist_ok=True)
+        args.log_path.write_text("", encoding="utf-8")
     overall_start = time.monotonic()
     count = 0
-    # Write progressively, one line per sample. A sample's env is created exactly once.
-    with args.output.open("w", encoding="utf-8") as fout:
-        log_file = args.log_path.open("w", encoding="utf-8") if args.log_path else None
-        try:
-            for item, prepared in zip(items, transcript_rows):
-                sample_start = time.monotonic()
-                env = ToolEnv(args.split, item["id"], root=str(env_root))
-                try:
-                    report = agent.run(item, env, split_dir, args.split, prepared_transcript=prepared)
-                except torch.OutOfMemoryError:
-                    LOG.exception('LLM out of memory on sample %s; aborting without CPU/disk fallback', item['id'])
+    collected_records = []
+    collected_logs = []
+    try:
+        for item, prepared in zip(sched_items, sched_rows):
+            sample_start = time.monotonic()
+            env = ToolEnv(args.split, item["id"], root=str(env_root))
+            try:
+                report = agent.run(item, env, split_dir, args.split, prepared_transcript=prepared)
+            except torch.OutOfMemoryError:
+                LOG.exception('LLM out of memory on sample %s; aborting without CPU/disk fallback', item['id'])
+                raise
+            except Exception as exc:
+                LOG.exception("Sample %s encountered an error", item["id"])
+                report = {"error": repr(exc), "transcript": prepared["transcript"]}
+                if args.fail_fast:
                     raise
-                except Exception as exc:
-                    LOG.exception("Sample %s encountered an error", item["id"])
-                    report = {"error": repr(exc), "transcript": prepared["transcript"]}
-                    if args.fail_fast:
-                        raise
-                calls = env.get_tool_calls()
-                state_hash = env.get_state_hash()
-                record = {"id": item["id"], "tool_calls": calls, "state_hash": state_hash}
-                fout.write(json.dumps(record, ensure_ascii=False) + "\n")
-                fout.flush()
-                count += 1
-                sample_time = time.monotonic() - sample_start
-                LOG.info("%d %s: %d calls, %.2fs", count, item["id"], len(calls), sample_time)
-                if log_file:
-                    log_file.write(json.dumps({"id": item["id"], "sample_seconds": round(sample_time, 3),
-                        "asr_seconds": prepared["asr_seconds"],
-                        "total_sample_seconds": round(sample_time + prepared["asr_seconds"], 6), **report}, ensure_ascii=False) + "\n")
-                    log_file.flush()
-        finally:
-            close = getattr(llm, 'close', None)
-            if callable(close):
-                close()
-            if log_file:
-                log_file.close()
+            calls = env.get_tool_calls()
+            state_hash = env.get_state_hash()
+            record = {"id": item["id"], "tool_calls": calls, "state_hash": state_hash}
+            collected_records.append(record)
+            count += 1
+            sample_time = time.monotonic() - sample_start
+            LOG.info("%d %s: %d calls, %.2fs", count, item["id"], len(calls), sample_time)
+            if args.log_path:
+                collected_logs.append({"id": item["id"], "sample_seconds": round(sample_time, 3),
+                    "asr_seconds": prepared["asr_seconds"],
+                    "total_sample_seconds": round(sample_time + prepared["asr_seconds"], 6), **report})
+    finally:
+        close = getattr(llm, 'close', None)
+        if callable(close):
+            close()
+    final_records = restore_original_order(orig_indices, collected_records)
+    with args.output.open("w", encoding="utf-8") as fout:
+        for r in final_records:
+            if r is not None:
+                fout.write(json.dumps(r, ensure_ascii=False) + "\n")
+    if args.log_path and collected_logs:
+        final_logs = restore_original_order(orig_indices, collected_logs)
+        with args.log_path.open("w", encoding="utf-8") as log_file:
+            for l in final_logs:
+                if l is not None:
+                    log_file.write(json.dumps(l, ensure_ascii=False) + "\n")
     LOG.info("Finished %d samples in %.1fs. Submission: %s", count, time.monotonic()-overall_start, args.output)
 
 
@@ -213,6 +251,10 @@ def main() -> None:
         os.environ["CUDA_VISIBLE_DEVICES"] = ""
     if args.asr_threads < 1:
         raise ValueError("--asr-threads must be positive")
+    if args.asr_beam_size < 1:
+        raise ValueError("--asr-beam-size must be positive")
+    if args.asr_batch_size < 1:
+        raise ValueError("--asr-batch-size must be positive")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
     if args.use_train_transcript and args.split != "train":
         raise ValueError("--use-train-transcript is forbidden for test splits")

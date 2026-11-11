@@ -6,6 +6,60 @@ instance, reads state, or edits/reconstructs the official call log.
 """
 from .eval_trace import exception_details
 from .execution_policy import check_tool_access, _canonical
+from .history import collect_ids
+
+
+def prepare_call_arguments(name, arguments, spec, context=None, transcript=""):
+    """Clean optional empty filters on reads and unmentioned default profile city on weather."""
+    if not isinstance(arguments, dict) or not isinstance(spec, dict):
+        return arguments
+    cleaned = dict(arguments)
+    if spec.get("kind") == "read":
+        required = set((spec.get("parameters") or {}).get("required") or [])
+        cleaned = {
+            k: v for k, v in cleaned.items()
+            if k in required or v not in (None, "", [], {})
+        }
+    if name in {"weather.get_current", "weather.get_forecast"} and isinstance(cleaned.get("location"), str):
+        profile = context.get("user_profile") if isinstance(context, dict) else None
+        city = profile.get("city") if isinstance(profile, dict) else None
+        if (isinstance(city, str) and city.strip()
+                and cleaned["location"].casefold().strip() == city.casefold().strip()
+                and city.casefold() not in (transcript or "").casefold()):
+            cleaned.pop("location", None)
+    return cleaned
+
+
+def _check_xref_node(value, schema, observed_ids, key_name=""):
+    if not isinstance(schema, dict):
+        return None
+    ref = schema.get("x-ref")
+    if ref and value is not None:
+        ref_app = str(ref).split(".", 1)[0]
+        allowed = observed_ids.get(ref_app, set())
+        if not isinstance(value, str) or value not in allowed:
+            return {"ok": False, "error": f"{key_name or 'id'} must come from an observed {ref} ID; call a read tool first"}
+    if isinstance(value, dict):
+        props = schema.get("properties")
+        if isinstance(props, dict):
+            for key, child in value.items():
+                if key in props:
+                    err = _check_xref_node(child, props[key], observed_ids, key)
+                    if err is not None:
+                        return err
+    elif isinstance(value, list) and isinstance(schema.get("items"), dict):
+        for child in value:
+            err = _check_xref_node(child, schema["items"], observed_ids, key_name)
+            if err is not None:
+                return err
+    return None
+
+
+def check_observed_xref(arguments, spec, observed_ids):
+    """Verify any present x-ref argument came from visible history, context, or prior reads."""
+    if observed_ids is None or not isinstance(arguments, dict) or not isinstance(spec, dict):
+        return None
+    return _check_xref_node(arguments, spec.get("parameters"), observed_ids)
 
 
 def precheck_call(name, arguments, catalog, enabled, monitor, local_names=()):
@@ -29,7 +83,7 @@ def precheck_call(name, arguments, catalog, enabled, monitor, local_names=()):
     return None
 
 
-def attempt_env_call(env, name, arguments, kind, monitor, call_index, *, emit=None):
+def attempt_env_call(env, name, arguments, kind, monitor, call_index, *, emit=None, spec=None, observed_ids=None):
     """Caller must precheck first. Execution ALWAYS requires explicit ok:true."""
     emit = emit or (lambda event, **data: None)
     emit("validate_start", name=name, arguments=arguments)
@@ -54,6 +108,13 @@ def attempt_env_call(env, name, arguments, kind, monitor, call_index, *, emit=No
             "error": f"Schema invalid: {validation!r}" if schema_rejected else f"Invalid validation response: {validation!r}",
             "stage": "validate", "name": name, "arguments": arguments, "validation": validation,
             "origin": "schema_rejection" if schema_rejected else "validation_protocol"}}
+    if observed_ids is not None and spec is not None:
+        xref_error = check_observed_xref(arguments, spec, observed_ids)
+        if xref_error is not None:
+            emit("xref_guard_rejected", name=name, arguments=arguments, validation=xref_error)
+            return {"executed": False, "feedback": {
+                "error": xref_error["error"], "stage": "xref_guard", "name": name,
+                "arguments": arguments, "validation": xref_error, "origin": "observed_id_guard"}}
     emit("call_start", name=name, arguments=arguments, call_index=call_index)
     execution_exception = None
     try:
@@ -66,6 +127,11 @@ def attempt_env_call(env, name, arguments, kind, monitor, call_index, *, emit=No
              exception=execution_exception, agent_result=result)
     else:
         emit("call_result", name=name, arguments=arguments, call_index=call_index, result=result)
+    if observed_ids is not None and isinstance(result, dict) and result.get("ok") is True and result.get("done") is not False:
+        app = name.split(".", 1)[0]
+        collect_ids(result, observed_ids, app)
+        if kind == "write":
+            collect_ids(arguments, observed_ids, app)
     verification = monitor.record_result(name, arguments, result, kind,
                                          call_index=call_index, execution_exception=execution_exception)
     emit("execution_verified", name=name, verification=verification)

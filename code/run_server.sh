@@ -11,9 +11,13 @@ SPLIT="${SPLIT:-public_test}"
 
 # Model directories are configured HERE. Inherited ASR_MODEL/LLM_MODEL variables
 # and model-path CLI options must not select another checkpoint for this launcher.
-# scripts/download_models.py stages the selected ASR repo into models/asr.
+# scripts/download_models.py stages the original ASR repo into models/asr.
+# If an adapted checkpoint is staged in models/asr_ft, prefer it while preserving models/asr.
 # ASR must be a local GIPformer ONNX transducer (encoder/decoder/joiner + tokens.txt).
 ASR_MODEL="${SCRIPT_DIR}/models/asr"
+if [ "${ASR_MODEL}" = "${SCRIPT_DIR}/models/asr" ] && [ -s "${SCRIPT_DIR}/models/asr_ft/tokens.txt" ]; then
+  ASR_MODEL="${SCRIPT_DIR}/models/asr_ft"
+fi
 
 # LLM - Qwen3.5-4B
 LLM_MODEL="${SCRIPT_DIR}/models/llm"
@@ -32,7 +36,8 @@ printf '[run_server] ASR_MODEL=%s\n[run_server] LLM_MODEL=%s\n' \
   "${ASR_MODEL}" "${LLM_MODEL}" >&2
 
 # Keep the two model flags AFTER "$@": argparse uses the last value.
-exec python -u "${SCRIPT_DIR}/main.py" \
+PYTHON_BIN="${PYTHON_BIN:-$(command -v python || command -v python3)}"
+exec "${PYTHON_BIN}" -u "${SCRIPT_DIR}/main.py" \
   --data-root "${DATA_ROOT}" \
   --split "${SPLIT}" \
   --output "${OUTPUT}" \

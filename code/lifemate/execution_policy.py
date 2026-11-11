@@ -74,14 +74,18 @@ class LoopMonitor:
     reuse. A successful/potentially mutating write invalidates all transient caches
     conservatively across apps; reads and known no-op writes do not.
     """
-    def __init__(self, max_entries=100):
+    def __init__(self, max_entries=100, empty_read_limit=0):
         if type(max_entries) is not int or not 1 <= max_entries <= 100:
             raise ValueError("max_entries must be an integer between 1 and 100")
+        if type(empty_read_limit) is not int or empty_read_limit < 0:
+            raise ValueError("empty_read_limit must be a nonnegative integer")
         self.max_entries = max_entries
+        self.empty_read_limit = empty_read_limit
         self.state_epoch = 0
         self._schema_rejections = {}
         self._records = OrderedDict()
         self._technical_errors = {}
+        self._empty_read_counts = {}
 
     def _key(self, name, arguments):
         if not isinstance(name, str) or not isinstance(arguments, dict):
@@ -92,6 +96,7 @@ class LoopMonitor:
     def _advance_state(self):
         self.state_epoch += 1
         self._records.clear()
+        self._empty_read_counts.clear()
 
     def check(self, name, arguments, kind):
         if kind == "local":
@@ -112,17 +117,24 @@ class LoopMonitor:
                     "instruction": "Đề xuất này đã gặp lỗi kỹ thuật hai lần; không thử lại nguyên call. "
                                    "Đây không phải kết luận schema hay bằng chứng entity không tồn tại."}
         record = self._records.get(key)
-        if record is None:
-            return None
-        self._records.move_to_end(key)
-        return {"block": True, "reason": record["reason"], "scope": "current_state",
-                "name": name, "arguments": deepcopy(arguments), "state_epoch": self.state_epoch,
-                "cached_result": deepcopy(record["result"]),
-                "source_call_index": record["call_index"],
-                "previous_error": deepcopy(record["verification"]),
-                "instruction": "Call giống hệt đã có kết quả trong phiên hiện tại và chưa có write có thể đổi trạng thái. "
-                               "Dùng cached_result từ source_call_index; không có env call mới. "
-                               "Không tự đổi entity, hỏi lại hoặc done chỉ vì kết quả rỗng/chưa hoàn tất."}
+        if record is not None:
+            self._records.move_to_end(key)
+            return {"block": True, "reason": record["reason"], "scope": "current_state",
+                    "name": name, "arguments": deepcopy(arguments), "state_epoch": self.state_epoch,
+                    "cached_result": deepcopy(record["result"]),
+                    "source_call_index": record["call_index"],
+                    "previous_error": deepcopy(record["verification"]),
+                    "instruction": "Call giống hệt đã có kết quả trong phiên hiện tại và chưa có write có thể đổi trạng thái. "
+                                   "Dùng cached_result từ source_call_index; không có env call mới. "
+                                   "Không tự đổi entity, hỏi lại hoặc done chỉ vì kết quả rỗng/chưa hoàn tất."}
+        if self.empty_read_limit and kind == "read" and self._empty_read_counts.get(name, 0) >= self.empty_read_limit:
+            count = self._empty_read_counts[name]
+            return {"block": True, "reason": "read_empty_retry_cap", "scope": "current_state",
+                    "name": name, "arguments": deepcopy(arguments), "state_epoch": self.state_epoch,
+                    "empty_count": count,
+                    "instruction": f"{name} đã trả về kết quả rỗng {count} lần; không gọi lại tool này. "
+                                   "Nếu còn thiếu thông tin bắt buộc thì gọi sys.ask_missing_info, nếu không thì làm bước tiếp theo hoặc kết thúc."}
+        return None
 
     def record_validation_failure(self, name, arguments, reason):
         """Only an explicit organizer rejection is a permanent schema rejection."""
@@ -167,6 +179,8 @@ class LoopMonitor:
         if may_write and result.get("done") is not False:
             self._advance_state()
         elif key is not None and (kind == "read" or (may_write and result.get("done") is False)):
+            if kind == "read" and outcome["status"] in ("empty", "failure"):
+                self._empty_read_counts[name] = self._empty_read_counts.get(name, 0) + 1
             reason = ("repeated_empty_read" if outcome["status"] == "empty" else
                       "repeated_failed_read" if kind == "read" and outcome["status"] == "failure" else
                       "repeated_successful_read" if kind == "read" else "repeated_no_progress_write")

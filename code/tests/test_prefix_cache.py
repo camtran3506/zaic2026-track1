@@ -40,6 +40,13 @@ def tiny_model(*, conditional=False, vocab_size=32, value_heads=2):
             vision_start_token_id=vocab_size+3, vision_end_token_id=vocab_size+4))
     else:
         model = Qwen3_5ForCausalLM(Qwen3_5TextConfig(**text))
+    from transformers.models.qwen3_5.modeling_qwen3_5 import torch_causal_conv1d_update
+    for m in model.modules():
+        if not any(p.is_cuda for p in m.parameters()):
+            if hasattr(m, 'causal_conv1d_fn'):
+                m.causal_conv1d_fn = None
+            if hasattr(m, 'causal_conv1d_update'):
+                m.causal_conv1d_update = torch_causal_conv1d_update
     return model.eval()
 
 
@@ -237,3 +244,34 @@ def test_agent_clears_snapshot_at_sample_end_even_after_failure(tmp_path, raises
     else:
         assert agent.run(item(), FakeEnv(), tmp_path, 'public_test', prepared)['prefix_cache'] == {'hits': 2}
     assert llm.events == ['begin', 'end']
+
+
+def test_incremental_multiturn_prefix_cache_chaining():
+    tok = tokenizer()
+    model = tiny_model(conditional=True, vocab_size=len(tok))
+    cached = LocalLLM.from_loaded_model(model, tok, max_input_tokens=8192, max_new_tokens=4, prefix_cache='auto')
+    baseline = LocalLLM.from_loaded_model(model, tok, max_input_tokens=8192, max_new_tokens=4)
+
+    obs_turn1 = []
+    obs_turn2 = [{'name': 'home.status', 'arguments': {}, 'result': '{"ok":true,"data":[1]}'}]
+    obs_turn3 = [
+        {'name': 'home.status', 'arguments': {}, 'result': '{"ok":true,"data":[1]}'},
+        {'name': 'home.status', 'arguments': {}, 'result': '{"ok":true,"data":[2]}'},
+    ]
+    obs_turn4 = [
+        {'name': 'home.status', 'arguments': {}, 'result': '{"ok":true,"data":[1]}'},
+        {'name': 'home.status', 'arguments': {}, 'result': '{"ok":true,"data":[2]}'},
+        {'error': 'replan tool call'},
+    ]
+
+    for obs in (obs_turn1, obs_turn2, obs_turn3, obs_turn4):
+        messages = request(obs)
+        expected = baseline.generate(SYSTEM_PROMPT, messages[1]['content'])
+        actual = cached.generate(SYSTEM_PROMPT, messages[1]['content'])
+        assert actual == expected
+
+    stats = cached.prefix_cache_stats()
+    assert stats['hits'] == 3
+    assert stats['chain_advanced_tokens'] > 0
+    assert stats['chain_hits'] >= 1
+    assert stats['fallbacks'] == 0

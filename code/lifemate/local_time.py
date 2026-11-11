@@ -9,6 +9,26 @@ from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 LOCAL_TIME_POLICY = "local-time-tools-v1"
 _MAX_MINUTES = 7 * 24 * 60
 _WEEKDAYS = ("thứ hai", "thứ ba", "thứ tư", "thứ năm", "thứ sáu", "thứ bảy", "chủ nhật")
+_TITLE_WEEKDAYS = ("Thứ Hai", "Thứ Ba", "Thứ Tư", "Thứ Năm", "Thứ Sáu", "Thứ Bảy", "Chủ Nhật")
+
+
+def date_reference(current_time: str, timezone_name: str | None = None) -> dict:
+    """Weekday calendar table (-1..+13 days and this_week/next_week) for prompt injection."""
+    current = _timestamp(current_time, "context.current_time")
+    if timezone_name:
+        current = current.astimezone(_context_zone({"timezone": timezone_name}, current.tzinfo))
+    today = current.date()
+
+    def label(day) -> str:
+        tag = {-1: " (hôm qua)", 0: " (hôm nay)", 1: " (mai)", 2: " (ngày kia)"}.get((day - today).days, "")
+        return f"{day.isoformat()} {_TITLE_WEEKDAYS[day.weekday()]}{tag}"
+
+    monday = today - timedelta(days=today.weekday())
+    return {
+        "days": [label(today + timedelta(days=k)) for k in range(-1, 14)],
+        "this_week": f"{monday.isoformat()} .. {(monday + timedelta(days=6)).isoformat()}",
+        "next_week": f"{(monday + timedelta(days=7)).isoformat()} .. {(monday + timedelta(days=13)).isoformat()}",
+    }
 
 
 def _spec(name, description, properties, required):

@@ -8,6 +8,7 @@ from .function_calling import native_chat, native_observation_messages
 from .history import prompt_history
 from .itn import ITN_POLICY, detect_candidates
 from .local_helpers import with_local_tools
+from .local_time import date_reference
 from .text import normalize_transcript
 
 
@@ -27,6 +28,28 @@ def fixed_prompt_payload(transcript, context, history, enabled):
     tools = prompt_catalog(with_local_tools(enabled))
     transcript = normalize_transcript(transcript)
     history = prompt_history(history)
+    context_map = context if isinstance(context, dict) else {}
+    user_context = {k: v for k, v in context_map.items() if k != "installed_apps"}
+    if isinstance(context_map.get("current_time"), str) and "date_reference" not in user_context:
+        try:
+            tz = context_map.get("timezone")
+            user_context["date_reference"] = date_reference(
+                context_map["current_time"],
+                tz if isinstance(tz, str) and tz else None,
+            )
+        except ValueError:
+            pass
+    apps = {}
+    for spec in enabled.values():
+        app = spec.get("_app") if isinstance(spec, dict) else None
+        if isinstance(app, dict) and isinstance(app.get("id"), str) and app["id"] and app["id"] != "sys" and app["id"] not in apps:
+            name = app.get("name", "")
+            desc = app.get("description", "")
+            summary = f"{name}: {desc}" if name and desc else (name or desc)
+            if summary:
+                apps[app["id"]] = summary
+    if apps and "apps" not in user_context:
+        user_context["apps"] = apps
     return tools, {
         "request_transcript": transcript,
         "itn_policy": ITN_POLICY,
@@ -36,7 +59,7 @@ def fixed_prompt_payload(transcript, context, history, enabled):
             {"history_index": i, "candidates": candidates}
             for i, turn in enumerate(history)
             if (candidates := detect_candidates(turn["text"]))],
-        "user_context": {k: v for k, v in context.items() if k != "installed_apps"},
+        "user_context": user_context,
         "conversation_history": history,
         "available_tools": tools,
     }

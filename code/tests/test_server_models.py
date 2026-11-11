@@ -83,7 +83,11 @@ def test_download_default_matches_launcher_and_only_asr_preserves_llm(server, mo
 
     def snapshot(**kwargs):
         calls.append(kwargs)
-        for name in ("encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt"):
+        for name in (
+            "encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx",
+            "encoder.onnx", "decoder.onnx", "joiner.onnx",
+            "tokens.txt", "bpe.model", "model.pt",
+        ):
             (Path(kwargs["local_dir"]) / name).write_bytes(b"downloaded ASR")
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", snapshot)
@@ -92,7 +96,8 @@ def test_download_default_matches_launcher_and_only_asr_preserves_llm(server, mo
     runpy.run_path(str(script), run_name="__main__")
     assert len(calls) == 1
     assert calls[0]["repo_id"] == "g-group-ai-lab/gipformer1.5-68M-rnnt"
-    assert "encoder.int8.onnx" in calls[0]["allow_patterns"]
+    for required in ("encoder.int8.onnx", "encoder.onnx", "bpe.model", "model.pt", "tokens.txt"):
+        assert required in calls[0]["allow_patterns"]
     assert calls[0]["local_dir"] == str(app / "models/asr")
     assert weights.read_bytes() == b"existing base used to train adapter"
 

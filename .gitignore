@@ -1,7 +1,5 @@
 code/models/*
-!code/models/.gitignore
+code/result/*
 code/unsloth_compiled_cache
-code/audit_initial_tokens.py
-code/result/finetune_20261029_212030
-code/result/finetune_20261103_022830
+runtime_cache
 train+public_test/

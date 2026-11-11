@@ -18,10 +18,10 @@ COPY main.py score_train.py /app/
 COPY lifemate/ /app/lifemate/
 COPY models/ /opt/models/
 RUN test -f /opt/models/llm/config.json && \
-    test -s /opt/models/asr/encoder.int8.onnx && \
-    test -s /opt/models/asr/decoder.int8.onnx && \
-    test -s /opt/models/asr/joiner.int8.onnx && \
     test -s /opt/models/asr/tokens.txt && \
+    (test -s /opt/models/asr/encoder.onnx || test -s /opt/models/asr/encoder.int8.onnx) && \
+    (test -s /opt/models/asr/decoder.onnx || test -s /opt/models/asr/decoder.int8.onnx) && \
+    (test -s /opt/models/asr/joiner.onnx || test -s /opt/models/asr/joiner.int8.onnx) && \
     mkdir -p /app/result
 
 ENTRYPOINT ["python", "/app/main.py"]

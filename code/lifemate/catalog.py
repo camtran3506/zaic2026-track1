@@ -12,10 +12,20 @@ def load_catalog(path: Path) -> dict[str, dict]:
     payload = json.loads(path.read_text(encoding="utf-8"))
     tools: dict[str, dict] = {}
     for app in payload.get("apps", []):
+        app_id = app.get("id")
+        app_meta = (
+            {
+                "id": app_id,
+                "name": app.get("name_vi", app.get("name", "")),
+                "description": app.get("description", ""),
+            }
+            if isinstance(app_id, str) and app_id
+            else None
+        )
         for spec in app.get("tools", []):
             name = spec.get("name")
             if isinstance(name, str) and name:
-                tools[name] = spec
+                tools[name] = {**spec, "_app": deepcopy(app_meta)} if app_meta is not None else spec
     # The competition makes this meta tool universally available. Its schema
     # is supplied here only if missing from the catalog; env.validate decides.
     tools.setdefault("sys.ask_missing_info", {

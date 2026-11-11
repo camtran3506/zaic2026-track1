@@ -42,7 +42,7 @@ class NumericsGuard:
     def batch(metadata, inputs):
         import torch
         tensors = {key: value.detach() for key, value in inputs.items()
-                   if key in {'input_ids', 'attention_mask', 'labels'} and isinstance(value, torch.Tensor)}
+                   if key in {'input_ids', 'attention_mask', 'labels', 'loss_weights'} and isinstance(value, torch.Tensor)}
         return {'samples': deepcopy(metadata or []), 'tensors': tensors}
 
     def start_microbatch(self, metadata, inputs):

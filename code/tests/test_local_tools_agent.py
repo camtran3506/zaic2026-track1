@@ -125,3 +125,112 @@ def test_local_numeric_schema_used_for_native_parser():
            "<parameter=travel_minutes>15</parameter><parameter=early_minutes>15</parameter>"
            "</function></tool_call>")
     assert type(parse_decision(raw, schemas)["arguments"]["travel_minutes"]) is int
+
+
+def test_graceful_stop_when_token_budget_exceeded_on_subsequent_steps():
+    entry = item()
+    env = FakeEnv()
+    events = []
+
+    class ExplodingLLM:
+        def __init__(self):
+            self.calls = 0
+
+        def generate(self, system, user):
+            self.calls += 1
+            if self.calls == 1:
+                return DURATION
+            raise ValueError("Prompt has 16500 tokens, exceeds --max-input-tokens=16000; full schemas, history and tool results are never truncated")
+
+    stats = LifeMateAgent(StubASR(), ExplodingLLM(), CATALOG, AgentConfig()).run(
+        entry, env, Path("/unused"), "train", trace=events.append)
+    assert stats["stop_reason"] == "max_input_tokens"
+    assert stats["local_executed"] == 1
+    assert any(e["event"] == "context_limit_reached" for e in events)
+
+    # Initial step 1 exceeding budget re-raises as configuration error
+    class InitialExplodingLLM:
+        def generate(self, system, user):
+            raise ValueError("Prompt has 16500 tokens, exceeds --max-input-tokens=16000; full schemas, history and tool results are never truncated")
+
+    import pytest
+    with pytest.raises(ValueError, match="exceeds --max-input-tokens"):
+        LifeMateAgent(StubASR(), InitialExplodingLLM(), CATALOG, AgentConfig()).run(
+            entry, FakeEnv(), Path("/unused"), "train")
+
+
+def test_identical_local_helper_observations_are_deduplicated():
+    entry = item()
+    env = FakeEnv()
+    prompts = []
+
+    class CapturingLLM:
+        def __init__(self):
+            self.outputs = [DURATION, DURATION, '{"action":"done"}']
+            self.idx = 0
+
+        def generate(self, system, user):
+            prompts.append(json.loads(user))
+            out = self.outputs[self.idx]
+            self.idx += 1
+            return out
+
+    stats = LifeMateAgent(StubASR(), CapturingLLM(), CATALOG, AgentConfig()).run(
+        entry, env, Path("/unused"), "train")
+    assert stats["stop_reason"] == "done"
+    assert stats["local_executed"] == 2
+    assert len(prompts) == 3
+    # Step 3 prompt (after 2 DURATION calls) only has 1 local observation entry
+    obs = prompts[2]["previous_actions_and_results"]
+    assert len(obs) == 1
+    assert obs[0]["name"] == "local_time.duration_between"
+
+
+def test_successful_helper_cleans_up_prior_rejections():
+    entry = item()
+    env = FakeEnv()
+    prompts = []
+
+    class RecoveringLLM:
+        def __init__(self):
+            # Step 1: malformed/rejected decision
+            # Step 2: successful helper
+            # Step 3: done
+            self.outputs = [
+                '{"action":"call","name":"local_batch.run","arguments":{"calls":[{"name":"news.search","arguments":{"query":"test"}}]}}',
+                DURATION,
+                '{"action":"done"}'
+            ]
+            self.idx = 0
+
+        def generate(self, system, user):
+            prompts.append(json.loads(user))
+            out = self.outputs[self.idx]
+            self.idx += 1
+            return out
+
+    stats = LifeMateAgent(StubASR(), RecoveringLLM(), CATALOG, AgentConfig()).run(
+        entry, env, Path("/unused"), "train")
+    assert stats["stop_reason"] == "done"
+    assert stats["invalid_proposals"] == 1
+    assert stats["local_executed"] == 1
+    # Step 3 prompt (after helper succeeded) should have cleaned up the rejected batch observation
+    obs = prompts[2]["previous_actions_and_results"]
+    assert len(obs) == 1
+    assert "error" not in obs[0]
+    assert obs[0]["name"] == "local_time.duration_between"
+
+
+def test_max_llm_steps_hard_ceiling():
+    entry = item()
+    env = FakeEnv()
+
+    class EndlessHelperLLM:
+        def generate(self, system, user):
+            return DURATION
+
+    stats = LifeMateAgent(StubASR(), EndlessHelperLLM(), CATALOG, AgentConfig(max_llm_steps=10)).run(
+        entry, env, Path("/unused"), "train")
+    assert stats["stop_reason"] == "max_llm_steps"
+    assert stats["llm_steps"] == 10
+    assert stats["local_executed"] == 10
