@@ -24,16 +24,23 @@ from .temporal_training import helper_demonstrations
 from .assist_training import task_demonstrations
 from .local_assist import ASSIST_TOOL, ASSIST_POLICY
 from .context import DEFAULT_MAX_NEW_TOKENS
+from .reasoning import REASONING_POLICY
+from .recovery import GUARD_RECOVERY_POLICY
 from .text import TEXT_NORMALIZATION, normalize_transcript
 from .itn import ITN_POLICY
 from .schema_prompt import SCHEMA_PROMPT_POLICY
 from .numerics import DEBUG_BATCH_KEY
 
 
-SFT_PROMPT_POLICY = "full-trajectory-date-apps-v14"
+SFT_PROMPT_POLICY = "full-trajectory-date-apps-v15"
 VALIDATION_ROLLOUT_POLICY = "asr-only-paired-clean-v1"
 DEFAULT_ASR_TRANSCRIPT_RATIO = 0.5
-_ASSISTANT_SPAN = re.compile(r"<\|im_start\|>assistant\n(?:<think>\n\n</think>\n\n)?(.*?<\|im_end\|>)(?=\n|$)", re.S)
+_THINK_OPEN = "<think>\n"
+_THINK_CLOSE = "\n</think>\n\n"
+_ASSISTANT_SPAN = re.compile(
+    r"<\|im_start\|>assistant\n(?:<think>\n(?:\n</think>\n\n)?)?(.*?<\|im_end\|>)(?=\n|$)",
+    re.S,
+)
 _FUNC_RE = re.compile(r"<function=([^>\n]+)>")
 _PARAM_RE = re.compile(r"<parameter=([^>\n]+)>\n(.*?)\n</parameter>", re.S)
 
@@ -67,7 +74,9 @@ def validate_prompt_policy(manifest):
             or manifest.get("assist_policy") != ASSIST_POLICY
             or manifest.get("schema_prompt_policy") != SCHEMA_PROMPT_POLICY
             or manifest.get("itn_policy") != ITN_POLICY
-            or manifest.get("execution_policy") != EXECUTION_POLICY):
+            or manifest.get("execution_policy") != EXECUTION_POLICY
+            or manifest.get("reasoning_policy", REASONING_POLICY) != REASONING_POLICY
+            or manifest.get("guard_recovery_policy", GUARD_RECOVERY_POLICY) != GUARD_RECOVERY_POLICY):
         raise ValueError("Prepared SFT data uses an older prompt/text-normalization/evaluation policy; "
                          "rerun prepare_sft.py in a new output directory")
 
@@ -241,7 +250,7 @@ def replay_sample(item, catalog, env, split_dir, asr=None, prepared_transcript=N
             def fits(candidate):
                 target = {'action': 'call', **candidate}
                 full = chat_token_ids(tokenizer, messages+[{'role': 'assistant', 'content': json.dumps(target, ensure_ascii=False)}], False)
-                return full[:len(prefix)] == prefix and 0 < len(full)-len(prefix) <= DEFAULT_MAX_NEW_TOKENS
+                return full[:len(prefix)] == prefix and 0 < len(full)-len(prefix) <= min(DEFAULT_MAX_NEW_TOKENS, 384)
 
             chunk = []
             for field in remaining:
@@ -330,12 +339,23 @@ def collapse_trajectory(steps, *, extra=None):
         "assistant_train_mask": [row.get("train", True) is not False for row in steps],
         "messages": last["messages"],
     }
-    for key in ("transcript_source", "augmentation", "recovery"):
+    for key in ("transcript_source", "augmentation", "recovery", "reasoning"):
         if key in last:
             collapsed[key] = deepcopy(last[key])
     if extra:
         collapsed.update(deepcopy(extra))
     return collapsed
+
+
+def _thinking_ranges(text, spans):
+    ranges = []
+    for s0, e0 in spans:
+        if s0 >= len(_THINK_OPEN) and text.startswith(_THINK_OPEN, s0 - len(_THINK_OPEN)):
+            body = text[s0:e0]
+            close = body.find(_THINK_CLOSE)
+            if close > 0:
+                ranges.append((s0, s0 + close))
+    return ranges
 
 
 def _fuzzy_ranges(text, spans, tools):
@@ -349,17 +369,23 @@ def _fuzzy_ranges(text, spans, tools):
     ranges = []
     for s0, e0 in spans:
         body = text[s0:e0]
-        fn = _FUNC_RE.search(body)
+        offset = 0
+        if s0 >= len(_THINK_OPEN) and text.startswith(_THINK_OPEN, s0 - len(_THINK_OPEN)):
+            close = body.find(_THINK_CLOSE)
+            if close >= 0:
+                offset = close + len(_THINK_CLOSE)
+        fn_body = body[offset:]
+        fn = _FUNC_RE.search(fn_body)
         keys = fuzzy_by_fn.get(fn.group(1), set()) if fn else set()
         if not keys:
             continue
-        for param in _PARAM_RE.finditer(body):
+        for param in _PARAM_RE.finditer(fn_body):
             if param.group(1) in keys:
-                ranges.append((s0 + param.start(2), s0 + param.end(2)))
+                ranges.append((s0 + offset + param.start(2), s0 + offset + param.end(2)))
     return ranges
 
 
-def _encode_native_with_spans(example, tokenizer, max_length, *, fuzzy_weight=None):
+def _encode_native_with_spans(example, tokenizer, max_length, *, fuzzy_weight=None, reasoning_weight=None):
     chat, tools = native_chat(example["messages"])
     payload = json.loads(example["messages"][1]["content"])
     obs_count = len(native_observation_messages(payload.get("previous_actions_and_results", [])))
@@ -384,6 +410,8 @@ def _encode_native_with_spans(example, tokenizer, max_length, *, fuzzy_weight=No
             f"{example.get('sample_id')}: assistant spans ({len(spans)}) do not match steps ({len(trained)})"
         )
     fuzzy = _fuzzy_ranges(text, spans, tools) if fuzzy_weight is not None else []
+    thinking = _thinking_ranges(text, spans) if reasoning_weight is not None else []
+    use_weights = (fuzzy_weight is not None) or (reasoning_weight is not None)
     enc = tokenizer(
         text, add_special_tokens=False, truncation=False,
         return_offsets_mapping=True, return_token_type_ids=False,
@@ -402,28 +430,42 @@ def _encode_native_with_spans(example, tokenizer, max_length, *, fuzzy_weight=No
             j += 1
         if j < len(spans) and trained[j] and s >= spans[j][0] and e <= spans[j][1] and e > s:
             labels[t] = ids[t]
-            if fuzzy_weight is not None:
-                weights[t] = float(fuzzy_weight) if any(a <= s < b for a, b in fuzzy) else 1.0
+            if use_weights:
+                if reasoning_weight is not None and any(a <= s < b for a, b in thinking):
+                    weights[t] = float(reasoning_weight)
+                elif fuzzy_weight is not None and any(a <= s < b for a, b in fuzzy):
+                    weights[t] = float(fuzzy_weight)
+                else:
+                    weights[t] = 1.0
     if not any(label != -100 for label in labels):
         raise ValueError(f"{example.get('sample_id')}: trajectory produced zero supervised tokens")
     row = {"input_ids": ids, "attention_mask": [1] * len(ids), "labels": labels}
-    if fuzzy_weight is not None:
+    if use_weights:
         row["loss_weights"] = weights
     return row
 
 
-def encode_example(example, tokenizer, max_length, *, fuzzy_weight=None):
+def encode_example(example, tokenizer, max_length, *, fuzzy_weight=None, reasoning_weight=None):
     messages = example["messages"]
     if [m["role"] for m in messages] != ["system", "user", "assistant"]:
         raise ValueError("SFT expects system/user/assistant messages")
     native = getattr(tokenizer, "lifemate_native_fc", False) is True
+    use_weights = (fuzzy_weight is not None) or (reasoning_weight is not None)
     if example.get("full_trajectory"):
         if not native or not getattr(tokenizer, "is_fast", False):
             raise ValueError("Full-trajectory SFT encoding requires a fast native-function-calling tokenizer")
-        return _encode_native_with_spans(example, tokenizer, max_length, fuzzy_weight=fuzzy_weight)
-    if fuzzy_weight is not None and native and getattr(tokenizer, "is_fast", False):
-        return _encode_native_with_spans(example, tokenizer, max_length, fuzzy_weight=fuzzy_weight)
-    prefix = chat_token_ids(tokenizer, messages[:-1], add_generation_prompt=True)
+        return _encode_native_with_spans(
+            example, tokenizer, max_length, fuzzy_weight=fuzzy_weight, reasoning_weight=reasoning_weight
+        )
+    if use_weights and native and getattr(tokenizer, "is_fast", False):
+        return _encode_native_with_spans(
+            example, tokenizer, max_length, fuzzy_weight=fuzzy_weight, reasoning_weight=reasoning_weight
+        )
+    has_reasoning = native and bool((messages[2].get("reasoning_content") or "").strip())
+    prefix = chat_token_ids(
+        tokenizer, messages[:-1], add_generation_prompt=True,
+        enable_thinking=(True if has_reasoning else None),
+    )
     full = chat_token_ids(tokenizer, messages, add_generation_prompt=False)
     if full[:len(prefix)] != prefix or len(full) <= len(prefix):
         raise ValueError("Chat template cannot isolate assistant tokens safely")
@@ -431,14 +473,18 @@ def encode_example(example, tokenizer, max_length, *, fuzzy_weight=None):
         raise ValueError(f"{example['sample_id']} step {example['step']}: {len(full)} tokens > max_length={max_length}; increase length, never truncate prompt or gold JSON")
     labels = [-100] * len(prefix) + full[len(prefix):]
     row = {"input_ids": full, "attention_mask": [1] * len(full), "labels": labels}
-    if fuzzy_weight is not None:
+    if use_weights:
         row["loss_weights"] = [0.0] * len(prefix) + [1.0] * (len(full) - len(prefix))
     return row
 
 
 class SupervisedDataset:
-    def __init__(self, examples, tokenizer, max_length, *, include_debug_metadata=False, source_path=None, fuzzy_weight=None):
-        self.rows = [encode_example(e, tokenizer, max_length, fuzzy_weight=fuzzy_weight) for e in examples]
+    def __init__(self, examples, tokenizer, max_length, *, include_debug_metadata=False, source_path=None,
+                 fuzzy_weight=None, reasoning_weight=None):
+        self.rows = [
+            encode_example(e, tokenizer, max_length, fuzzy_weight=fuzzy_weight, reasoning_weight=reasoning_weight)
+            for e in examples
+        ]
         if include_debug_metadata:
             for index, (row, example) in enumerate(zip(self.rows, examples)):
                 row[DEBUG_BATCH_KEY] = {'sample_id': example['sample_id'], 'sft_step': example['step'],

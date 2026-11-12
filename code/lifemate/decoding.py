@@ -4,7 +4,9 @@ from __future__ import annotations
 import json
 from weakref import WeakKeyDictionary
 
-from transformers import StoppingCriteria
+from transformers import LogitsProcessor, StoppingCriteria
+
+from .context import DEFAULT_THINKING_BUDGET
 
 
 _CLOSING_TOKEN_TABLES = WeakKeyDictionary()
@@ -99,9 +101,14 @@ class _FilteredStoppingCriteria(StoppingCriteria):
         return self.tokenizer.decode(input_ids[0, self.prompt_length:], skip_special_tokens=False)
 
 
-def complete_decision_json(text: str) -> str | None:
+def complete_decision_json(text: str, *, thinking_opened: bool = False) -> str | None:
     # Reasoning markers are special only outside JSON, not inside argument strings.
     skip_until = 0
+    if thinking_opened and not text.lstrip().startswith('<think>'):
+        end_think = text.find('</think>')
+        if end_think < 0:
+            return None
+        skip_until = end_think + len('</think>')
     start, depth, in_string, escaped = None, 0, False, False
     for index, char in enumerate(text):
         if index < skip_until:
@@ -154,8 +161,9 @@ def complete_decision_json(text: str) -> str | None:
 
 class DecisionJsonStoppingCriteria(_FilteredStoppingCriteria):
     """Single-request agent decoding. Never inspect JSON from the input prompt."""
-    def __init__(self, tokenizer, prompt_length: int, *, fast_check=True):
+    def __init__(self, tokenizer, prompt_length: int, *, fast_check=True, thinking_opened: bool = False):
         super().__init__(tokenizer, prompt_length, fast_check=fast_check)
+        self.thinking_opened = thinking_opened
         self.completed_json = None
 
     def __call__(self, input_ids, scores, **kwargs):
@@ -164,14 +172,15 @@ class DecisionJsonStoppingCriteria(_FilteredStoppingCriteria):
         if not self._needs_full_check(input_ids):
             return self.completed_json is not None
         text = self._decode(input_ids)
-        self.completed_json = complete_decision_json(text)
+        self.completed_json = complete_decision_json(text, thinking_opened=self.thinking_opened)
         return self.completed_json is not None
 
 
 class NativeToolStoppingCriteria(_FilteredStoppingCriteria):
     """Wait for the entire native XML call, never a JSON object inside a parameter."""
-    def __init__(self, tokenizer, prompt_length, *, fast_check=True):
+    def __init__(self, tokenizer, prompt_length, *, fast_check=True, thinking_opened: bool = False):
         super().__init__(tokenizer, prompt_length, fast_check=fast_check)
+        self.thinking_opened = thinking_opened
         self.completed_output = None
 
     def __call__(self, input_ids, scores, **kwargs):
@@ -181,7 +190,7 @@ class NativeToolStoppingCriteria(_FilteredStoppingCriteria):
         if not self._needs_full_check(input_ids):
             return self.completed_output is not None
         text = self._decode(input_ids)
-        visible = visible_output(text)
+        visible = visible_output(text, thinking_opened=self.thinking_opened)
         if '<tool_call>' in visible:
             self.completed_output = complete_native_call(visible)
         else:
@@ -189,3 +198,51 @@ class NativeToolStoppingCriteria(_FilteredStoppingCriteria):
             candidate = complete_decision_json(visible)
             self.completed_output = candidate if candidate and json.loads(candidate) == {'action': 'done'} else None
         return self.completed_output is not None
+
+
+class ThinkingBudgetLogitsProcessor(LogitsProcessor):
+    """Cap thinking tokens inside `<think>...</think>` at `max_thinking_tokens`.
+
+    When the generation prompt already ends with `<think>\\n` and the model has not
+    closed `</think>` upon reaching `max_thinking_tokens`, force the exact token
+    sequence for `\\n</think>\\n\\n` so remaining tokens go cleanly to `<tool_call>`.
+    """
+    def __init__(self, tokenizer, prompt_length: int, max_thinking_tokens: int = DEFAULT_THINKING_BUDGET):
+        if max_thinking_tokens < 0:
+            raise ValueError("max_thinking_tokens must be non-negative")
+        self.tokenizer = tokenizer
+        self.prompt_length = prompt_length
+        self.max_thinking_tokens = max_thinking_tokens
+        self.close_seq = tokenizer.encode("\n</think>\n\n", add_special_tokens=False)
+        end_think_id = tokenizer.convert_tokens_to_ids("</think>")
+        unk_id = getattr(tokenizer, "unk_token_id", None)
+        self.end_think_id = (
+            end_think_id
+            if isinstance(end_think_id, int) and end_think_id >= 0 and end_think_id != unk_id
+            else None
+        )
+        self.forcing_idx: int | None = None
+
+    def _has_end_think(self, gen_ids: list[int]) -> bool:
+        if self.end_think_id is not None:
+            return self.end_think_id in gen_ids
+        return "</think>" in self.tokenizer.decode(gen_ids, skip_special_tokens=False)
+
+    def __call__(self, input_ids, scores):
+        if input_ids.shape[0] != 1:
+            raise ValueError("Thinking budget supports one agent request at a time")
+        if not self.close_seq:
+            return scores
+        gen_ids = input_ids[0, self.prompt_length:].tolist()
+        if self.forcing_idx is None:
+            if self._has_end_think(gen_ids):
+                return scores
+            if len(gen_ids) < self.max_thinking_tokens:
+                return scores
+            self.forcing_idx = 0
+        if self.forcing_idx < len(self.close_seq):
+            target_id = self.close_seq[self.forcing_idx]
+            self.forcing_idx += 1
+            scores.fill_(float("-inf"))
+            scores[:, target_id] = 0.0
+        return scores

@@ -1,6 +1,7 @@
 """Observe -> plan a call/read-only batch -> validate -> execute -> observe."""
 from __future__ import annotations
 
+import inspect
 import json
 import time
 from dataclasses import dataclass
@@ -8,6 +9,7 @@ from pathlib import Path
 from typing import Any
 
 from .catalog import allowed_tools
+from .context import DEFAULT_THINKING_BUDGET
 from .eval_trace import exception_details
 from .history import extract_observed_ids, prompt_history, resolve_history
 from .local_helpers import execute_helper, helper_tool_schemas, with_local_tools
@@ -154,6 +156,8 @@ class AgentConfig:
     sample_seconds: float = float("inf")
     # Reserving time is best effort, not a hard CUDA generation timeout.
     reserve_seconds: float = 1.0
+    thinking_budget: int = DEFAULT_THINKING_BUDGET
+    thinking_reserve_seconds: float = 2.0
     use_train_transcript: bool = False
     # Only env/invalid planning decisions spend this budget. Valid helper-only
     # turns have no count ceiling; model input/output token limits still apply.
@@ -161,6 +165,19 @@ class AgentConfig:
     max_llm_steps: int = 64
     empty_read_limit: int = 2
     enforce_observed_xref: bool = True
+
+
+def _supports_thinking_budget(llm: Any) -> bool:
+    gen = getattr(llm, "generate", None)
+    if not callable(gen):
+        return False
+    try:
+        sig = inspect.signature(gen)
+    except (TypeError, ValueError):
+        return False
+    return "thinking_budget" in sig.parameters or any(
+        p.kind == inspect.Parameter.VAR_KEYWORD for p in sig.parameters.values()
+    )
 
 
 def build_step_prompt(transcript, context, history, enabled, observations):
@@ -177,6 +194,7 @@ class LifeMateAgent:
         self.llm = llm
         self.catalog = catalog
         self.cfg = cfg
+        self._llm_accepts_thinking_budget = _supports_thinking_budget(llm)
 
     def run(self, item: dict, env: Any, split_dir: Path, split: str,
             prepared_transcript: dict | None = None, *, trace=None) -> dict:
@@ -226,6 +244,7 @@ class LifeMateAgent:
                     "elapsed_seconds": 0, "executed": 0, "invalid_proposals": 0,
                     "local_executed": 0,
                     'llm_steps': 0, 'non_helper_steps': 0, 'batches': 0,
+                    'thinking_turns': 0,
                     "stop_reason": "no_available_tools"}
         if prepared_transcript is not None:
             if prepared_transcript.get("id") != item["id"]:
@@ -246,6 +265,7 @@ class LifeMateAgent:
         executed = 0
         local_executed = 0
         batches = 0
+        thinking_turns = 0
         stop_reason = None
 
         def reject(error, stage, **feedback):
@@ -308,18 +328,32 @@ class LifeMateAgent:
         while (executed < self.cfg.max_calls and invalid < self.cfg.max_invalid
                and non_helper_steps < self.cfg.max_total_steps
                and step < self.cfg.max_llm_steps):
-            if time.monotonic() - t0 > self.cfg.sample_seconds - self.cfg.reserve_seconds:
+            elapsed = time.monotonic() - t0
+            remaining = self.cfg.sample_seconds - elapsed
+            if remaining < self.cfg.reserve_seconds:
                 stop_reason = "time_limit"
                 break
+            allow_thinking = (
+                self.cfg.thinking_budget > 0
+                and remaining >= (self.cfg.reserve_seconds + self.cfg.thinking_reserve_seconds)
+            )
+            turn_thinking_budget = self.cfg.thinking_budget if allow_thinking else 0
             if session is not None:
                 user_prompt = session.prompt(observations)
             else:
                 _, user_prompt = build_step_prompt(transcript, context, history, enabled, observations)
             step += 1
             non_helper_steps += 1
-            emit("llm_start", request={"system": SYSTEM_PROMPT, "user": user_prompt})
+            if turn_thinking_budget > 0:
+                thinking_turns += 1
+            emit("llm_start", request={"system": SYSTEM_PROMPT, "user": user_prompt},
+                 thinking_budget=turn_thinking_budget)
             try:
-                raw = self.llm.generate(SYSTEM_PROMPT, user_prompt)
+                if self._llm_accepts_thinking_budget:
+                    raw = self.llm.generate(SYSTEM_PROMPT, user_prompt,
+                                            thinking_budget=turn_thinking_budget)
+                else:
+                    raw = self.llm.generate(SYSTEM_PROMPT, user_prompt)
             except ValueError as exc:
                 if ("exceeds" in str(exc) and "max-input-tokens" in str(exc)) and step > 1:
                     emit("context_limit_reached", step=step, error=str(exc))
@@ -408,8 +442,10 @@ class LifeMateAgent:
                            "max_llm_steps" if step >= self.cfg.max_llm_steps else
                            "max_total_steps")
         emit("stop", reason=stop_reason, executed=executed, local_executed=local_executed,
-             invalid_proposals=invalid, batches=batches, non_helper_steps=non_helper_steps)
+             invalid_proposals=invalid, batches=batches, non_helper_steps=non_helper_steps,
+             thinking_turns=thinking_turns)
         return {"transcript": transcript, "elapsed_seconds": round(time.monotonic() - t0, 3),
                 "executed": executed, "local_executed": local_executed, "invalid_proposals": invalid,
                 'llm_steps': step, 'non_helper_steps': non_helper_steps, 'batches': batches,
+                'thinking_turns': thinking_turns,
                 "stop_reason": stop_reason}

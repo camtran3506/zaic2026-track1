@@ -226,7 +226,7 @@ Các cell dưới ghi mã vào `/kaggle/working/lifemate_app` để chạy trong
 for rel in ['lifemate/__init__.py', 'lifemate/catalog.py', 'lifemate/models.py', 'lifemate/agent.py', 'lifemate/transcripts.py', 'lifemate/decoding.py',
             'lifemate/gpu.py', 'lifemate/context.py', 'lifemate/text.py', 'lifemate/function_calling.py', 'lifemate/asr.py', 'lifemate/llm.py', 'lifemate/prefix_cache.py', 'lifemate/prompt_session.py', 'lifemate/runtime.py', 'lifemate/history.py', 'lifemate/scoring.py', 'lifemate/evaluation.py', 'lifemate/eval_diagnostics.py', 'lifemate/eval_trace.py',
             'lifemate/local_time.py', 'lifemate/temporal_text.py', 'lifemate/temporal_training.py', 'lifemate/batching.py',
-            'lifemate/schema_prompt.py', 'lifemate/schema_cache.py', 'lifemate/numerics.py',
+            'lifemate/schema_prompt.py', 'lifemate/schema_cache.py', 'lifemate/numerics.py', 'lifemate/reasoning.py', 'lifemate/recovery.py',
             'lifemate/local_assist.py', 'lifemate/assist_training.py',
             'lifemate/itn.py', 'lifemate/local_helpers.py', 'lifemate/local_knowledge.py', 'lifemate/local_checks.py',
             'lifemate/execution_policy.py', 'lifemate/tool_execution.py', 'lifemate/specialist_training.py',

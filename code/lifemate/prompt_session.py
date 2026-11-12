@@ -188,18 +188,24 @@ class InferenceSession:
         return tokenizer(text, add_special_tokens=False, truncation=False,
                          return_token_type_ids=False)["input_ids"]
 
-    def _render_full(self, tokenizer, observations):
+    def _render_full(self, tokenizer, observations, *, enable_thinking=None):
         chat = self._base_chat + observations
+        kwargs = dict(self._kwargs)
+        if enable_thinking is not None:
+            kwargs["enable_thinking"] = bool(enable_thinking)
         text = tokenizer.apply_chat_template(chat, tokenize=False, add_generation_prompt=True,
-                                             tools=self._tools, **self._kwargs)
+                                             tools=self._tools, **kwargs)
         self.stats["full_renders"] += 1
         return text, self._tokens(tokenizer, text), []
 
-    def _render_suffix(self, tokenizer, observations):
+    def _render_suffix(self, tokenizer, observations, *, enable_thinking=None):
         # Re-render ALL observations: later user feedback can change how Qwen
         # renders earlier assistant reasoning, and rejected feedback can vanish.
+        kwargs = dict(self._kwargs)
+        if enable_thinking is not None:
+            kwargs["enable_thinking"] = bool(enable_thinking)
         rendered = tokenizer.apply_chat_template([_ANCHOR, *observations], tokenize=False,
-            add_generation_prompt=True, **self._kwargs)
+            add_generation_prompt=True, **kwargs)
         if not rendered.startswith(self._anchor_text):
             raise ValueError("Observation anchor is not an exact rendered prefix")
         suffix = "\n" + rendered[len(self._anchor_text):]
@@ -211,7 +217,7 @@ class InferenceSession:
                       and ids[len(self._prefix_ids):end] == self._newline_ids else [])
         return self._prefix_text + suffix, ids, gpu_prefix
 
-    def render(self, tokenizer, system, prompt):
+    def render(self, tokenizer, system, prompt, *, enable_thinking=None):
         """Return exactly the reference text/IDs, or use full rendering on a miss."""
         if (self._fixed_json is None or prompt.session is not self
                 or prompt.fixed_json is not self._fixed_json):
@@ -250,8 +256,8 @@ class InferenceSession:
                     self._gpu_prefix_ids = self._prefix_ids + self._newline_ids
                     self._anchor_text = tokenizer.apply_chat_template([_ANCHOR], tokenize=False,
                         add_generation_prompt=False, **kwargs)
-                    full = self._render_full(tokenizer, observations)
-                    joined = self._render_suffix(tokenizer, observations)
+                    full = self._render_full(tokenizer, observations, enable_thinking=enable_thinking)
+                    joined = self._render_suffix(tokenizer, observations, enable_thinking=enable_thinking)
                     if joined[:2] != full[:2] or self._prefix_ids[-1] != tokenizer.convert_tokens_to_ids("<|im_end|>"):
                         self._prefix_text = self._prefix_ids = None
                         self.stats["fallback_reason"] = "initial full-prompt parity check failed"
@@ -260,7 +266,7 @@ class InferenceSession:
                 self.stats["fallback_reason"] = "no closed special-token prefix boundary"
         if self._prefix_ids is not None:
             try:
-                result = self._render_suffix(tokenizer, observations)
+                result = self._render_suffix(tokenizer, observations, enable_thinking=enable_thinking)
             except ValueError:
                 self._prefix_text = self._prefix_ids = None
                 self.stats["fallback_reason"] = "observation rendering boundary changed"
@@ -268,4 +274,4 @@ class InferenceSession:
                 self.stats["suffix_renders"] += 1
                 self.stats["reused_tokens"] += len(self._prefix_ids)
                 return result
-        return self._render_full(tokenizer, observations)
+        return self._render_full(tokenizer, observations, enable_thinking=enable_thinking)

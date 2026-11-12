@@ -3,15 +3,20 @@ from __future__ import annotations
 
 from copy import deepcopy
 import difflib
+import hashlib
 import json
 import re
 
 from .agent import SYSTEM_PROMPT, _train_transcript, build_step_prompt, full_json
 from .catalog import allowed_tools
 from .execution_policy import LoopMonitor
+from .history import collect_ids, extract_observed_ids
 from .local_helpers import execute_helper, helper_tool_schemas
 from .text import normalize_transcript
-from .tool_execution import attempt_env_call, precheck_call, result_observation
+from .tool_execution import attempt_env_call, check_observed_xref, precheck_call, result_observation
+
+GUARD_RECOVERY_POLICY = "guard-xref-validate-recovery-v1"
+DEFAULT_GUARD_RECOVERY_RATIO = 0.18
 
 
 SEARCH_TOOLS = frozenset({
@@ -259,3 +264,260 @@ def build_recovery_trajectory(record, prepared_transcript, steps, catalog, env_f
     for row in new_steps:
         row["recovery"] = deepcopy(meta)
     return new_steps, meta
+
+
+def sample_selected_for_guard_recovery(
+    sample_id: str,
+    ratio: float = DEFAULT_GUARD_RECOVERY_RATIO,
+    seed: int = 42,
+) -> bool:
+    """Deterministically select a fraction of sample IDs using SHA-256."""
+    if not 0.0 <= ratio <= 1.0:
+        raise ValueError("guard_recovery_ratio must be between 0 and 1")
+    if ratio == 0.0:
+        return False
+    if ratio == 1.0:
+        return True
+    digest = hashlib.sha256(f"{seed}:{sample_id}:guard_recovery".encode("utf-8")).hexdigest()
+    return (int(digest[:8], 16) / 0x100000000) < ratio
+
+
+def _unobserved_xref_keys(args: dict, spec: dict, observed_ids: dict[str, set[str]]) -> list[tuple[str, str]]:
+    props = (spec.get("parameters") or {}).get("properties") or {}
+    unobserved: list[tuple[str, str]] = []
+    for key, val in (args or {}).items():
+        prop = props.get(key)
+        if not isinstance(prop, dict) or not prop.get("x-ref"):
+            continue
+        ref_app = str(prop["x-ref"]).split(".", 1)[0]
+        if not isinstance(val, str) or val not in observed_ids.get(ref_app, set()):
+            unobserved.append((key, ref_app))
+    return unobserved
+
+
+def _xref_placeholder(read_args: dict, ref_app: str, observed_ids: dict[str, set[str]]) -> str:
+    seen = observed_ids.get(ref_app, set())
+    if isinstance(read_args, dict):
+        q = read_args.get("query")
+        if isinstance(q, str) and q.strip() and q.strip() not in seen:
+            return q.strip()
+        for val in read_args.values():
+            if isinstance(val, str) and val.strip() and val.strip() not in seen:
+                return val.strip()
+    placeholder = "chua_xac_dinh"
+    while placeholder in seen:
+        placeholder += "_x"
+    return placeholder
+
+
+class _ValidateOnlyEnv:
+    """Read-only wrapper that forbids `env.call` during guard probing."""
+
+    def __init__(self, env):
+        self._env = env
+
+    def validate(self, name, arguments):
+        return self._env.validate(name, arguments)
+
+    def call(self, name, arguments):
+        raise AssertionError(f"Guard probe must never execute env.call({name!r})")
+
+
+def _probe_guard_rejection(env, name: str, bad_args: dict, catalog, enabled, spec: dict, observed_ids: dict[str, set[str]], call_index: int):
+    if precheck_call(name, bad_args, catalog, enabled, LoopMonitor()) is not None:
+        return None
+    validation = env.validate(name, bad_args)
+    accepted = isinstance(validation, dict) and validation.get("ok") is True
+    if accepted and check_observed_xref(bad_args, spec, observed_ids) is None:
+        return None
+    outcome = attempt_env_call(
+        _ValidateOnlyEnv(env),
+        name,
+        bad_args,
+        spec.get("kind", "unknown"),
+        LoopMonitor(),
+        call_index,
+        spec=spec,
+        observed_ids=observed_ids,
+    )
+    if outcome.get("executed"):
+        return None
+    return outcome.get("feedback")
+
+
+def _parse_json_obj(value):
+    if isinstance(value, str):
+        try:
+            return json.loads(value)
+        except ValueError:
+            return None
+    return value if isinstance(value, dict) else None
+
+
+def build_guard_recovery_examples(
+    record: dict,
+    prepared_transcript: dict,
+    steps: list[dict],
+    catalog: dict[str, dict],
+    env_or_factory,
+    *,
+    ratio: float = DEFAULT_GUARD_RECOVERY_RATIO,
+    seed: int = 42,
+    max_examples_per_trajectory: int = 1,
+) -> list[dict]:
+    """Build standalone 1-step `full_trajectory=False` recovery SFT rows from real guard rejections.
+
+    Uses already-replayed step observations + read-only `env.validate` probing so no extra
+    `ToolEnv` instances or `env.call` side effects occur.
+
+    Covers two genuine failure modes:
+    1. `xref_guard`: LLM proposes a `write` call with an unobserved/raw `x-ref` argument before
+       calling the prerequisite `read` tool -> teaches reading `agent_feedback` and calling the read tool.
+    2. `validate`: LLM proposes an env call missing a required parameter or using an invalid enum
+       -> teaches reading `agent_feedback` and immediately correcting the call.
+    """
+    if max_examples_per_trajectory < 1 or not steps:
+        return []
+    if not sample_selected_for_guard_recovery(str(record["id"]), ratio, seed):
+        return []
+
+    env = env_or_factory() if callable(env_or_factory) else env_or_factory
+    context = record.get("context", {})
+    enabled = allowed_tools(catalog, context.get("installed_apps", {}))
+    local_names = set(helper_tool_schemas())
+    transcript = prepared_transcript["transcript"]
+    history = prepared_transcript["history"]
+    observed_ids = extract_observed_ids(context, history)
+
+    call_index = 0
+    results: list[dict] = []
+
+    for idx, step in enumerate(steps):
+        decision = json.loads(step["messages"][-1]["content"])
+        if decision.get("action") != "call":
+            continue
+        name = decision.get("name")
+        args = decision.get("arguments") or {}
+        if name in local_names or name not in enabled:
+            continue
+
+        spec = enabled[name]
+        kind = spec.get("kind", "unknown")
+        obs_at_k = json.loads(step["messages"][1]["content"])["previous_actions_and_results"]
+        next_obs_result = None
+        if idx + 1 < len(steps):
+            next_obs = json.loads(steps[idx + 1]["messages"][1]["content"])["previous_actions_and_results"]
+            if len(next_obs) > idx:
+                next_obs_result = _parse_json_obj(next_obs[idx].get("result"))
+
+        if len(results) < max_examples_per_trajectory and kind == "read":
+            read_adds_ids: dict[str, set[str]] = deepcopy(observed_ids)
+            read_app = name.split(".", 1)[0]
+            if isinstance(next_obs_result, dict) and next_obs_result.get("ok") is True and next_obs_result.get("done") is not False:
+                collect_ids(next_obs_result, read_adds_ids, read_app)
+
+            for future in steps[idx + 1:]:
+                f_dec = json.loads(future["messages"][-1]["content"])
+                if f_dec.get("action") != "call":
+                    continue
+                f_name = f_dec.get("name")
+                f_args = f_dec.get("arguments") or {}
+                if f_name not in enabled or enabled[f_name].get("kind") != "write":
+                    continue
+                missing_xrefs = _unobserved_xref_keys(f_args, enabled[f_name], observed_ids)
+                if not missing_xrefs:
+                    continue
+                relevant = any(
+                    (f_args.get(rk) in read_adds_ids.get(ra, set())) or ra == read_app
+                    for rk, ra in missing_xrefs
+                )
+                if not relevant:
+                    continue
+                bad_args = deepcopy(f_args)
+                for ref_key, ref_app in missing_xrefs:
+                    bad_args[ref_key] = _xref_placeholder(args, ref_app, observed_ids)
+                feedback = _probe_guard_rejection(
+                    env, f_name, bad_args, catalog, enabled, enabled[f_name], observed_ids, call_index
+                )
+                if feedback and feedback.get("stage") in ("xref_guard", "validate"):
+                    obs_with_error = deepcopy(obs_at_k) + [feedback]
+                    _, prompt = build_step_prompt(transcript, context, history, enabled, obs_with_error)
+                    results.append({
+                        "sample_id": record["id"],
+                        "step": 0,
+                        "full_trajectory": False,
+                        "train": True,
+                        "transcript_source": prepared_transcript.get("transcript_source"),
+                        "recovery": {
+                            "kind": "guard_xref",
+                            "stage": feedback["stage"],
+                            "failed_tool": f_name,
+                            "target_tool": name,
+                        },
+                        "messages": [
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "user", "content": prompt},
+                            {"role": "assistant", "content": json.dumps(decision, ensure_ascii=False, separators=(",", ":"))},
+                        ],
+                    })
+                    break
+
+        if len(results) < max_examples_per_trajectory and kind == "write" and name != "sys.ask_missing_info":
+            params_schema = spec.get("parameters") or {}
+            props = params_schema.get("properties") or {}
+            required = list(params_schema.get("required") or [])
+            bad_args = None
+            mutation_kind = None
+            non_xref_req = [
+                r for r in required
+                if r in args and not (isinstance(props.get(r), dict) and props[r].get("x-ref"))
+            ]
+            if non_xref_req:
+                bad_args = deepcopy(args)
+                bad_args.pop(non_xref_req[-1])
+                mutation_kind = "missing_required"
+            else:
+                enum_keys = [
+                    k for k, p in props.items()
+                    if k in args and isinstance(p, dict) and isinstance(p.get("enum"), list) and p["enum"]
+                ]
+                if enum_keys:
+                    bad_args = deepcopy(args)
+                    bad_args[enum_keys[0]] = "__invalid_enum_value__"
+                    mutation_kind = "invalid_enum"
+            if bad_args is not None:
+                feedback = _probe_guard_rejection(
+                    env, name, bad_args, catalog, enabled, spec, observed_ids, call_index
+                )
+                if feedback and feedback.get("stage") == "validate":
+                    obs_with_error = deepcopy(obs_at_k) + [feedback]
+                    _, prompt = build_step_prompt(transcript, context, history, enabled, obs_with_error)
+                    results.append({
+                        "sample_id": record["id"],
+                        "step": 0,
+                        "full_trajectory": False,
+                        "train": True,
+                        "transcript_source": prepared_transcript.get("transcript_source"),
+                        "recovery": {
+                            "kind": "guard_validate",
+                            "mutation": mutation_kind,
+                            "stage": "validate",
+                            "failed_tool": name,
+                            "target_tool": name,
+                        },
+                        "messages": [
+                            {"role": "system", "content": SYSTEM_PROMPT},
+                            {"role": "user", "content": prompt},
+                            {"role": "assistant", "content": json.dumps(decision, ensure_ascii=False, separators=(",", ":"))},
+                        ],
+                    })
+
+        # Update observed_ids cleanly using the already-replayed step output.
+        if isinstance(next_obs_result, dict) and next_obs_result.get("ok") is True and next_obs_result.get("done") is not False:
+            app = name.split(".", 1)[0]
+            collect_ids(next_obs_result, observed_ids, app)
+            if kind == "write":
+                collect_ids(args, observed_ids, app)
+        call_index += 1
+
+    return results

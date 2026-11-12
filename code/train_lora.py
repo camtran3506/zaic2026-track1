@@ -11,6 +11,7 @@ from lifemate.sft import AssistantCollator, SupervisedDataset, file_sha256, vali
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device, model_device_map
 from lifemate.context import MAX_CONTEXT_TOKENS, validate_training_length
 from lifemate.llm import is_qwen35, model_loader, lora_targets, configure_tokenizer
+from lifemate.reasoning import DEFAULT_REASONING_WEIGHT
 from lifemate.runtime import (make_runtime_manifest, runtime_save_callback,
                               save_runtime_manifest, training_dtype)
 from lifemate.numerics import NUMERICS_POLICY, guarded_trainer_class
@@ -132,6 +133,8 @@ def main():
     p.add_argument("--learning-rate", type=float, default=1e-4)
     p.add_argument("--fuzzy-weight", type=float, default=0.3,
                    help="Loss weight on x-match=fuzzy parameter value spans (0..1; 1.0 disables downweighting)")
+    p.add_argument("--reasoning-weight", type=float, default=DEFAULT_REASONING_WEIGHT,
+                   help="Loss weight on short checked reasoning tokens inside <think>...</think> (0..1; 1.0 disables downweighting)")
     p.add_argument("--lora-r", type=int, default=16)
     p.add_argument("--lora-alpha", type=int, default=32)
     p.add_argument("--lora-dropout", type=float, default=0.0, help="0 enables Unsloth optimized LoRA kernels")
@@ -143,6 +146,8 @@ def main():
     args = p.parse_args()
     if not math.isfinite(args.fuzzy_weight) or not 0.0 <= args.fuzzy_weight <= 1.0:
         p.error("--fuzzy-weight must be between 0.0 and 1.0")
+    if not math.isfinite(args.reasoning_weight) or not 0.0 <= args.reasoning_weight <= 1.0:
+        p.error("--reasoning-weight must be between 0.0 and 1.0")
     validate_training_length(args.max_length)
     configure_cuda_device(args)
     # Unsloth must patch Transformers/PEFT BEFORE either is imported.
@@ -205,9 +210,11 @@ def main():
     if {e["sample_id"] for e in examples} != set(manifest["partitions"]["train"]["sample_ids"]):
         raise ValueError("train sample IDs disagree with manifest")
     fuzzy_arg = None if args.fuzzy_weight >= 1.0 else args.fuzzy_weight
+    reasoning_arg = None if args.reasoning_weight >= 1.0 else args.reasoning_weight
     train_data = SupervisedDataset(examples, tokenizer, args.max_length,
                                    include_debug_metadata=True, source_path=path,
-                                   fuzzy_weight=fuzzy_arg)
+                                   fuzzy_weight=fuzzy_arg,
+                                   reasoning_weight=reasoning_arg)
     runtime = make_runtime_manifest(args.base_model, tokenizer, seed=args.seed)
     run_config = {
         **{k: str(v.resolve()) if isinstance(v, Path) else v for k, v in vars(args).items()},

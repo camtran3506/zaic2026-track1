@@ -16,9 +16,11 @@ Defaults: `Qwen/Qwen3.5-4B` (~4.0B, Apache-2.0) and `g-group-ai-lab/gipformer1.5
 
 Qwen3.5 uses its native conditional-generation checkpoint through
 `AutoModelForImageTextToText`, with text-only prompts. The same loader is used for
-inference, Transformers fine-tuning and adapter merge. The chat template uses
-`enable_thinking=False` consistently in inference and SFT for direct native tool calls
-within the existing token budget. Unsloth uses
+inference, Transformers fine-tuning and adapter merge. Inference uses
+`enable_thinking=False` and `--thinking-budget 0` by default, with all 384 generated
+tokens available for the decision or tool call. SFT preparation enables checked
+reasoning by default (`--short-reasoning`); `--no-short-reasoning` disables it.
+SFT reasoning targets do not enable thinking during inference. Unsloth uses
 `FastVisionModel`; LoRA targets only language attention/MLP projections. Stage
 Qwen3.5 weights in a fresh directory and train a new adapter; Qwen3 adapters
 are incompatible. Other inference and training budgets are unchanged.
@@ -65,8 +67,9 @@ remain work for that migration.
 ## Native function calling for Qwen3.5-4B
 
 For [Qwen/Qwen3.5-4B](https://huggingface.co/Qwen/Qwen3.5-4B), inference and SFT
-use the **checkpoint tokenizer's own chat template** with `tools=...` and
-`enable_thinking=False`. Each tool is passed as
+use the **checkpoint tokenizer's own chat template** with `tools=...`.
+Inference uses `enable_thinking=False`; SFT retains the supplied checked reasoning
+in assistant targets. Each tool is passed as
 `{"type":"function","function": <prompt schema>}`. Every allowed tool and all
 argument constraints are retained; the conservative metadata compaction below
 applies equally to SFT and inference. Prior calls become assistant `tool_calls`, and their real results
@@ -696,6 +699,7 @@ By default `docker run ... lifemate:baseline` targets **private_test** at `/data
 | `--asr-threads` | GIPformer CPU threads; greedy decoding | 4 |
 | `--max-input-tokens` | maximum prompt tokens | 16000 |
 | `--max-new-tokens` | per-agent-step generated tokens | 384 |
+| `--thinking-budget` | optional thinking tokens per step; 0 disables thinking | 0 |
 | `--max-calls` | maximum executed tools/sample | 8 |
 | `--max-invalid` | maximum invalid model plans | 3 |
 | `--sample-seconds` | optional LLM cooperative budget; inf disables it | inf |

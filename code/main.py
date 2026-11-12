@@ -24,7 +24,8 @@ os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
 from lifemate.catalog import load_catalog
 from lifemate.agent import AgentConfig, LifeMateAgent
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
-from lifemate.context import DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_NEW_TOKENS, validate_inference_budget
+from lifemate.context import (DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_NEW_TOKENS,
+                              DEFAULT_THINKING_BUDGET, validate_inference_budget)
 from lifemate.runtime import DEFAULT_LLM_DTYPE
 from lifemate.schema_cache import DEFAULT_SCHEMA_CACHE_MB, cache_budget_mb
 
@@ -70,6 +71,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--llm-dtype", default=DEFAULT_LLM_DTYPE, choices=["float16", "bfloat16", "float32"])
     p.add_argument("--max-input-tokens", type=int, default=DEFAULT_MAX_INPUT_TOKENS)
     p.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
+    p.add_argument("--thinking-budget", type=int, default=DEFAULT_THINKING_BUDGET,
+                   help="Per-turn <think> token cap when time and context allow (default: 0, thinking disabled)")
+    p.add_argument("--thinking-reserve-seconds", type=float, default=2.0,
+                   help="Additional remaining-time buffer required before opening <think>")
     p.add_argument("--max-calls", type=int, default=8)
     p.add_argument("--max-invalid", type=int, default=3)
     p.add_argument("--sample-seconds", type=float, default=float("inf"),
@@ -187,6 +192,8 @@ def run_llm_stage(args, items, transcript_rows, split_dir, env_root):
                    schema_cache_eager=enable_schedule)
     cfg = AgentConfig(max_calls=args.max_calls, max_invalid=args.max_invalid,
                       sample_seconds=args.sample_seconds,
+                      thinking_budget=getattr(args, "thinking_budget", DEFAULT_THINKING_BUDGET),
+                      thinking_reserve_seconds=getattr(args, "thinking_reserve_seconds", 2.0),
                       use_train_transcript=args.use_train_transcript)
     if args.use_train_transcript and args.split != "train":
         raise ValueError("--use-train-transcript is forbidden for test splits")
@@ -260,6 +267,10 @@ def main() -> None:
         raise ValueError("--use-train-transcript is forbidden for test splits")
     if args.limit < 0 or math.isnan(args.sample_seconds) or args.sample_seconds <= 0:
         raise ValueError("Use nonnegative --limit and positive --sample-seconds (inf = unlimited)")
+    if args.thinking_budget < 0:
+        raise ValueError("--thinking-budget must be non-negative")
+    if math.isnan(args.thinking_reserve_seconds) or args.thinking_reserve_seconds < 0:
+        raise ValueError("--thinking-reserve-seconds must be finite and non-negative")
     if args.stage in ("full", "asr") and args.asr_model is None:
         raise ValueError("--asr-model is required for the ASR stage")
     if args.stage in ("full", "llm") and args.llm_model is None:

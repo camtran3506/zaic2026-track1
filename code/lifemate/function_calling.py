@@ -49,8 +49,8 @@ def _json(value):
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
 
 
-def tool_call_message(name, arguments, content=""):
-    return {"role": "assistant", "content": content, "reasoning_content": "",
+def tool_call_message(name, arguments, content="", reasoning_content=""):
+    return {"role": "assistant", "content": content, "reasoning_content": reasoning_content,
             "tool_calls": [{"type": "function", "function": {
                 "name": name, "arguments": deepcopy(arguments)}}]}
 
@@ -118,16 +118,19 @@ def native_chat(messages):
         if len(messages) != 3 or messages[2]["role"] != "assistant":
             raise ValueError("Expected one portable assistant target")
         target = json.loads(messages[2]["content"])
+        reasoning_content = messages[2].get("reasoning_content") or ""
         if target["action"] == "call":
-            chat.append(tool_call_message(target["name"], target["arguments"]))
+            chat.append(tool_call_message(target["name"], target["arguments"],
+                                          reasoning_content=reasoning_content))
         elif target["action"] == "done":
-            chat.append({"role": "assistant", "content": _json(target), "reasoning_content": ""})
+            chat.append({"role": "assistant", "content": _json(target),
+                         "reasoning_content": reasoning_content})
         else:
             raise ValueError("Native SFT supports call/done targets only")
     return chat, tools
 
 
-def template_inputs(tokenizer, messages):
+def template_inputs(tokenizer, messages, *, enable_thinking=None):
     kwargs = dict(getattr(tokenizer, "lifemate_template_kwargs", {}))
     if getattr(tokenizer, "lifemate_native_fc", False) is True:
         messages, tools = native_chat(messages)
@@ -136,11 +139,20 @@ def template_inputs(tokenizer, messages):
             if "tool_calls" not in template or "tools" not in template:
                 raise ValueError("Qwen3.5 checkpoint chat template must support tools and tool_calls")
             kwargs["tools"] = tools
+        if enable_thinking is not None:
+            kwargs["enable_thinking"] = bool(enable_thinking)
     return messages, kwargs
 
 
-def visible_output(text):
+def visible_output(text, *, thinking_opened: bool = False):
     """Ignore leading reasoning without rewriting literal markers in arguments."""
+    if thinking_opened:
+        stripped = text.lstrip()
+        if not stripped.startswith("<think>"):
+            end = text.find("</think>")
+            if end < 0:
+                return ""
+            text = text[end + len("</think>"):]
     text = text.lstrip()
     while text.startswith("<think>"):
         end = text.find("</think>")

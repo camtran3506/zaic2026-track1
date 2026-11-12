@@ -8,7 +8,10 @@ import sys
 from main import resolve_data_layout
 from lifemate.agent import _train_transcript
 from lifemate.catalog import load_catalog
-from lifemate.recovery import build_recovery_trajectory
+from lifemate.reasoning import (DEFAULT_REASONING_STEPWISE_RATIO, DEFAULT_SHORT_REASONING, REASONING_POLICY,
+                                attach_reasoning_to_trajectory, select_reasoning_stepwise_rows)
+from lifemate.recovery import (DEFAULT_GUARD_RECOVERY_RATIO, GUARD_RECOVERY_POLICY,
+                               build_guard_recovery_examples, build_recovery_trajectory)
 from lifemate.sft import (DEFAULT_ASR_TRANSCRIPT_RATIO, SFT_PROMPT_POLICY, VALIDATION_ROLLOUT_POLICY, UnexposedToolError,
                          asr_transcript_ratio, assign_transcript_sources, collapse_trajectory, file_sha256,
                          is_asr_argument_damaged, prepare_train_transcript, prepare_validation_transcripts,
@@ -48,6 +51,15 @@ def main():
                    help="Demonstrate calendar_reference / date helper calls despite user_context.date_reference")
     p.add_argument("--no-inject-recovery", dest="inject_recovery", action="store_false",
                    help="Disable injecting failed-search + recovery trajectories on eligible TRAIN samples")
+    p.add_argument("--no-inject-guard-recovery", dest="inject_guard_recovery", action="store_false",
+                   help="Disable injecting xref_guard/validate self-correction step-wise rows on TRAIN samples")
+    p.add_argument("--guard-recovery-ratio", type=float, default=DEFAULT_GUARD_RECOVERY_RATIO,
+                   help="Deterministic hash ratio of eligible TRAIN samples for guard self-correction rows (0..1)")
+    p.add_argument("--short-reasoning", action=argparse.BooleanOptionalAction,
+                   default=DEFAULT_SHORT_REASONING,
+                   help="Add Short Checked Reasoning inside <think>...</think> (default: enabled)")
+    p.add_argument("--reasoning-stepwise-ratio", type=float, default=DEFAULT_REASONING_STEPWISE_RATIO,
+                   help="Fraction of intermediate call turns emitted as step-wise <think> rows in full-trajectory mode")
     p.add_argument("--step-wise-sft", action="store_true",
                    help="Keep separate per-step SFT rows instead of full-trajectory packing")
     p.add_argument("--asr-model", type=Path, help="Required when using ASR transcripts or standalone diagnostic splits")
@@ -70,6 +82,10 @@ def main():
     validate_training_length(args.max_length)
     if args.asr_batch_size < 1:
         p.error("--asr-batch-size must be positive")
+    if not 0.0 <= args.guard_recovery_ratio <= 1.0:
+        p.error("--guard-recovery-ratio must be between 0 and 1")
+    if not 0.0 <= args.reasoning_stepwise_ratio <= 1.0:
+        p.error("--reasoning-stepwise-ratio must be between 0 and 1")
     if (args.rename_variants or args.distractor_probability) and args.tokenizer is None:
         p.error("--tokenizer is required for app/tool augmentation")
     if args.asr_model is None and (args.asr_transcript_ratio > 0 or args.validation_fraction > 0
@@ -140,6 +156,8 @@ def main():
                     schema_prompt_policy=SCHEMA_PROMPT_POLICY,
                     specialist_training_policy=SPECIALIST_TRAINING_POLICY,
                     temporal_helper_training_policy=TEMPORAL_TRAINING_POLICY,
+                    reasoning_policy=REASONING_POLICY,
+                    guard_recovery_policy=GUARD_RECOVERY_POLICY,
                     transcript_mixing={"policy": "seeded-sample-v1", "unit": "sample",
                                        "asr_ratio": args.asr_transcript_ratio, "seed": args.seed,
                                        "rounding": ("nearest-total" if not validation and not partitions['app_heldout'] else
@@ -157,6 +175,10 @@ def main():
         'transcript_mode': args.transcript_mode,
         'include_date_helpers': args.include_date_helpers,
         'inject_recovery': args.inject_recovery,
+        'inject_guard_recovery': args.inject_guard_recovery,
+        'guard_recovery_ratio': args.guard_recovery_ratio,
+        'short_reasoning': args.short_reasoning,
+        'reasoning_stepwise_ratio': args.reasoning_stepwise_ratio,
     }
     rollout_rows = {"validation": [], "app_heldout": []}
     for partition, rows in partitions.items():
@@ -181,6 +203,8 @@ def main():
         count = 0
         trajectory_count = 0
         recovery_count = 0
+        guard_recovery_count = 0
+        reasoning_stepwise_count = 0
         helper_count = 0
         batch_count = 0
         ungrouped_count = 0
@@ -236,11 +260,11 @@ def main():
                             "clean_prepared_transcript": clean_prepared,
                             "gold_tool_calls": record["label"]["tool_calls"], "gold_state_hash": gold_hash,
                         })
-                    variant_runs.append((prepared, examples))
+                    variant_runs.append((prepared, examples, env))
                 if sample_skipped or not variant_runs:
                     continue
                 retained_ids.append(record["id"])
-                for prepared, examples in variant_runs:
+                for prepared, examples, variant_env in variant_runs:
                     if partition == 'train':
                         for example in examples:
                             assert_no_heldout(example, holdout['apps'])
@@ -269,6 +293,8 @@ def main():
                     ungrouped_count += sum(len(t) for t, _ in trajectories)
                     for traj, is_recovery in trajectories:
                         grouped = traj if is_recovery else group_examples(traj, tokenizer=tokenizer, max_length=args.max_length)
+                        if args.short_reasoning:
+                            grouped = attach_reasoning_to_trajectory(grouped)
                         for example in grouped:
                             target = json.loads(example["messages"][-1]["content"])
                             if target.get('name') == BATCH_TOOL:
@@ -281,12 +307,37 @@ def main():
                                     helper_count += 1
                                     helper_counts[child['name']] += 1
                             example["transcript_source"] = prepared["transcript_source"]
-                        rows_to_write = [collapse_trajectory(grouped)] if full_trajectory_sft else grouped
+                        if full_trajectory_sft:
+                            rows_to_write = [collapse_trajectory(grouped)]
+                            if (partition == "train" and args.short_reasoning
+                                    and args.reasoning_stepwise_ratio > 0):
+                                extra_stepwise = select_reasoning_stepwise_rows(
+                                    grouped, ratio=args.reasoning_stepwise_ratio, seed=args.seed,
+                                )
+                                rows_to_write.extend(extra_stepwise)
+                                reasoning_stepwise_count += len(extra_stepwise)
+                        else:
+                            rows_to_write = grouped
                         trajectory_count += 1
                         written_source_counts[prepared["transcript_source"]] += 1
                         for row_out in rows_to_write:
                             row_out["transcript_source"] = prepared["transcript_source"]
                             f.write(json.dumps(row_out, ensure_ascii=False) + "\n")
+                            count += 1
+                    if partition == "train" and args.inject_guard_recovery and args.guard_recovery_ratio > 0:
+                        guard_rows = build_guard_recovery_examples(
+                            record, prepared, examples, catalog,
+                            variant_env,
+                            ratio=args.guard_recovery_ratio, seed=args.seed,
+                        )
+                        for g_row in guard_rows:
+                            assert_no_heldout(g_row, holdout['apps'])
+                        if args.short_reasoning and guard_rows:
+                            guard_rows = attach_reasoning_to_trajectory(guard_rows)
+                        guard_recovery_count += len(guard_rows)
+                        for g_row in guard_rows:
+                            g_row["transcript_source"] = prepared["transcript_source"]
+                            f.write(json.dumps(g_row, ensure_ascii=False) + "\n")
                             count += 1
                 print(f"{partition}: {i+1}/{len(rows)} samples, {count} SFT rows", flush=True)
         if not retained_ids:
@@ -301,6 +352,8 @@ def main():
             transcript_source_counts=source_summary,
             requested_transcript_source_counts=requested_counts,
             examples=count, trajectories=trajectory_count, recovery_trajectories=recovery_count,
+            guard_recovery_examples=guard_recovery_count,
+            reasoning_stepwise_examples=reasoning_stepwise_count,
             asr_damaged_filtered=asr_damaged_filtered,
             ungrouped_examples=ungrouped_count, batch_examples=batch_count,
             local_helper_examples=helper_count,

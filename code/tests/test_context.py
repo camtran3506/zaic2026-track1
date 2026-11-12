@@ -17,10 +17,11 @@ def test_inference_defaults_match_training_context(monkeypatch):
     monkeypatch.setattr(sys, 'argv', ['main.py', '--data-root', 'data'])
     args = parse_args()
     assert (args.max_input_tokens, args.max_new_tokens) == (16000, 384)
+    assert args.thinking_budget == 0
     assert args.max_input_tokens + args.max_new_tokens == MAX_CONTEXT_TOKENS
 
 
-@pytest.mark.parametrize('budgets', [(16000, 385), (16384, 1), (0, 384), (16000, -1)])
+@pytest.mark.parametrize('budgets', [(15872, 513), (16000, 385), (16384, 1), (0, 512), (15872, -1)])
 def test_invalid_budget_fails_before_dataset_or_model_loading(budgets):
     result = subprocess.run([sys.executable, APP / 'main.py', '--data-root', 'missing',
         '--max-input-tokens', str(budgets[0]), '--max-new-tokens', str(budgets[1])],

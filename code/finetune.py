@@ -9,6 +9,8 @@ import sys
 
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
 from lifemate.sft import DEFAULT_ASR_TRANSCRIPT_RATIO, asr_transcript_ratio
+from lifemate.reasoning import DEFAULT_REASONING_STEPWISE_RATIO, DEFAULT_SHORT_REASONING
+from lifemate.recovery import DEFAULT_GUARD_RECOVERY_RATIO
 from lifemate.data_generalization import add_arguments, validate_options
 from lifemate.context import MAX_CONTEXT_TOKENS, validate_training_length
 
@@ -29,6 +31,15 @@ def main():
                    help="Demonstrate calendar_reference / date helper calls despite user_context.date_reference")
     p.add_argument("--no-inject-recovery", dest="inject_recovery", action="store_false",
                    help="Disable injecting failed-search + recovery trajectories on eligible TRAIN samples")
+    p.add_argument("--no-inject-guard-recovery", dest="inject_guard_recovery", action="store_false",
+                   help="Disable injecting xref_guard/validate self-correction step-wise rows on TRAIN samples")
+    p.add_argument("--guard-recovery-ratio", type=float, default=DEFAULT_GUARD_RECOVERY_RATIO,
+                   help="Deterministic hash ratio of eligible TRAIN samples for guard self-correction rows (0..1)")
+    p.add_argument("--short-reasoning", action=argparse.BooleanOptionalAction,
+                   default=DEFAULT_SHORT_REASONING,
+                   help="Add Short Checked Reasoning inside <think>...</think> (default: enabled)")
+    p.add_argument("--reasoning-stepwise-ratio", type=float, default=DEFAULT_REASONING_STEPWISE_RATIO,
+                   help="Fraction of intermediate call turns emitted as step-wise <think> rows in full-trajectory mode")
     p.add_argument("--step-wise-sft", action="store_true",
                    help="Keep separate per-step SFT rows instead of full-trajectory packing")
     p.add_argument("--asr-device", choices=["cpu"], default="cpu")
@@ -91,6 +102,11 @@ def main():
         prepare.append("--include-date-helpers")
     if not args.inject_recovery:
         prepare.append("--no-inject-recovery")
+    if not args.inject_guard_recovery:
+        prepare.append("--no-inject-guard-recovery")
+    prepare.extend(["--guard-recovery-ratio", args.guard_recovery_ratio])
+    prepare.append("--short-reasoning" if args.short_reasoning else "--no-short-reasoning")
+    prepare.extend(["--reasoning-stepwise-ratio", args.reasoning_stepwise_ratio])
     if args.step_wise_sft:
         prepare.append("--step-wise-sft")
     prepare.extend(['--tokenizer', base, '--max-length', args.max_length,

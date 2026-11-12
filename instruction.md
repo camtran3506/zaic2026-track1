@@ -28,6 +28,7 @@ LifeMate hoạt động theo nguyên lý **2 giai đoạn độc lập tuyệt �
 2. **Giai đoạn LLM (Chữ viết -> Tool Execution Agent):**
    - Sử dụng mô hình `Qwen/Qwen3.5-4B` tải ở định dạng `bfloat16` kết hợp LoRA Adapter.
    - Tự động nạp `user_context` (bao gồm `date_reference` tính sẵn và danh mục app), kết hợp dynamic prefix caching, schema snapshot caching.
+   - Inference mặc định **tắt thinking** (`enable_thinking=False`, `thinking_budget=0`): tối đa **16.000 input / 384 output tokens** mỗi lượt, không cấp riêng 256 token thinking. Dữ liệu SFT mặc định **bật Short Checked Reasoning** trong thẻ `<think>` để huấn luyện.
    - Tương tác nhiều lượt với môi trường công cụ (Tool Environment) cho đến khi ra kết quả cuối cùng hoặc đạt giới hạn số bước.
 
 ### 1.2. Cấu trúc cây thư mục chuẩn
@@ -205,13 +206,15 @@ Quá trình fine-tune LLM huấn luyện mô hình `Qwen3.5-4B` thực hiện g�
 Pipeline đã tích hợp toàn bộ các kỹ thuật tối ưu hóa cao nhất:
 - **Full-Trajectory SFT:** Gộp toàn bộ các lượt gọi công cụ của 1 mẫu thành 1 trajectory liền mạch.
 - **Dual Gold + ASR (`--transcript-mode dual`):** Nhân đôi dữ liệu với 100% bản chép lời chuẩn (Gold) và 100% bản nhận dạng giọng nói ASR.
-- **Weighted Loss Trainer (`--fuzzy-weight 0.3`):** Giảm trọng số phạt sai sót trên các tham số tìm kiếm mờ (`fuzzy`), tập trung độ chính xác vào tên hàm và tham số khóa (`exact`).
+- **Weighted Loss Trainer (`--fuzzy-weight 0.3`, `--reasoning-weight 0.25`):** Giảm trọng số phạt sai sót trên các tham số tìm kiếm mờ (`fuzzy`) và token reasoning, ưu tiên độ chính xác của lệnh gọi công cụ (`tool_call`).
 - **Lọc ASR lỗi nặng (`--filter-damaged-asr`):** Bỏ qua các bản sao ASR nếu bị ASR làm mất hoàn toàn tham số thực thi chuẩn.
 - **Search Recovery Trajectories:** Bổ sung kịch bản xử lý tự phục hồi khi kết quả tìm kiếm rỗng.
+- **Self-Correction Guard Recovery (`--guard-recovery-ratio 0.18`):** Bổ sung các mẫu phục hồi đơn bước khi gặp từ chối từ guard (`xref_guard` và schema `validate`), dạy mô hình phản xạ sửa lỗi chính xác trong 3 lượt `max_invalid` khi suy luận.
+- **Short Checked Reasoning mặc định bật (`--short-reasoning`):** Dữ liệu SFT thêm dòng reasoning ngắn đã kiểm chứng và các mẫu reasoning từng bước. Khi inference vẫn dùng `enable_thinking=False`, `thinking_budget=0`.
 - **Pre-computed `date_reference`:** Tự động giải quyết thời gian biểu mà không cần sinh các lệnh gọi helper thời gian dư thừa.
 
 ### 5.1. Chạy Fine-tune LLM toàn diện bằng `nohup` (Khuyên dùng)
-Chạy kịch bản 1 lệnh [`finetune.py`](file:///mnt/mmlab2024nas/trantran/lifemate/code/finetune.py):
+Chạy kịch bản 1 lệnh [`finetune.py`](code/finetune.py) (mặc định kích hoạt Guard Recovery và Short Checked Reasoning):
 
 ```bash
 cd /mnt/mmlab2024nas/trantran/lifemate/code
@@ -220,7 +223,7 @@ nohup /usr/bin/python3.12 finetune.py \
   --cuda-visible-devices 0 \
   --data-root /mnt/mmlab2024nas/trantran/lifemate/train+public_test \
   --base-model /mnt/mmlab2024nas/trantran/lifemate/code/models/llm \
-  --output-dir /mnt/mmlab2024nas/trantran/lifemate/code/result/run_sft_dual \
+  --output-dir /mnt/mmlab2024nas/trantran/lifemate/code/result/run_sft_noreason \
   --asr-model /mnt/mmlab2024nas/trantran/lifemate/code/models/asr \
   --transcript-mode dual \
   --asr-transcript-ratio 0.5 \
@@ -229,6 +232,8 @@ nohup /usr/bin/python3.12 finetune.py \
   --asr-beam-size 4 \
   --filter-damaged-asr \
   --fuzzy-weight 0.3 \
+  --guard-recovery-ratio 0.18 \
+  --no-short-reasoning \
   --epochs 2 \
   --batch-size 1 \
   --gradient-accumulation 8 \
@@ -237,7 +242,7 @@ nohup /usr/bin/python3.12 finetune.py \
   --lora-alpha 32 \
   --lora-dropout 0.0 \
   --save-strategy epoch \
-  > /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/train_llm.log 2>&1 &
+  > /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/train_llm3.log 2>&1 &
 ```
 
 *Kiểm tra tiến trình:*
@@ -262,6 +267,8 @@ cd /mnt/mmlab2024nas/trantran/lifemate/code
   --transcript-mode dual \
   --asr-transcript-ratio 0.5 \
   --filter-damaged-asr \
+  --guard-recovery-ratio 0.18 \
+  --short-reasoning \
   --validation-fraction 0.0
 ```
 
@@ -321,7 +328,7 @@ nohup env \
   PYTHON_BIN="/usr/bin/python3.12" \
   DATA_ROOT="/mnt/mmlab2024nas/trantran/lifemate/train+public_test" \
   SPLIT="public_test" \
-  OUTPUT="/mnt/mmlab2024nas/trantran/lifemate/code/result/submission.jsonl" \
+  OUTPUT="/mnt/mmlab2024nas/trantran/lifemate/code/result/submission1.jsonl" \
   TRANSCRIPT_CACHE="/mnt/mmlab2024nas/trantran/lifemate/code/result/transcripts.jsonl" \
   DEVICE="cuda" \
   bash run_server.sh \
@@ -333,7 +340,7 @@ nohup env \
   --prefix-cache auto \
   --schema-cache auto \
   --sample-schedule schema \
-  > /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/inference_server.log 2>&1 &
+  > /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/inference_server1.log 2>&1 &
 ```
 
 *Theo dõi tiến độ:*
@@ -369,6 +376,7 @@ nohup /usr/bin/python3.12 main.py \
   --sample-schedule schema \
   --max-input-tokens 16000 \
   --max-new-tokens 384 \
+  --thinking-budget 0 \
   --max-calls 8 \
   --max-invalid 3 \
   --sample-seconds inf \
@@ -414,6 +422,9 @@ nohup /usr/bin/python3.12 main.py \
   --prefix-cache auto \
   --schema-cache auto \
   --sample-schedule schema \
+  --max-input-tokens 16000 \
+  --max-new-tokens 384 \
+  --thinking-budget 0 \
   > /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/stage_llm.log 2>&1 &
 ```
 
@@ -457,6 +468,11 @@ nohup /usr/bin/python3.12 main.py \
 | :--- | :--- | :--- | :--- |
 | `--transcript-mode` | `dual` | `dual`, `mix` | `dual`: nhân bản 100% Gold + 100% ASR; `mix`: chia tỷ lệ. |
 | `--fuzzy-weight` | `0.3` | `0.0` đến `1.0` | Trọng số phạt loss trên các tham số `fuzzy` (giá trị < 1.0 giúp tránh overfitting chuỗi tìm kiếm). |
+| `--reasoning-weight` | `0.25` | `0.0` đến `1.0` | Trọng số loss của token reasoning trong dữ liệu SFT; reasoning mặc định bật khi huấn luyện. |
+| `--guard-recovery-ratio` | `0.18` | `0.0` đến `1.0` | Tỷ lệ mẫu chèn quỹ đạo tự sửa lỗi Guard Recovery (`xref_guard` và schema `validate` trong `prepare_sft.py`). |
+| `--reasoning-stepwise-ratio` | `0.5` | `0.0` đến `1.0` | Tỷ lệ sinh thêm mẫu reasoning từng bước khi bật `--short-reasoning` (mặc định bật). |
+| `--no-inject-guard-recovery` | Tắt (cờ) | Bật / Tắt | Cờ tắt hoàn toàn việc chèn các mẫu Guard Recovery trong `prepare_sft.py`. |
+| `--short-reasoning` | Đã bật mặc định | Bật / Tắt | Sinh reasoning trong `prepare_sft.py` và `finetune.py`; dùng `--no-short-reasoning` để tắt. |
 | `--filter-damaged-asr` | Đã bật (cờ) | Bật / Tắt | Loại bỏ bản sao ASR khỏi SFT nếu ASR làm hỏng các đối số chuẩn của tool call. |
 | `--epochs` | `2` | Số thực > 0 | Số epoch huấn luyện LoRA (2 epoch là tối ưu chống suy giảm chất lượng). |
 | `--batch-size` | `1` | Số nguyên | Batch size cục bộ trên mỗi GPU. |
@@ -472,8 +488,10 @@ nohup /usr/bin/python3.12 main.py \
 | `--prefix-cache` | `auto` | `auto`, `off` | Kích hoạt bộ nhớ đệm KV đa lượt tự động (tăng tốc độ suy luận gấp ~2.5 lần). |
 | `--schema-cache` | `auto` | `auto`, `shared`, `off` | Tái sử dụng KV-cache các system prompt và định nghĩa JSON schema của các app. |
 | `--sample-schedule` | `schema` | `schema`, `original` | Sắp xếp các mẫu có cùng tập installed apps chạy liền kề nhau để tối đa hóa tỷ lệ trúng schema cache. |
-| `--max-input-tokens` | `16000` | Số nguyên | Giới hạn ngữ cảnh đầu vào (context budget) cho prompt. |
-| `--max-new-tokens` | `384` | Số nguyên | Giới hạn số token sinh ra tối đa cho mỗi lượt quyết định tool call. |
+| `--max-input-tokens` | `16000` | Số nguyên | Giới hạn token đầu vào cho prompt; tổng input + output tối đa 16.384 tokens. |
+| `--max-new-tokens` | `384` | Số nguyên | Toàn bộ ngân sách token đầu ra cho quyết định hoặc tool call mỗi lượt. |
+| `--thinking-budget` | `0` | Số nguyên >= 0 | Mặc định tắt thinking, không dành 256 token riêng cho suy nghĩ. |
+| `--thinking-reserve-seconds` | `2.0` | Số thực >= 0 | Chỉ có tác dụng nếu chủ động bật thinking; không dùng với mặc định `--thinking-budget 0`. |
 | `--max-calls` | `8` | Số nguyên | Giới hạn tối đa số bước gọi công cụ trên mỗi mẫu để tránh vòng lặp vô hạn. |
 | `--max-invalid` | `3` | Số nguyên | Số lần tối đa môi trường cho phép gọi sai cú pháp trước khi hủy lượt. |
 | `--sample-seconds` | `inf` | `inf` hoặc số giây | Giới hạn thời gian tối đa cho mỗi mẫu (mặc định `inf` = không giới hạn). |

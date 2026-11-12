@@ -6,7 +6,9 @@ import json
 import logging
 from pathlib import Path
 
-from .context import DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_NEW_TOKENS, MAX_CONTEXT_TOKENS
+from .context import (DEFAULT_MAX_INPUT_TOKENS, DEFAULT_MAX_NEW_TOKENS,
+                      DEFAULT_THINKING_BUDGET, MAX_CONTEXT_TOKENS)
+from .reasoning import REASONING_POLICY
 
 from .function_calling import JSON_PROTOCOL, NATIVE_PROTOCOL
 from .local_time import LOCAL_TIME_POLICY
@@ -66,7 +68,9 @@ def generation_policy(tokenizer, model_path=None, seed=DEFAULT_SEED):
             "repetition_penalty": 1.0, "presence_penalty": 0.0, "frequency_penalty": 0.0,
             "seed": seed, "eos_token_ids": eos, "pad_token_id": pad,
             "max_input_tokens": DEFAULT_MAX_INPUT_TOKENS,
-            "max_new_tokens": DEFAULT_MAX_NEW_TOKENS, "max_context_tokens": MAX_CONTEXT_TOKENS}
+            "max_new_tokens": DEFAULT_MAX_NEW_TOKENS,
+            "thinking_budget": DEFAULT_THINKING_BUDGET,
+            "max_context_tokens": MAX_CONTEXT_TOKENS}
 
 
 def transformers_generation_config(policy):
@@ -130,6 +134,7 @@ def make_runtime_manifest(model_path, tokenizer, seed=DEFAULT_SEED, policy=None)
             "local_helper_policy": LOCAL_HELPER_POLICY,
             "assist_policy": ASSIST_POLICY,
             "schema_prompt_policy": SCHEMA_PROMPT_POLICY,
+            "reasoning_policy": REASONING_POLICY,
             "model_fingerprint": model_fingerprint(model_path),
             "tokenizer_fingerprint": tokenizer_fingerprint(tokenizer),
             "chat_template_kwargs": dict(getattr(tokenizer, "lifemate_template_kwargs", {})),
@@ -182,6 +187,8 @@ def load_runtime_manifest(model_path, tokenizer, artifact_path=None):
         raise ValueError("ITN policy differs from training/export; regenerate SFT and retrain the adapter")
     if manifest.get("execution_policy") != EXECUTION_POLICY:
         raise ValueError("Automatic execution policy differs from training/export; regenerate SFT and retrain the adapter")
+    if manifest.get("reasoning_policy", REASONING_POLICY) != REASONING_POLICY:
+        raise ValueError("Reasoning policy differs from training/export; regenerate SFT and retrain the adapter")
     expected_protocol = NATIVE_PROTOCOL if getattr(tokenizer, "lifemate_native_fc", False) is True else JSON_PROTOCOL
     if manifest["output_protocol"] != expected_protocol:
         raise ValueError("Output protocol differs from the LifeMate agent; regenerate SFT and retrain the adapter")

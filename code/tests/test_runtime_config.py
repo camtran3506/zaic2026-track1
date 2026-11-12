@@ -52,6 +52,9 @@ def test_portable_contract_survives_tokenizer_reload_and_model_relocation(artifa
     assert render_prompt(tok, messages) == render_prompt(reloaded, messages)
     # Portable greedy is temperature=0; HF uses do_sample=False, without sampling-only flags.
     assert actual['generation']['temperature'] == 0
+    assert actual['generation']['max_input_tokens'] == 16000
+    assert actual['generation']['max_new_tokens'] == 384
+    assert actual['generation']['thinking_budget'] == 0
     hf = GenerationConfig.from_pretrained(adapter)
     assert not hf.do_sample and hf.repetition_penalty == 1
     assert hf.eos_token_id == [2, 4] and hf.pad_token_id == 1

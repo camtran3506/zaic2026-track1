@@ -154,9 +154,12 @@ class OfflineRecognizer:
     assert prepared_manifest['batching']['max_helper_calls'] is None
     assert prepared_manifest['batching']['max_helpers_per_sample'] is None
     assert prepared_manifest['batching']['max_read_calls'] == 4
+    assert prepared_manifest['sft_format']['short_reasoning'] is True
     if architecture == 'qwen3_5':
         assert prepared_manifest['partitions']['train']['trajectories'] == len(source_rows)
-        assert prepared_manifest['partitions']['train']['examples'] == len(source_rows)
+        assert prepared_manifest['partitions']['train']['examples'] == (
+            len(source_rows) + prepared_manifest['partitions']['train']['reasoning_stepwise_examples']
+        )
         assert prepared_manifest['partitions']['train']['local_helper_examples'] >= 84
         assert prepared_manifest['partitions']['train']['local_helper_examples_by_tool']['local_assist.solve'] >= 4
     assert prepared_manifest['assist_policy'] == 'fixed-python-task-workflows-v1'
@@ -165,6 +168,7 @@ class OfflineRecognizer:
     # the organizer/env retains its original app/returns/parameter annotations.
     original_names = {spec['name'] for spec in tools}
     first = json.loads((run/'sft/train.jsonl').read_text().splitlines()[0])
+    assert first['messages'][-1]['reasoning_content']
     prompt_schemas = json.loads(first['messages'][1]['content'])['available_tools']['tool_schemas']
     for spec in prompt_schemas:
         if spec['name'] in original_names:
@@ -183,7 +187,9 @@ class OfflineRecognizer:
     expected_protocol = 'qwen35-native-fc-v1' if architecture == 'qwen3_5' else 'lifemate-decision-json-v1'
     assert runtime['output_protocol'] == expected_protocol
     assert runtime['generation']['temperature'] == 0
+    assert runtime['generation']['max_input_tokens'] == 16000
     assert runtime['generation']['max_new_tokens'] == 384
+    assert runtime['generation']['thinking_budget'] == 0
     assert (run / 'training/checkpoint-2/lifemate_runtime.json').is_file()
     from safetensors.torch import load_file
     weights = load_file(str(adapter / 'adapter_model.safetensors'))

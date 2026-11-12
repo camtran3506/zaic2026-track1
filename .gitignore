@@ -3,3 +3,8 @@ code/result/*
 code/unsloth_compiled_cache
 runtime_cache
 train+public_test/
+code/__pycache__
+code/.pytest_cache
+code/lifemate/__pycache__
+code/scripts/__pycache__
+code/tests/__pycache__
