@@ -413,6 +413,10 @@ def collapse_trajectory(steps, *, extra=None):
         raise ValueError(
             f"{last.get('sample_id')}: expected {len(steps) - 1} cumulative observations, got {len(observations)}"
         )
+    reasonings = [
+        (row.get("messages", [{}])[-1].get("reasoning_content") or row.get("reasoning") or "").strip()
+        for row in steps
+    ]
     collapsed = {
         "sample_id": last["sample_id"],
         "step": 0,
@@ -420,6 +424,8 @@ def collapse_trajectory(steps, *, extra=None):
         "assistant_train_mask": [row.get("train", True) is not False for row in steps],
         "messages": last["messages"],
     }
+    if any(reasonings):
+        collapsed["assistant_reasonings"] = reasonings
     for key in ("transcript_source", "augmentation", "recovery", "reasoning", "trajectory_source"):
         if key in last:
             collapsed[key] = deepcopy(last[key])
@@ -481,19 +487,43 @@ def _encode_native_with_spans(example, tokenizer, max_length, *, fuzzy_weight=No
     )
     if not text.startswith(pre_text):
         raise ValueError("Rendered chat diverges from pre-observation request prefix")
-    spans = [(m.start(1), m.end(1)) for m in _ASSISTANT_SPAN.finditer(text, pos=len(pre_text))]
     if example.get("full_trajectory"):
         trained = list(example.get("assistant_train_mask") or [])
+        matches = list(_ASSISTANT_SPAN.finditer(text, pos=len(pre_text)))
+        if not matches or len(matches) != len(trained):
+            raise ValueError(
+                f"{example.get('sample_id')}: assistant spans ({len(matches)}) do not match steps ({len(trained)})"
+            )
+        raw_reasonings = example.get("assistant_reasonings")
+        if isinstance(raw_reasonings, list) and len(raw_reasonings) == len(trained):
+            reasonings = [(r or "").strip() for r in raw_reasonings]
+        else:
+            last_reason = (example["messages"][-1].get("reasoning_content") or example.get("reasoning") or "").strip()
+            reasonings = [""] * (len(trained) - 1) + ([last_reason] if trained else [])
+        parts = [text[:len(pre_text)]]
+        cursor = len(pre_text)
+        for m, reason in zip(matches, reasonings):
+            parts.append(text[cursor:m.start(0)])
+            body = m.group(1)
+            tool_part = body.split(_THINK_CLOSE, 1)[1] if _THINK_CLOSE in body else body
+            parts.append(f"<|im_start|>assistant\n{_THINK_OPEN}{reason}{_THINK_CLOSE}{tool_part}")
+            cursor = m.end(0)
+        parts.append(text[cursor:])
+        text = "".join(parts)
+        spans = [(m.start(1), m.end(1)) for m in _ASSISTANT_SPAN.finditer(text, pos=len(pre_text))]
     else:
+        spans = [(m.start(1), m.end(1)) for m in _ASSISTANT_SPAN.finditer(text, pos=len(pre_text))]
         trained = [False] * (len(spans) - 1) + [example.get("train", True) is not False]
     if not spans or len(spans) != len(trained):
         raise ValueError(
             f"{example.get('sample_id')}: assistant spans ({len(spans)}) do not match steps ({len(trained)})"
         )
-    if not example.get("full_trajectory"):
-        prefix_before_target = text[:spans[-1][0]]
+    for (s0, _), is_trained in zip(spans, trained):
+        if not is_trained:
+            continue
+        prefix_before_target = text[:s0]
         if not (prefix_before_target.endswith(_THINK_OPEN) or prefix_before_target.endswith(_THINK_CLOSE)):
-            raise ValueError("Step-wise target span must be preceded by a <think> block for train/inference parity")
+            raise ValueError("Supervised assistant span must be preceded by a <think> block for train/inference parity")
     fuzzy = _fuzzy_ranges(text, spans, tools) if fuzzy_weight is not None else []
     thinking = _thinking_ranges(text, spans) if reasoning_weight is not None else []
     use_weights = (fuzzy_weight is not None) or (reasoning_weight is not None)

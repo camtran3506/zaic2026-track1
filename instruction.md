@@ -247,7 +247,7 @@ nohup /usr/bin/python3.12 finetune.py \
   --cuda-visible-devices 0 \
   --data-root /mnt/mmlab2024nas/trantran/lifemate/train+public_test \
   --base-model /mnt/mmlab2024nas/trantran/lifemate/code/models/llm \
-  --output-dir /mnt/mmlab2024nas/trantran/lifemate/code/result/run_sft_stepwise \
+  --output-dir /mnt/mmlab2024nas/trantran/lifemate/code/result/run_sft_final \
   --asr-model /mnt/mmlab2024nas/trantran/lifemate/code/models/asr_ft \
   --transcript-mode dual \
   --asr-transcript-ratio 0.5 \
@@ -267,7 +267,7 @@ nohup /usr/bin/python3.12 finetune.py \
   --lora-alpha 32 \
   --lora-dropout 0.0 \
   --save-strategy epoch \
-  > /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/train_llm_stepwise.log 2>&1 &
+  > /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/train_llm_final.log 2>&1 &
 ```
 
 *Kiểm tra tiến trình:*

@@ -319,6 +319,91 @@ def test_reasoning_sft_weights_and_stepwise_selection(bpe_tokenizer):
     assert batch["loss_weights"].shape == batch["labels"].shape == batch["input_ids"].shape
 
 
+def test_full_trajectory_preserves_think_prefix_on_every_step_for_ab_parity(bpe_tokenizer):
+    def _contiguous_supervised_ranges(labels):
+        ranges = []
+        start = None
+        for idx, lbl in enumerate(labels):
+            if lbl != -100 and start is None:
+                start = idx
+            elif lbl == -100 and start is not None:
+                ranges.append((start, idx))
+                start = None
+        if start is not None:
+            ranges.append((start, len(labels)))
+        return ranges
+
+    catalog = _contacts_sms_catalog()
+    catalog["sms.send"]["parameters"]["properties"]["content"]["x-match"] = "fuzzy"
+    entry = item()
+    entry["context"]["installed_apps"]["contacts"] = {"tools": ["contacts.search"]}
+    entry["context"]["installed_apps"]["sms"] = {"tools": ["sms.send"]}
+    entry["audio_text"] = "Nhắn cho anh Dũng là mai họp"
+    entry["label"] = {
+        "tool_calls": [
+            {"name": "contacts.search", "arguments": {"query": "Dũng"}},
+            {"name": "sms.send", "arguments": {"contact_id": "c_08", "content": "mai họp"}},
+        ]
+    }
+
+    class ContactSmsEnv(FakeEnv):
+        def validate(self, name, args):
+            return {"ok": True}
+
+        def call(self, name, args):
+            if name == "contacts.search":
+                return {"ok": True, "contacts": [{"id": "c_08", "name": "Dũng"}]}
+            return {"ok": True, "sent": True}
+
+    steps = replay_sample(entry, catalog, ContactSmsEnv(), Path("/unused"), include_date_helpers=False)
+    assert len(steps) == 3  # contacts.search -> sms.send -> done
+
+    empty_think_ids = bpe_tokenizer("<|im_start|>assistant\n<think>\n\n</think>\n\n", add_special_tokens=False)["input_ids"]
+    open_think_ids = bpe_tokenizer("<|im_start|>assistant\n<think>\n", add_special_tokens=False)["input_ids"]
+
+    # 1) Default full-trajectory (without short reasoning): every step has empty <think> block before target
+    # and matches step-wise SFT target tokens & fuzzy loss_weights 1:1.
+    traj = collapse_trajectory(steps)
+    row = encode_example(traj, bpe_tokenizer, 16384, fuzzy_weight=0.3)
+    token_spans = _contiguous_supervised_ranges(row["labels"])
+    assert len(token_spans) == 3
+    for idx, (step_row_in, (ts, te)) in enumerate(zip(steps, token_spans)):
+        assert ts >= len(empty_think_ids)
+        assert row["input_ids"][ts - len(empty_think_ids):ts] == empty_think_ids, idx
+        assert all(lbl == -100 for lbl in row["labels"][ts - len(empty_think_ids):ts])
+        assert all(w == 0.0 for w in row["loss_weights"][ts - len(empty_think_ids):ts])
+
+        step_encoded = encode_example(step_row_in, bpe_tokenizer, 16384, fuzzy_weight=0.3)
+        step_target_ids = [tid for tid, lbl in zip(step_encoded["input_ids"], step_encoded["labels"]) if lbl != -100]
+        step_target_weights = [w for w, lbl in zip(step_encoded["loss_weights"], step_encoded["labels"]) if lbl != -100]
+        assert row["input_ids"][ts:te] == step_target_ids
+        assert row["loss_weights"][ts:te] == pytest.approx(step_target_weights)
+
+    # 2) Full-trajectory WITH short reasoning: every intermediate & final step keeps its reasoning_content
+    # and matches step-wise SFT target tokens, reasoning weights (0.25), and fuzzy weights (0.3) 1:1.
+    enriched = attach_reasoning_to_trajectory(steps)
+    traj_r = collapse_trajectory(enriched)
+    assert traj_r["assistant_reasonings"] == [r["reasoning"] for r in enriched]
+    row_r = encode_example(traj_r, bpe_tokenizer, 16384, fuzzy_weight=0.3, reasoning_weight=0.25)
+    token_spans_r = _contiguous_supervised_ranges(row_r["labels"])
+    assert len(token_spans_r) == 3
+    for idx, (step_row_in, (ts, te)) in enumerate(zip(enriched, token_spans_r)):
+        assert ts >= len(open_think_ids)
+        assert row_r["input_ids"][ts - len(open_think_ids):ts] == open_think_ids, idx
+        assert all(lbl == -100 for lbl in row_r["labels"][ts - len(open_think_ids):ts])
+        assert all(w == 0.0 for w in row_r["loss_weights"][ts - len(open_think_ids):ts])
+
+        step_encoded = encode_example(step_row_in, bpe_tokenizer, 16384, fuzzy_weight=0.3, reasoning_weight=0.25)
+        step_target_ids = [tid for tid, lbl in zip(step_encoded["input_ids"], step_encoded["labels"]) if lbl != -100]
+        step_target_weights = [w for w, lbl in zip(step_encoded["loss_weights"], step_encoded["labels"]) if lbl != -100]
+        assert row_r["input_ids"][ts:te] == step_target_ids
+        assert row_r["loss_weights"][ts:te] == pytest.approx(step_target_weights)
+        assert any(w == pytest.approx(0.25) for w in step_target_weights)
+        assert any(w == pytest.approx(1.0) for w in step_target_weights)
+        if idx == 1:  # sms.send has fuzzy `content`
+            assert any(w == pytest.approx(0.3) for w in step_target_weights)
+
+
 # ---------------------------------------------------------------------------
 # Default 16000 / 384 budgets and optional adaptive thinking
 # ---------------------------------------------------------------------------
