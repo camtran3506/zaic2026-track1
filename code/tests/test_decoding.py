@@ -70,7 +70,8 @@ def test_hf_generate_stops_before_trailing_tokens_and_ignores_prompt_json():
     produced = []
     def actual_generate(**kwargs):
         length = kwargs['input_ids'].shape[1]
-        result = model.generate(**kwargs, logits_processor=LogitsProcessorList([ScriptedTokens(length)]))
+        guards = list(kwargs.pop('logits_processor', []))
+        result = model.generate(**kwargs, logits_processor=LogitsProcessorList([ScriptedTokens(length), *guards]))
         produced.append(result.shape[1] - length)
         return result
     llm = LocalLLM.from_loaded_model(SimpleNamespace(generate=actual_generate,

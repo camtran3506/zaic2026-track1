@@ -62,7 +62,8 @@ def check_observed_xref(arguments, spec, observed_ids):
     return _check_xref_node(arguments, spec.get("parameters"), observed_ids)
 
 
-def precheck_call(name, arguments, catalog, enabled, monitor, local_names=()):
+def precheck_call(name, arguments, catalog, enabled, monitor, local_names=(), *,
+                  transcript='', context=None, history=(), observations=()):
     access = check_tool_access(name, catalog, enabled, local_names)
     if not access["allowed"]:
         return {"stage": "precheck", "name": name, "arguments": arguments,
@@ -76,11 +77,28 @@ def precheck_call(name, arguments, catalog, enabled, monitor, local_names=()):
     if name == "sys.ask_missing_info" and (not isinstance(target, str) or target not in enabled or target == name):
         return {"stage": "precheck", "name": name, "arguments": arguments,
                 "error": "Missing-info tool_name must be another available application tool."}
+    if name == "sys.ask_missing_info":
+        from .missing_info_guard import check_missing_info
+        feedback = check_missing_info(arguments, enabled, transcript=transcript, context=context,
+                                      history=history, observations=observations)
+        if feedback:
+            return {"stage": "missing_info_guard", "name": name, "arguments": arguments,
+                    "error": feedback['instruction'], "feedback": feedback}
     feedback = monitor.check(name, arguments, enabled[name].get("kind", "unknown"))
     if feedback:
         return {"stage": "loop_guard", "name": name, "arguments": arguments,
                 "error": feedback["instruction"], "feedback": feedback}
     return None
+
+
+def update_observed_ids(name, arguments, result, kind, observed_ids):
+    """Share successful-result ID provenance with environment and recorded replay."""
+    if (observed_ids is not None and isinstance(result, dict)
+            and result.get('ok') is True and result.get('done') is not False):
+        app = name.split('.', 1)[0]
+        collect_ids(result, observed_ids, app)
+        if kind == 'write':
+            collect_ids(arguments, observed_ids, app)
 
 
 def attempt_env_call(env, name, arguments, kind, monitor, call_index, *, emit=None, spec=None, observed_ids=None):
@@ -127,11 +145,7 @@ def attempt_env_call(env, name, arguments, kind, monitor, call_index, *, emit=No
              exception=execution_exception, agent_result=result)
     else:
         emit("call_result", name=name, arguments=arguments, call_index=call_index, result=result)
-    if observed_ids is not None and isinstance(result, dict) and result.get("ok") is True and result.get("done") is not False:
-        app = name.split(".", 1)[0]
-        collect_ids(result, observed_ids, app)
-        if kind == "write":
-            collect_ids(arguments, observed_ids, app)
+    update_observed_ids(name, arguments, result, kind, observed_ids)
     verification = monitor.record_result(name, arguments, result, kind,
                                          call_index=call_index, execution_exception=execution_exception)
     emit("execution_verified", name=name, verification=verification)

@@ -75,6 +75,8 @@ def test_prepared_json_and_all_native_tokens_match_full_reference(bpe_tokenizer,
     for observations in observation_views():
         _, expected_user = build_step_prompt(*inputs, observations)
         user = session.prompt(observations)
+        assert 'request_transcript_source' not in json.loads(user)
+        assert 'request_transcript_note' not in json.loads(user)
         assert isinstance(user, str) and str(user) == expected_user
         actual = session.render(bpe_tokenizer, SYSTEM_PROMPT, user)
         assert actual[:2] == reference(bpe_tokenizer, expected_user)

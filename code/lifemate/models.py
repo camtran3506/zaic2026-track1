@@ -69,6 +69,8 @@ class LocalLLM:
         self.device = self.model.get_input_embeddings().weight.device
         self.max_input_tokens = max_input_tokens
         self.max_new_tokens = max_new_tokens
+        if self.thinking_budget == 0:
+            logging.info('Zero-thinking inference: direct JSON/tool-call output guard enabled')
 
     @classmethod
     def from_loaded_model(cls, model, tokenizer, max_input_tokens=DEFAULT_MAX_INPUT_TOKENS,
@@ -137,7 +139,7 @@ class LocalLLM:
         # Import lazily: Unsloth must be imported before Transformers during training.
         from transformers import LogitsProcessorList, StoppingCriteriaList
         from .decoding import (DecisionJsonStoppingCriteria, NativeToolStoppingCriteria,
-                               ThinkingBudgetLogitsProcessor)
+                               DirectActionLogitsProcessor, ThinkingBudgetLogitsProcessor)
         if thinking_budget is not None and int(thinking_budget) < 0:
             raise ValueError("thinking_budget must be non-negative")
         tokenizer = self.tokenizer
@@ -181,7 +183,9 @@ class LocalLLM:
                 [stopping_class(tokenizer, prompt_len, thinking_opened=thinking_opened)]
             )
             if not thinking_opened:
-                return criteria, None
+                return criteria, LogitsProcessorList([
+                    DirectActionLogitsProcessor(tokenizer, prompt_len, native=native)
+                ])
             processors = LogitsProcessorList(
                 [ThinkingBudgetLogitsProcessor(tokenizer, prompt_len, max_thinking_tokens=effective_thinking_budget)]
             )

@@ -36,7 +36,7 @@ def test_train_adapter_reload_and_merge(tmp_path, architecture):
     base = tmp_path / 'tiny-base'
     base.mkdir()
     tok = Tokenizer(models.WordLevel({'[UNK]': 0, '[PAD]': 1, '[EOS]': 2,
-        '<s>': 3, '</s>': 4, 'system': 5, 'user': 6, 'assistant': 7}, unk_token='[UNK]'))
+        '<s>': 3, '</s>': 4, 'system': 5, 'user': 6, 'assistant': 7, '{': 8}, unk_token='[UNK]'))
     tok.pre_tokenizer = pre_tokenizers.WhitespaceSplit()
     tokenizer = PreTrainedTokenizerFast(tokenizer_object=tok, unk_token='[UNK]',
         pad_token='[PAD]', eos_token='[EOS]', additional_special_tokens=['<s>', '</s>'])
@@ -143,7 +143,7 @@ class OfflineRecognizer:
     assert config['numerics_guard'] == 'finite-loss-and-gradients-v1'
     assert not (run/'training/debug_numerics').exists()
     assert config['fuzzy_weight'] == 0.3
-    assert config['epochs'] == 2
+    assert config['epochs'] == 3
     prepared_manifest = json.loads((run/'sft/manifest.json').read_text())
     assert prepared_manifest['training_augmentation']['rename_variants'] == 0
     assert prepared_manifest['training_augmentation']['variants_kept'] == 0
@@ -154,12 +154,12 @@ class OfflineRecognizer:
     assert prepared_manifest['batching']['max_helper_calls'] is None
     assert prepared_manifest['batching']['max_helpers_per_sample'] is None
     assert prepared_manifest['batching']['max_read_calls'] == 4
-    assert prepared_manifest['sft_format']['short_reasoning'] is True
+    assert prepared_manifest['sft_format']['short_reasoning'] is False
+    assert prepared_manifest['sft_format']['full_trajectory'] is False
     if architecture == 'qwen3_5':
         assert prepared_manifest['partitions']['train']['trajectories'] == len(source_rows)
-        assert prepared_manifest['partitions']['train']['examples'] == (
-            len(source_rows) + prepared_manifest['partitions']['train']['reasoning_stepwise_examples']
-        )
+        assert prepared_manifest['partitions']['train']['examples'] > len(source_rows)
+        assert prepared_manifest['partitions']['train']['reasoning_stepwise_examples'] == 0
         assert prepared_manifest['partitions']['train']['local_helper_examples'] >= 84
         assert prepared_manifest['partitions']['train']['local_helper_examples_by_tool']['local_assist.solve'] >= 4
     assert prepared_manifest['assist_policy'] == 'fixed-python-task-workflows-v1'
@@ -168,7 +168,7 @@ class OfflineRecognizer:
     # the organizer/env retains its original app/returns/parameter annotations.
     original_names = {spec['name'] for spec in tools}
     first = json.loads((run/'sft/train.jsonl').read_text().splitlines()[0])
-    assert first['messages'][-1]['reasoning_content']
+    assert 'reasoning_content' not in first['messages'][-1]
     prompt_schemas = json.loads(first['messages'][1]['content'])['available_tools']['tool_schemas']
     for spec in prompt_schemas:
         if spec['name'] in original_names:

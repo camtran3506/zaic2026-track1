@@ -185,7 +185,8 @@ def test_native_stopping_waits_past_inner_json_and_keeps_special_tags(native_tok
             return scores
     def generate(**kwargs):
         prefix = kwargs['input_ids'].shape[1]
-        output = model.generate(**kwargs, logits_processor=LogitsProcessorList([Script(prefix)]))
+        guards = list(kwargs.pop('logits_processor', []))
+        output = model.generate(**kwargs, logits_processor=LogitsProcessorList([Script(prefix), *guards]))
         lengths.append(output.shape[1] - prefix)
         return output
     llm = LocalLLM.from_loaded_model(SimpleNamespace(generate=generate,

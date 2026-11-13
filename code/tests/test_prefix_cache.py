@@ -196,8 +196,15 @@ def test_cache_failure_retries_original_path_and_restores_forwards(monkeypatch):
     attempts = []
     def generate(**kwargs):
         attempts.append('past_key_values' in kwargs)
+        guard = kwargs['logits_processor'][0]
         if 'past_key_values' in kwargs:
+            # A cached attempt can fail after starting an action. Its output
+            # framing state must not leak into the fresh full-prompt retry.
+            begun = torch.cat([kwargs['input_ids'], torch.tensor([[tok.get_vocab()['{']]])], dim=1)
+            guard(begun, torch.zeros(1, len(tok)))
             raise RuntimeError('simulated incompatible cached generate')
+        scores = guard(kwargs['input_ids'], torch.zeros(1, len(tok)))
+        assert torch.isneginf(scores[0, tok.get_vocab()['R']])
         return original_generate(**kwargs)
     monkeypatch.setattr(model, 'generate', generate)
     assert llm.generate(SYSTEM_PROMPT, messages[1]['content']) == expected

@@ -16,7 +16,7 @@ from .batching import BATCH_TOOL, observation_children
 
 
 REASONING_POLICY = "deterministic-short-checked-reasoning-v1"
-DEFAULT_SHORT_REASONING = True
+DEFAULT_SHORT_REASONING = False
 DEFAULT_REASONING_WEIGHT = 0.25
 DEFAULT_REASONING_STEPWISE_RATIO = 0.5
 _MAX_REASONING_CHARS = 280

@@ -125,6 +125,10 @@ def test_two_alias_trajectories_preserve_arguments_history_guards_and_sys_target
             if 'automatic_execution_feedback' in observation:
                 assert not any(name in json.dumps(observation['automatic_execution_feedback']) for name in tools)
     missing = deepcopy(entry)
+    # Keep the sys target aliasing case genuinely unresolved under the shared
+    # missing-info guard; context/history preservation is checked above.
+    missing['context']['collections'] = {}
+    missing['history'] = []
     missing['label']['tool_calls'] = [{'name': 'sys.ask_missing_info', 'arguments': {
         'tool_name': 'smart_home.light_set', 'params': ['device_id']}}]
     examples = replay_sample(missing, CATALOG, FakeEnv(), Path('/unused'))

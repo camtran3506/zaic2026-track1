@@ -77,7 +77,7 @@ def test_empty_calls_with_temporal_words_demonstrates_helpers_then_done():
 
 def test_gold_tool_must_exist_in_complete_prompt(monkeypatch):
     import lifemate.sft as sft
-    monkeypatch.setattr(sft, 'build_step_prompt', lambda *args: (
+    monkeypatch.setattr(sft, 'build_step_prompt', lambda *args, **kwargs: (
         {'tool_schemas': [{'name': 'smart_home.get_status'}]},
         json.dumps({'available_tools': {'tool_schemas': []}})))
     with pytest.raises(UnexposedToolError, match='smart_home.get_status not exposed'):

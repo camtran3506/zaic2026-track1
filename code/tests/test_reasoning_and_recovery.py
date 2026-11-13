@@ -84,7 +84,8 @@ def _contacts_sms_catalog():
     }
 
 
-def test_guard_recovery_builds_xref_feedback_and_direct_read_target(bpe_tokenizer):
+@pytest.mark.parametrize('prompt_source', [None, 'audio_text', 'asr'])
+def test_guard_recovery_builds_xref_feedback_and_direct_read_target(bpe_tokenizer, prompt_source):
     catalog = _contacts_sms_catalog()
 
     class Env:
@@ -120,6 +121,8 @@ def test_guard_recovery_builds_xref_feedback_and_direct_read_target(bpe_tokenize
         },
     }
     prepared = {"id": "train_xref", "transcript": "nhắn cô ly tối nay họp nhé", "history": [], "transcript_source": "audio_text"}
+    if prompt_source is not None:
+        prepared['transcript_source'] = prepared['prompt_transcript_source'] = prompt_source
     steps = replay_sample(record, catalog, Env(), Path("/unused"), prepared_transcript=prepared, include_date_helpers=False)
 
     examples = build_guard_recovery_examples(record, prepared, steps, catalog, Env, ratio=1.0, seed=42)
@@ -132,6 +135,9 @@ def test_guard_recovery_builds_xref_feedback_and_direct_read_target(bpe_tokenize
     assert ex["recovery"]["target_tool"] == "contacts.search"
 
     payload = json.loads(ex["messages"][1]["content"])
+    assert payload.get('request_transcript_source') == prompt_source
+    if prompt_source is not None:
+        assert payload['request_transcript_note']
     obs = payload["previous_actions_and_results"]
     assert len(obs) == 1
     assert obs[0]["stage"] == "xref_guard"
@@ -428,9 +434,9 @@ def test_agent_and_local_llm_adaptive_time_and_prefix_cache_across_turns(bpe_tok
 
     def fake_generate(**kwargs):
         seen_input_ids.append(kwargs["input_ids"][0].tolist())
-        seen_processors.append("logits_processor" in kwargs)
+        seen_processors.append(tuple(type(p).__name__ for p in kwargs.get('logits_processor', ())))
         end_think = tok.convert_tokens_to_ids("</think>")
-        if seen_processors[-1]:
+        if 'ThinkingBudgetLogitsProcessor' in seen_processors[-1]:
             suffix = tok("step 1\n", add_special_tokens=False)["input_ids"] + [end_think] + tok('\n\n{"action":"done"}', add_special_tokens=False)["input_ids"]
         else:
             suffix = tok('{"action":"done"}', add_special_tokens=False)["input_ids"]
@@ -452,17 +458,17 @@ def test_agent_and_local_llm_adaptive_time_and_prefix_cache_across_turns(bpe_tok
     res0 = llm.generate(SYSTEM_PROMPT, p0, thinking_budget=256)
     _, ref_on_ids = render_prompt(tok, [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": str(p0)}], enable_thinking=True)
     assert seen_input_ids[-1] == ref_on_ids
-    assert seen_processors[-1] is True
+    assert seen_processors[-1] == ('ThinkingBudgetLogitsProcessor',)
     assert "<think>" in res0 and "</think>" in res0
     assert parse_decision(res0) == {"action": "done"}
 
-    # Turn 1: thinking_budget=0 (e.g., low time reserve) -> closes `<think>\n\n</think>\n\n`, NO logits_processor
+    # Turn 1: budget 0 closes the prompt's think block and guards the output prefix.
     obs1 = [{"name": "smart_home.get_status", "arguments": {}, "result": "{}"}]
     p1 = session.prompt(obs1)
     res1 = llm.generate(SYSTEM_PROMPT, p1, thinking_budget=0)
     _, ref_off_ids = render_prompt(tok, [{"role": "system", "content": SYSTEM_PROMPT}, {"role": "user", "content": str(p1)}], enable_thinking=False)
     assert seen_input_ids[-1] == ref_off_ids
-    assert seen_processors[-1] is False
+    assert seen_processors[-1] == ('DirectActionLogitsProcessor',)
     assert parse_decision(res1) == {"action": "done"}
     # CPU & GPU prefix caches keep hitting across dynamic thinking switch!
     assert session.report()["suffix_renders"] == 1
@@ -561,7 +567,8 @@ def test_prepare_sft_emits_guard_recovery_and_reasoning_stepwise_rows(tmp_path, 
             "--asr-transcript-ratio", "0",
             "--tokenizer", str(tok_dir),
             "--guard-recovery-ratio", "1.0",
-            *([] if short_reasoning else ["--no-short-reasoning"]),
+            "--no-step-wise-sft",
+            *(["--short-reasoning"] if short_reasoning else ["--no-short-reasoning"]),
             "--reasoning-stepwise-ratio", "1.0",
         ],
     )
@@ -569,6 +576,7 @@ def test_prepare_sft_emits_guard_recovery_and_reasoning_stepwise_rows(tmp_path, 
     manifest = json.loads((out_dir / "manifest.json").read_text())
     train_meta = manifest["partitions"]["train"]
     assert manifest["batching"]["max_new_tokens"] == 384
+    assert manifest["sft_format"]["full_trajectory"] is True
     assert manifest["sft_format"]["short_reasoning"] is short_reasoning
     assert manifest["sft_format"]["inject_guard_recovery"] is True
     assert train_meta["guard_recovery_examples"] == 1
@@ -581,4 +589,90 @@ def test_prepare_sft_emits_guard_recovery_and_reasoning_stepwise_rows(tmp_path, 
         assert all("reasoning_content" not in message for row in rows for message in row["messages"])
     ds = SupervisedDataset(rows, bpe_tokenizer, 16384, fuzzy_weight=0.3, reasoning_weight=0.25)
     assert len(ds) == expected_rows
+
+
+def test_prepare_sft_default_stepwise_filters_untrained_recovery_steps_and_preserves_think_prefix(
+    tmp_path, bpe_tokenizer, monkeypatch
+):
+    import sys
+    import prepare_sft
+
+    split = tmp_path / "data" / "train"
+    split.mkdir(parents=True)
+    catalog = _contacts_sms_catalog()
+    (split / "train_tools_catalog.json").write_text(json.dumps({"apps": [{"tools": list(catalog.values())}]}))
+    record = {
+        "id": "train_0001",
+        "audio_text": "Nhắn cho anh Dũng là mai họp",
+        "context": {
+            "installed_apps": {
+                "contacts": {"tools": ["contacts.search"]},
+                "sms": {"tools": ["sms.send"]},
+            }
+        },
+        "history": [],
+        "label": {
+            "tool_calls": [
+                {"name": "contacts.search", "arguments": {"query": "Dũng"}},
+                {"name": "sms.send", "arguments": {"contact_id": "c_08", "content": "mai họp"}},
+            ]
+        },
+    }
+    (split / "train.jsonl").write_text(json.dumps(record, ensure_ascii=False) + "\n")
+    (split / "zaic_tools.py").write_text(
+        """class ToolEnv:
+    def __init__(self, split, id, root): pass
+    def validate(self, name, args):
+        return {'ok': True}
+    def call(self, name, args):
+        if name == 'contacts.search':
+            if args.get('query') == 'Dũng':
+                return {'ok': True, 'contacts': [{'id': 'c_08', 'name': 'Dũng'}]}
+            return {'ok': True, 'contacts': []}
+        return {'ok': True, 'done': True}
+    def get_tool_calls(self): return []
+    def get_state_hash(self): return 'h'
+"""
+    )
+    tok_dir = tmp_path / "tok"
+    tok_dir.mkdir()
+    bpe_tokenizer.save_pretrained(tok_dir)
+    (tok_dir / "config.json").write_text('{"model_type":"qwen3_5"}')
+
+    out_dir = tmp_path / "sft_stepwise_default"
+    monkeypatch.delitem(sys.modules, "zaic_tools", raising=False)
+    monkeypatch.setattr(
+        sys, "argv",
+        [
+            "prepare_sft.py",
+            "--data-root", str(split.parent),
+            "--output-dir", str(out_dir),
+            "--asr-transcript-ratio", "0",
+            "--tokenizer", str(tok_dir),
+            "--guard-recovery-ratio", "0.0",
+        ],
+    )
+    prepare_sft.main()
+    manifest = json.loads((out_dir / "manifest.json").read_text())
+    train_meta = manifest["partitions"]["train"]
+    assert manifest["sft_format"]["full_trajectory"] is False
+    assert manifest["sft_format"]["short_reasoning"] is False
+    assert manifest["sft_format"]["inject_recovery"] is True
+    assert train_meta["recovery_trajectories"] == 1
+
+    rows = [json.loads(line) for line in (out_dir / "train.jsonl").read_text().splitlines() if line.strip()]
+    assert all(not row.get("full_trajectory") for row in rows)
+    assert all(row.get("train", True) is not False for row in rows)
+    assert all("reasoning_content" not in message for row in rows for message in row["messages"])
+    assert len(rows) == 6  # 3 canonical steps + 3 trainable recovery steps (step 0 with train=False omitted)
+
+    ds = SupervisedDataset(rows, bpe_tokenizer, 16384, fuzzy_weight=0.3)
+    assert len(ds) == 6
+    for row in rows:
+        chat, tools = native_chat(row["messages"])
+        text = bpe_tokenizer.apply_chat_template(
+            chat, tokenize=False, add_generation_prompt=False, tools=tools, enable_thinking=False
+        )
+        assert text.count("<think>\n\n</think>\n\n") >= 1
+        assert text.endswith("<|im_end|>\n") or text.endswith("<|im_end|>")
 

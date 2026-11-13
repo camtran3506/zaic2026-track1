@@ -8,6 +8,7 @@ import pytest
 from lifemate.local_helpers import LOCAL_HELPER_POLICY, execute_helper, helper_tool_schemas
 from lifemate.local_time import LOCAL_TIME_POLICY
 from lifemate.local_assist import ASSIST_POLICY
+from lifemate.agent import AgentConfig
 from lifemate.runtime import load_runtime_manifest, RUNTIME_MANIFEST
 from lifemate.sft import SFT_PROMPT_POLICY, replay_sample, validate_prompt_policy
 from lifemate.specialist_training import specialist_demonstrations
@@ -129,9 +130,14 @@ def record(arguments):
 
 
 def test_sft_specialists_do_not_see_future_gold_and_keep_env_sequence():
+    # Deliberately inconsistent gold tests helper label leakage. The production
+    # guard rejects it; opt out only for this independent causality assertion.
+    with pytest.raises(ValueError, match='xref_guard'):
+        replay_sample(record({'alert_id': 'future_a'}), TOOLS, Env(), Path('/unused'))
+    config = AgentConfig(enforce_observed_xref=False)
     env = Env()
-    left = replay_sample(record({"alert_id": "future_a"}), TOOLS, env, Path("/unused"))
-    right = replay_sample(record({"alert_id": "future_b"}), TOOLS, Env(), Path("/unused"))
+    left = replay_sample(record({"alert_id": "future_a"}), TOOLS, env, Path("/unused"), config=config)
+    right = replay_sample(record({"alert_id": "future_b"}), TOOLS, Env(), Path("/unused"), config=config)
     a, b = [json.loads(x["messages"][-1]["content"]) for x in left], [json.loads(x["messages"][-1]["content"]) for x in right]
     helpers_a = [x for x in a if x.get("name") in helper_tool_schemas()]
     helpers_b = [x for x in b if x.get("name") in helper_tool_schemas()]

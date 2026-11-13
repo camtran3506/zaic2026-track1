@@ -15,7 +15,7 @@ from .history import extract_observed_ids, prompt_history, resolve_history
 from .local_helpers import execute_helper, helper_tool_schemas, with_local_tools
 from .local_assist import ASSIST_INSTRUCTIONS
 from .local_checks import inspect_call
-from .execution_policy import AUTOMATIC_GUARD_INSTRUCTIONS, LoopMonitor
+from .execution_policy import AUTOMATIC_GUARD_INSTRUCTIONS, DEFAULT_EMPTY_READ_LIMIT, LoopMonitor
 from .tool_execution import precheck_call, attempt_env_call, prepare_call_arguments, result_observation
 from .text import normalize_transcript
 from .prompt_session import InferenceSession, fixed_prompt_payload
@@ -163,7 +163,7 @@ class AgentConfig:
     # turns have no count ceiling; model input/output token limits still apply.
     max_total_steps: int = 32
     max_llm_steps: int = 64
-    empty_read_limit: int = 2
+    empty_read_limit: int = DEFAULT_EMPTY_READ_LIMIT
     enforce_observed_xref: bool = True
 
 
@@ -180,9 +180,9 @@ def _supports_thinking_budget(llm: Any) -> bool:
     )
 
 
-def build_step_prompt(transcript, context, history, enabled, observations):
+def build_step_prompt(transcript, context, history, enabled, observations, *, transcript_source=None):
     """Use the same complete catalog, history and observations in SFT/inference."""
-    tools, info = fixed_prompt_payload(transcript, context, history, enabled)
+    tools, info = fixed_prompt_payload(transcript, context, history, enabled, transcript_source=transcript_source)
     info["previous_actions_and_results"] = observations
     # Token limits are checked by LocalLLM/encode_example, never by dropping data.
     return tools, full_json(info)
@@ -282,13 +282,27 @@ class LifeMateAgent:
             nonlocal executed, local_executed, stop_reason
             if isinstance(name, str) and name in enabled:
                 args = prepare_call_arguments(name, args, enabled[name], context, transcript)
-            rejection = precheck_call(name, args, self.catalog, enabled, monitor, local_names)
+            rejection = precheck_call(name, args, self.catalog, enabled, monitor, local_names,
+                                      transcript=transcript, context=context, history=history,
+                                      observations=observation_children(observations))
             if rejection:
                 if rejection['stage'] == 'loop_guard':
                     emit('loop_advisory', name=name, arguments=args, feedback=rejection['feedback'])
                 reject(**rejection)
                 return False
             if name in local_names:
+                if not in_batch and any(o.get('scope') == 'local' and o.get('name') == name and o.get('arguments') == args
+                                        for o in observation_children(observations)):
+                    emit('loop_advisory', name=name, arguments=args,
+                         feedback='Duplicate local helper call with identical arguments.')
+                    reject(
+                        'Helper nội bộ này đã được gọi với cùng tham số trong lượt hiện tại; '
+                        'hãy dùng kết quả đã có trong previous_actions_and_results để gọi tool tiếp theo hoặc trả về {"action":"done"}.',
+                        'loop_guard',
+                        name=name,
+                        arguments=args,
+                    )
+                    return False
                 local_executed += 1
                 emit('local_call_start', name=name, arguments=args, local_call_index=local_executed-1)
                 try:
@@ -301,8 +315,7 @@ class LifeMateAgent:
                     reject(str(exc), 'local_validate', name=name, arguments=args)
                 emit('local_call_result', name=name, arguments=args, result=result, local_call_index=local_executed-1)
                 observation = {'name': name, 'arguments': args, 'result': full_json(result), 'scope': 'local'}
-                if not any(o.get('scope') == 'local' and o.get('name') == name and o.get('arguments') == args for o in observations):
-                    observations.append(observation)
+                observations.append(observation)
                 if not in_batch and successful(observation):
                     observations[:] = [o for o in observations if 'result' in o]
                 return successful(observation)

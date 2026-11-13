@@ -10,7 +10,11 @@ import json
 
 
 EXECUTION_POLICY = "automatic-tool-guards-v1"
+# Distinct read arguments stay allowed after empty results; exact repeats are
+# still blocked by the state-scoped read cache. Zero disables the empty-read cap.
+DEFAULT_EMPTY_READ_LIMIT = 0
 AUTOMATIC_GUARD_INSTRUCTIONS = """- Chương trình tự kiểm tên/quyền tool, validate và chống lặp bằng Python; không cần gọi helper để bật các kiểm tra này.
+- sys.ask_missing_info chỉ báo phần thực sự chưa xác định. Python chặn tên tham số sai hoặc hỏi lại giá trị đã xác định từ schema/context/transcript/history/kết quả đọc; dùng bằng chứng trong phản hồi chặn để tiếp tục.
 - Tool + arguments bị validate từ chối bị cấm suốt sample, kể cả sau read/write khác; sửa đề xuất theo lỗi thật.
 - Read đã trả ok:true (có dữ liệu, rỗng hoặc done:false) được giữ lại trong phiên hiện tại.
   Không gọi lại cùng read + arguments khi chưa có write có thể đổi trạng thái; dùng kết quả/feedback đã có.
@@ -74,7 +78,7 @@ class LoopMonitor:
     reuse. A successful/potentially mutating write invalidates all transient caches
     conservatively across apps; reads and known no-op writes do not.
     """
-    def __init__(self, max_entries=100, empty_read_limit=0):
+    def __init__(self, max_entries=100, empty_read_limit=DEFAULT_EMPTY_READ_LIMIT):
         if type(max_entries) is not int or not 1 <= max_entries <= 100:
             raise ValueError("max_entries must be an integer between 1 and 100")
         if type(empty_read_limit) is not int or empty_read_limit < 0:

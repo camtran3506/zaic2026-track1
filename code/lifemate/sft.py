@@ -9,16 +9,17 @@ import re
 import time
 import unicodedata
 
-from .agent import (SYSTEM_PROMPT, _train_transcript, audio_path, build_step_prompt,
+from .agent import (SYSTEM_PROMPT, AgentConfig, _train_transcript, audio_path, build_step_prompt,
                     full_json, history_text)
 from .catalog import allowed_tools
 from .function_calling import native_chat, native_observation_messages
-from .history import history_entries
+from .history import extract_observed_ids, history_entries
 from .llm import chat_token_ids
 from .local_time import LOCAL_TIME_POLICY
 from .local_helpers import LOCAL_HELPER_POLICY, execute_helper
 from .execution_policy import EXECUTION_POLICY, LoopMonitor
-from .tool_execution import precheck_call, attempt_env_call, result_observation
+from .tool_execution import (precheck_call, attempt_env_call, check_observed_xref,
+                             result_observation, update_observed_ids)
 from .specialist_training import specialist_demonstrations
 from .temporal_training import helper_demonstrations
 from .assist_training import task_demonstrations
@@ -32,9 +33,10 @@ from .schema_prompt import SCHEMA_PROMPT_POLICY
 from .numerics import DEBUG_BATCH_KEY
 
 
-SFT_PROMPT_POLICY = "full-trajectory-date-apps-v15"
+SFT_PROMPT_POLICY = "full-trajectory-date-apps-v17-dual-transcript-source"
 VALIDATION_ROLLOUT_POLICY = "asr-only-paired-clean-v1"
 DEFAULT_ASR_TRANSCRIPT_RATIO = 0.5
+SYNTHETIC_SFT_POLICY = "recorded-tool-results-audio-text-only-v1"
 _THINK_OPEN = "<think>\n"
 _THINK_CLOSE = "\n</think>\n\n"
 _ASSISTANT_SPAN = re.compile(
@@ -50,6 +52,12 @@ def asr_transcript_ratio(value):
     if not 0 <= ratio <= 1:
         raise ValueError("ASR transcript ratio must be between 0 and 1")
     return ratio
+
+
+def is_synthetic_sample(item):
+    """Use explicit provenance, never a missing WAV, to select offline replay."""
+    return (item.get("synthetic") is True
+            or str(item.get("id", "")).startswith("synthetic_"))
 
 
 def assign_transcript_sources(records, ratio=DEFAULT_ASR_TRANSCRIPT_RATIO, seed=42, *, count=None):
@@ -83,6 +91,14 @@ def validate_prompt_policy(manifest):
 
 class UnexposedToolError(ValueError):
     """A gold tool is absent from the actual prompt's complete schemas."""
+
+
+class GoldGuardConflict(ValueError):
+    """An automatic guard rejects a gold target; never train that contradiction."""
+
+    def __init__(self, sample_id, step, feedback):
+        self.feedback = deepcopy(feedback)
+        super().__init__(f"{sample_id} step {step}: gold blocked by automatic guard: {full_json(feedback)}")
 
 
 def split_records(records, validation_fraction=0.0, seed=42):
@@ -164,6 +180,12 @@ def _current_train_transcript(item, split_dir, asr, transcript_source):
 
 def prepare_train_transcript(item, split_dir, asr=None, *, transcript_source=None):
     """Resolve one selected source for all SFT steps, without silent fallback."""
+    if is_synthetic_sample(item):
+        if not isinstance(item.get("audio_text"), str) or not item["audio_text"].strip():
+            raise ValueError(f"{item['id']}: synthetic samples require nonempty audio_text")
+        # Synthetic audio fields can contain placeholders. Never decode them,
+        # including audio-only history; history must supply its own text.
+        asr, transcript_source = None, "audio_text"
     started = time.monotonic()
     transcript, transcript_source = _current_train_transcript(item, split_dir, asr, transcript_source)
     class MissingASR:
@@ -200,6 +222,8 @@ def pretranscribe_sft_partition(records, split_dir, asr, partition, sources, bat
         return
     needed_audios = []
     for record in records:
+        if is_synthetic_sample(record):
+            continue
         needs_current = (partition != "train") or (sources.get(record["id"]) == "asr")
         if needs_current and record.get("audio"):
             needed_audios.append(audio_path(split_dir, record["audio"]))
@@ -211,30 +235,38 @@ def pretranscribe_sft_partition(records, split_dir, asr, partition, sources, bat
         asr.transcribe_batch(unique_needed, batch_size=batch_size)
 
 
-def replay_sample(item, catalog, env, split_dir, asr=None, prepared_transcript=None, *, tokenizer=None, include_date_helpers=True):
+def replay_sample(item, catalog, env, split_dir, asr=None, prepared_transcript=None, *, tokenizer=None,
+                  include_date_helpers=True, config=None, _recorded_results=None):
     """Replay TRAIN gold in order; never expose future calls in earlier prompts."""
     calls = item.get("label", {}).get("tool_calls")
     if not isinstance(calls, list):
         raise ValueError(f"{item['id']}: missing label.tool_calls list (empty list is valid)")
     prepared = prepared_transcript or prepare_train_transcript(item, split_dir, asr)
     transcript, history = prepared["transcript"], prepared["history"]
+    prompt_source = None if is_synthetic_sample(item) else prepared.get('prompt_transcript_source')
     context = item.get("context", {})
     enabled = allowed_tools(catalog, context.get("installed_apps", {}))
     observations, examples = [], []
-    monitor = LoopMonitor()
+    config = config or AgentConfig()
+    monitor = LoopMonitor(empty_read_limit=config.empty_read_limit)
+    observed_ids = extract_observed_ids(context, history) if config.enforce_observed_xref else None
 
     def example(target, step):
-        _, prompt = build_step_prompt(transcript, context, history, enabled, observations)
+        _, prompt = build_step_prompt(transcript, context, history, enabled, observations,
+                                      transcript_source=prompt_source)
         exposed = json.loads(prompt)["available_tools"]["tool_schemas"]
         if target["action"] == "call" and target["name"] not in {t["name"] for t in exposed}:
             raise UnexposedToolError(
                 f"{item['id']} step {step}: target {target['name']} not exposed in prompt "
                 f"({len(exposed)} schemas); check catalog prompt construction")
-        return {"sample_id": item["id"], "step": step, "messages": [
+        row = {"sample_id": item["id"], "step": step, "messages": [
             {"role": "system", "content": SYSTEM_PROMPT},
             {"role": "user", "content": prompt},
             {"role": "assistant", "content": json.dumps(target, ensure_ascii=False, separators=(",", ":"))},
         ]}
+        if _recorded_results is not None:
+            row["trajectory_source"] = "synthetic_recorded"
+        return row
 
     def helper_rows(helper):
         """Pack field normalization by actual completion tokens, never a count cap."""
@@ -243,7 +275,8 @@ def replay_sample(item, catalog, env, split_dir, asr=None, prepared_transcript=N
             return
         remaining = list(helper['arguments']['inputs']['fields'])
         while remaining:
-            _, prompt = build_step_prompt(transcript, context, history, enabled, observations)
+            _, prompt = build_step_prompt(transcript, context, history, enabled, observations,
+                                          transcript_source=prompt_source)
             messages = [{'role': 'system', 'content': SYSTEM_PROMPT}, {'role': 'user', 'content': prompt}]
             prefix = chat_token_ids(tokenizer, messages, True)
 
@@ -294,10 +327,12 @@ def replay_sample(item, catalog, env, split_dir, asr=None, prepared_transcript=N
 
     for step, call in enumerate(calls):
         name, args = call.get("name"), call.get("arguments")
-        rejection = precheck_call(name, args, catalog, enabled, monitor)
+        rejection = precheck_call(name, args, catalog, enabled, monitor, transcript=transcript,
+                                  context=context, history=history, observations=observations)
         if rejection:
-            reason = rejection.get("feedback", {}).get("reason", rejection.get("access", {}).get("status", rejection["stage"]))
-            raise ValueError(f"{item['id']} step {step}: gold blocked by automatic guard: {name!r}, {reason}")
+            if rejection.get('access', {}).get('allowed') is False:
+                raise UnexposedToolError(f"{item['id']} step {step}: target {name!r} not exposed: {full_json(rejection)}")
+            raise GoldGuardConflict(item['id'], step, rejection)
         if name == "sys.ask_missing_info" and step != len(calls) - 1:
             raise ValueError(f"{item['id']}: invalid or non-terminal ask_missing_info")
         # Local demonstrations are derived exclusively from the visible request,
@@ -312,13 +347,59 @@ def replay_sample(item, catalog, env, split_dir, asr=None, prepared_transcript=N
                 local_result = execute_helper(packed["name"], packed["arguments"], context, history, enabled, observations)
                 observations.append({**packed, "scope": "local", "result": full_json(local_result)})
         examples.append(example({"action": "call", "name": name, "arguments": args}, len(examples)))
-        outcome = attempt_env_call(env, name, args, enabled[name].get("kind", "unknown"), monitor, step)
+        kind = enabled[name].get("kind", "unknown")
+        if _recorded_results is None:
+            outcome = attempt_env_call(env, name, args, kind, monitor, step,
+                                       spec=enabled[name], observed_ids=observed_ids)
+        else:
+            from .local_checks import inspect_call
+            inspection = inspect_call(name, args, enabled)
+            if inspection["status"] == "invalid":
+                raise ValueError(f"{item['id']} step {step}: synthetic schema invalid: {inspection['errors']}")
+            xref_error = check_observed_xref(args, enabled[name], observed_ids)
+            if xref_error:
+                raise GoldGuardConflict(item['id'], step, {'stage': 'xref_guard', 'name': name,
+                                        'arguments': args, 'error': xref_error['error']})
+            result = deepcopy(_recorded_results[step])
+            update_observed_ids(name, args, result, kind, observed_ids)
+            verification = monitor.record_result(name, args, result, kind, call_index=step)
+            verification["origin"] = "synthetic_recorded"
+            outcome = {"executed": True, "result": result, "verification": verification,
+                       "automatic_execution_feedback": monitor.automatic_feedback(kind, verification, step)}
         if not outcome["executed"]:
+            if outcome['feedback'].get('stage') == 'xref_guard':
+                raise GoldGuardConflict(item['id'], step, outcome['feedback'])
             raise ValueError(f"{item['id']} step {step}: gold schema invalid or validation failed: {outcome['feedback']}")
         observations.append(result_observation(name, args, outcome, full_json))
     if not calls or calls[-1]["name"] != "sys.ask_missing_info":
         examples.append(example({"action": "done"}, len(examples)))
     return examples
+
+
+def replay_synthetic_sample(item, catalog, split_dir, *, prepared_transcript=None, tokenizer=None,
+                            include_date_helpers=True):
+    """Build SFT from aligned recorded calls/results without constructing ToolEnv.
+
+    Schema checks are local; recorded results and final_state are never treated
+    as proof of execution. Only the current call's recorded result is appended
+    after its target, so neither future results nor final_state enter the prefix.
+    """
+    label = item.get("label") or {}
+    calls, results = label.get("tool_calls"), label.get("tool_results")
+    if not isinstance(calls, list) or not isinstance(results, list) or len(calls) != len(results):
+        raise ValueError(f"{item['id']}: synthetic label.tool_calls/tool_results must be aligned lists")
+    for step, (call, result) in enumerate(zip(calls, results)):
+        if (not isinstance(call, dict) or not isinstance(call.get("name"), str)
+                or not isinstance(call.get("arguments"), dict) or not isinstance(result, dict)):
+            raise ValueError(f"{item['id']} step {step}: synthetic calls need name/arguments and object tool_results")
+        try:
+            json.dumps([call, result], allow_nan=False)
+        except (TypeError, ValueError) as exc:
+            raise ValueError(f"{item['id']} step {step}: synthetic call/result must be finite JSON") from exc
+    prepared = prepared_transcript or prepare_train_transcript(item, split_dir, transcript_source="audio_text")
+    return replay_sample(item, catalog, None, split_dir, prepared_transcript=prepared,
+                         tokenizer=tokenizer, include_date_helpers=include_date_helpers,
+                         _recorded_results=results)
 
 
 def collapse_trajectory(steps, *, extra=None):
@@ -339,7 +420,7 @@ def collapse_trajectory(steps, *, extra=None):
         "assistant_train_mask": [row.get("train", True) is not False for row in steps],
         "messages": last["messages"],
     }
-    for key in ("transcript_source", "augmentation", "recovery", "reasoning"):
+    for key in ("transcript_source", "augmentation", "recovery", "reasoning", "trajectory_source"):
         if key in last:
             collapsed[key] = deepcopy(last[key])
     if extra:
@@ -409,6 +490,10 @@ def _encode_native_with_spans(example, tokenizer, max_length, *, fuzzy_weight=No
         raise ValueError(
             f"{example.get('sample_id')}: assistant spans ({len(spans)}) do not match steps ({len(trained)})"
         )
+    if not example.get("full_trajectory"):
+        prefix_before_target = text[:spans[-1][0]]
+        if not (prefix_before_target.endswith(_THINK_OPEN) or prefix_before_target.endswith(_THINK_CLOSE)):
+            raise ValueError("Step-wise target span must be preceded by a <think> block for train/inference parity")
     fuzzy = _fuzzy_ranges(text, spans, tools) if fuzzy_weight is not None else []
     thinking = _thinking_ranges(text, spans) if reasoning_weight is not None else []
     use_weights = (fuzzy_weight is not None) or (reasoning_weight is not None)

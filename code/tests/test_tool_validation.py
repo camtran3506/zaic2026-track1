@@ -18,9 +18,9 @@ def run_agent(calls, env, config=None):
         item(), env, Path('/unused'), 'train')
 
 
-def replay(calls, env):
+def replay(calls, env, config=None):
     entry = dict(item(), audio_text='Bật đèn', label={'tool_calls': calls})
-    return replay_sample(entry, CATALOG, env, Path('/unused'))
+    return replay_sample(entry, CATALOG, env, Path('/unused'), config=config)
 
 
 def rejection_feedback(system, user):
@@ -42,7 +42,8 @@ def test_toolenv_accepted_ids_and_read_after_write_are_executed_in_both_paths():
         {'name': 'smart_home.light_set', 'arguments': {'device_id': 'not_previously_read', 'power': 'off'}},
         {'name': 'smart_home.get_status', 'arguments': {}},
     ]
-    for runner in (lambda c, e: run_agent(c, e, AgentConfig(enforce_observed_xref=False)), replay):
+    for runner in (lambda c, e: run_agent(c, e, AgentConfig(enforce_observed_xref=False)),
+                   lambda c, e: replay(c, e, AgentConfig(enforce_observed_xref=False))):
         env = FakeEnv()
         runner(calls, env)
         assert env.calls == calls
@@ -51,6 +52,11 @@ def test_toolenv_accepted_ids_and_read_after_write_are_executed_in_both_paths():
     guarded_report = run_agent(calls, guarded_env)
     assert [c['name'] for c in guarded_env.calls] == ['smart_home.get_status']
     assert guarded_report['executed'] == 1
+    # SFT now applies the same guard by default, and refuses a contradictory gold target.
+    guarded_env = FakeEnv()
+    with pytest.raises(ValueError, match='xref_guard'):
+        replay(calls, guarded_env)
+    assert not guarded_env.calls
 
 
 def test_arguments_rejected_by_toolenv_are_never_coerced_or_executed():

@@ -10,6 +10,101 @@ from .context import DEFAULT_THINKING_BUDGET
 
 
 _CLOSING_TOKEN_TABLES = WeakKeyDictionary()
+_DIRECT_ACTION_TABLES = WeakKeyDictionary()
+
+
+def _direct_action_table(tokenizer, native):
+    """Cache legal first-token continuations, including split/merged markers.
+
+    Inspect decoded vocabulary pieces rather than assuming <think> or
+    <tool_call> has one token ID. The gate ends at the structured output opener;
+    arbitrary text and literal markers inside arguments remain untouched.
+    """
+    decoder = getattr(getattr(tokenizer, 'backend_tokenizer', None), 'decoder', None)
+    key = (len(tokenizer), native, decoder.__getstate__() if decoder is not None else None,
+           getattr(tokenizer.decode, '__func__', None),
+           getattr(tokenizer.batch_decode, '__func__', None))
+    try:
+        cached = _DIRECT_ACTION_TABLES.get(tokenizer)
+    except TypeError:
+        cached = None
+    if cached is not None and key in cached:
+        return cached[key]
+    roots = ('{', '<tool_call>') if native else ('{',)
+    # ByteLevel concatenates ASCII pieces exactly. Other decoders may insert
+    # spaces or rewrite earlier text: require a whole opener in one piece there.
+    concatenate = decoder is not None and type(decoder).__name__ == 'ByteLevel'
+    prefixes = ({root[:length] for root in roots for length in range(len(root))}
+                if concatenate else {''})
+    table = {prefix: [] for prefix in prefixes}
+    ids = sorted(set(tokenizer.get_vocab().values()))
+    for start in range(0, len(ids), 16384):
+        chunk = ids[start:start + 16384]
+        pieces = tokenizer.batch_decode([[idx] for idx in chunk], skip_special_tokens=False,
+                                        clean_up_tokenization_spaces=False)
+        for idx, piece in zip(chunk, pieces):
+            if not piece:
+                continue
+            for prefix in prefixes:
+                text = (prefix + piece).lstrip()
+                if text and any(text.startswith(root) or (concatenate and root.startswith(text)) for root in roots):
+                    table[prefix].append(idx)
+    table = {prefix: tuple(allowed) for prefix, allowed in table.items()}
+    if not table['']:
+        raise ValueError('Tokenizer has no direct JSON/tool-call output opener; cannot disable thinking safely')
+    try:
+        if cached is None:
+            cached = {}
+            _DIRECT_ACTION_TABLES[tokenizer] = cached
+        cached[key] = table
+    except TypeError:
+        pass
+    return table
+
+
+class DirectActionLogitsProcessor(LogitsProcessor):
+    """Zero-thinking inference: require an action opener before any free text.
+
+    Used only for a single greedy generation with effective thinking budget 0.
+    Tokens completing a reasoning prefix (including alternative tokenizations)
+    are masked before sampling. After '{' / '<tool_call>', ordinary generation
+    and existing schema/parsing guards own the action and argument contents.
+    This enforces output framing, not a complete JSON/XML grammar.
+    """
+    def __init__(self, tokenizer, prompt_length, *, native=False):
+        self.tokenizer, self.prompt_length, self.native = tokenizer, prompt_length, native
+        self.roots = ('{', '<tool_call>') if native else ('{',)
+        self._committed = False
+        self._table = None
+        self._indices = {}
+
+    def __call__(self, input_ids, scores):
+        if self._committed:
+            return scores
+        if input_ids.shape[0] != 1:
+            raise ValueError('Direct-action guard requires single-sample greedy generation')
+        generated = input_ids[0, self.prompt_length:]
+        text = (self.tokenizer.decode(generated.tolist(), skip_special_tokens=False,
+                                      clean_up_tokenization_spaces=False).lstrip()
+                if generated.numel() else '')
+        if any(text.startswith(root) for root in self.roots):
+            self._committed = True
+            return scores
+        if self._table is None:
+            self._table = _direct_action_table(self.tokenizer, self.native)
+        allowed = self._table.get(text, ())
+        import torch
+        key = (text, scores.device, scores.shape[-1])
+        if key not in self._indices:
+            self._indices[key] = torch.tensor([idx for idx in allowed if idx < scores.shape[-1]],
+                                              dtype=torch.long, device=scores.device)
+        indices = self._indices[key]
+        kept = scores.index_select(-1, indices)
+        if not torch.isfinite(kept).any():
+            raise ValueError('No finite direct-action continuation; refusing free-form thinking output')
+        scores.fill_(-float('inf'))
+        scores.index_copy_(-1, indices, kept)
+        return scores
 
 
 def _closing_token_table(tokenizer):

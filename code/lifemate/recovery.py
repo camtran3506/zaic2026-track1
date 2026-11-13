@@ -9,13 +9,13 @@ import re
 
 from .agent import SYSTEM_PROMPT, _train_transcript, build_step_prompt, full_json
 from .catalog import allowed_tools
-from .execution_policy import LoopMonitor
+from .execution_policy import DEFAULT_EMPTY_READ_LIMIT, LoopMonitor
 from .history import collect_ids, extract_observed_ids
 from .local_helpers import execute_helper, helper_tool_schemas
 from .text import normalize_transcript
 from .tool_execution import attempt_env_call, check_observed_xref, precheck_call, result_observation
 
-GUARD_RECOVERY_POLICY = "guard-xref-validate-recovery-v1"
+GUARD_RECOVERY_POLICY = "guard-xref-validate-missing-info-recovery-v2"
 DEFAULT_GUARD_RECOVERY_RATIO = 0.18
 
 
@@ -160,7 +160,8 @@ def build_recovery_trajectory(record, prepared_transcript, steps, catalog, env_f
     history = prepared_transcript["history"]
 
     def make_step(step_num, decision, observations, *, train=True):
-        _, prompt = build_step_prompt(transcript, context, history, enabled, observations)
+        _, prompt = build_step_prompt(transcript, context, history, enabled, observations,
+                                      transcript_source=prepared_transcript.get('prompt_transcript_source'))
         row = {
             "sample_id": record["id"],
             "step": step_num,
@@ -174,11 +175,20 @@ def build_recovery_trajectory(record, prepared_transcript, steps, catalog, env_f
         }
         return row
 
+    def guarded_call(env, name, args, monitor, call_index, observed_ids, observations):
+        rejection = precheck_call(name, args, catalog, enabled, monitor, transcript=transcript,
+                                  context=context, history=history, observations=observations)
+        if rejection:
+            return {'executed': False, 'feedback': rejection}
+        return attempt_env_call(env, name, args, enabled[name].get('kind', 'unknown'), monitor,
+                                call_index, spec=enabled[name], observed_ids=observed_ids)
+
     def replay_prefix(env, monitor):
         observations = deepcopy(
             json.loads(steps[search_idx]["messages"][1]["content"])["previous_actions_and_results"]
         )
         call_index = 0
+        observed_ids = extract_observed_ids(context, history)
         for step in steps[:search_idx]:
             decision = json.loads(step["messages"][-1]["content"])
             if decision.get("action") != "call":
@@ -186,34 +196,35 @@ def build_recovery_trajectory(record, prepared_transcript, steps, catalog, env_f
             name, args = decision["name"], decision["arguments"]
             if name in local_names:
                 continue
-            outcome = attempt_env_call(env, name, args, enabled[name].get("kind", "unknown"), monitor, call_index)
+            prior = json.loads(step['messages'][1]['content'])['previous_actions_and_results']
+            outcome = guarded_call(env, name, args, monitor, call_index, observed_ids, prior)
             if not outcome["executed"]:
-                return None, 0
+                return None, 0, observed_ids
             call_index += 1
-        return observations, call_index
+        return observations, call_index, observed_ids
 
-    probe_env, probe_monitor = env_factory(), LoopMonitor()
-    probe_obs, call_index = replay_prefix(probe_env, probe_monitor)
+    probe_env, probe_monitor = env_factory(), LoopMonitor(empty_read_limit=DEFAULT_EMPTY_READ_LIMIT)
+    probe_obs, call_index, probe_ids = replay_prefix(probe_env, probe_monitor)
     if probe_obs is None or precheck_call(fn, {"query": wrong}, catalog, enabled, probe_monitor) is not None:
         return None
-    wrong_outcome = attempt_env_call(probe_env, fn, {"query": wrong}, enabled[fn].get("kind", "unknown"), probe_monitor, call_index)
+    wrong_outcome = guarded_call(probe_env, fn, {'query': wrong}, probe_monitor, call_index, probe_ids, probe_obs)
     if not wrong_outcome["executed"] or search_hits(wrong_outcome["result"]):
         return None
 
     if kind == "asr_name":
         last_word = wrong.split()[-1]
-        test_env, test_monitor = env_factory(), LoopMonitor()
-        test_obs, test_idx = replay_prefix(test_env, test_monitor)
+        test_env, test_monitor = env_factory(), LoopMonitor(empty_read_limit=DEFAULT_EMPTY_READ_LIMIT)
+        test_obs, test_idx, test_ids = replay_prefix(test_env, test_monitor)
         if test_obs is None:
             return None
-        attempt_env_call(test_env, fn, {"query": wrong}, enabled[fn].get("kind", "unknown"), test_monitor, test_idx)
-        last_outcome = attempt_env_call(test_env, fn, {"query": last_word}, enabled[fn].get("kind", "unknown"), test_monitor, test_idx + 1)
+        guarded_call(test_env, fn, {'query': wrong}, test_monitor, test_idx, test_ids, test_obs)
+        last_outcome = guarded_call(test_env, fn, {'query': last_word}, test_monitor, test_idx + 1, test_ids, test_obs)
         recover_args = {"query": last_word} if (last_outcome["executed"] and (target_ids & set(search_hits(last_outcome["result"])))) else {}
     else:
         recover_args = {"query": query}
 
-    env, monitor = env_factory(), LoopMonitor()
-    observations, call_index = replay_prefix(env, monitor)
+    env, monitor = env_factory(), LoopMonitor(empty_read_limit=DEFAULT_EMPTY_READ_LIMIT)
+    observations, call_index, observed_ids = replay_prefix(env, monitor)
     if observations is None:
         return None
     new_steps = [deepcopy(row) for row in steps[:search_idx]]
@@ -222,7 +233,7 @@ def build_recovery_trajectory(record, prepared_transcript, steps, catalog, env_f
     new_steps.append(make_step(len(new_steps), wrong_decision, observations, train=False))
     if precheck_call(fn, {"query": wrong}, catalog, enabled, monitor) is not None:
         return None
-    wrong_outcome = attempt_env_call(env, fn, {"query": wrong}, enabled[fn].get("kind", "unknown"), monitor, call_index)
+    wrong_outcome = guarded_call(env, fn, {'query': wrong}, monitor, call_index, observed_ids, observations)
     if not wrong_outcome["executed"] or search_hits(wrong_outcome["result"]):
         return None
     call_index += 1
@@ -232,7 +243,7 @@ def build_recovery_trajectory(record, prepared_transcript, steps, catalog, env_f
     new_steps.append(make_step(len(new_steps), recover_decision, observations, train=True))
     if precheck_call(fn, recover_args, catalog, enabled, monitor) is not None:
         return None
-    recover_outcome = attempt_env_call(env, fn, recover_args, enabled[fn].get("kind", "unknown"), monitor, call_index)
+    recover_outcome = guarded_call(env, fn, recover_args, monitor, call_index, observed_ids, observations)
     if not recover_outcome["executed"] or not (target_ids & set(search_hits(recover_outcome["result"]))):
         return None
     call_index += 1
@@ -254,7 +265,7 @@ def build_recovery_trajectory(record, prepared_transcript, steps, catalog, env_f
         expected_result = orig_after_obs[offset]["result"]
         if precheck_call(name, args, catalog, enabled, monitor) is not None:
             return None
-        outcome = attempt_env_call(env, name, args, enabled[name].get("kind", "unknown"), monitor, call_index)
+        outcome = guarded_call(env, name, args, monitor, call_index, observed_ids, observations)
         if not outcome["executed"] or full_json(outcome["result"]) != expected_result:
             return None
         call_index += 1
@@ -324,7 +335,7 @@ class _ValidateOnlyEnv:
 
 
 def _probe_guard_rejection(env, name: str, bad_args: dict, catalog, enabled, spec: dict, observed_ids: dict[str, set[str]], call_index: int):
-    if precheck_call(name, bad_args, catalog, enabled, LoopMonitor()) is not None:
+    if precheck_call(name, bad_args, catalog, enabled, LoopMonitor(empty_read_limit=DEFAULT_EMPTY_READ_LIMIT)) is not None:
         return None
     validation = env.validate(name, bad_args)
     accepted = isinstance(validation, dict) and validation.get("ok") is True
@@ -335,7 +346,7 @@ def _probe_guard_rejection(env, name: str, bad_args: dict, catalog, enabled, spe
         name,
         bad_args,
         spec.get("kind", "unknown"),
-        LoopMonitor(),
+        LoopMonitor(empty_read_limit=DEFAULT_EMPTY_READ_LIMIT),
         call_index,
         spec=spec,
         observed_ids=observed_ids,
@@ -370,11 +381,12 @@ def build_guard_recovery_examples(
     Uses already-replayed step observations + read-only `env.validate` probing so no extra
     `ToolEnv` instances or `env.call` side effects occur.
 
-    Covers two genuine failure modes:
+    Covers genuine failure modes:
     1. `xref_guard`: LLM proposes a `write` call with an unobserved/raw `x-ref` argument before
        calling the prerequisite `read` tool -> teaches reading `agent_feedback` and calling the read tool.
     2. `validate`: LLM proposes an env call missing a required parameter or using an invalid enum
        -> teaches reading `agent_feedback` and immediately correcting the call.
+    3. `missing_info_guard`: LLM asks for an already-resolved field -> teaches continuing the gold action.
     """
     if max_examples_per_trajectory < 1 or not steps:
         return []
@@ -441,7 +453,8 @@ def build_guard_recovery_examples(
                 )
                 if feedback and feedback.get("stage") in ("xref_guard", "validate"):
                     obs_with_error = deepcopy(obs_at_k) + [feedback]
-                    _, prompt = build_step_prompt(transcript, context, history, enabled, obs_with_error)
+                    _, prompt = build_step_prompt(transcript, context, history, enabled, obs_with_error,
+                                                  transcript_source=prepared_transcript.get('prompt_transcript_source'))
                     results.append({
                         "sample_id": record["id"],
                         "step": 0,
@@ -461,6 +474,31 @@ def build_guard_recovery_examples(
                         ],
                     })
                     break
+
+        if len(results) < max_examples_per_trajectory and kind == 'write':
+            props = (spec.get('parameters') or {}).get('properties') or {}
+            for parameter in args:
+                if parameter not in props:
+                    continue
+                proposed = {'tool_name': name, 'params': [parameter]}
+                feedback = precheck_call('sys.ask_missing_info', proposed, catalog, enabled,
+                                        LoopMonitor(empty_read_limit=DEFAULT_EMPTY_READ_LIMIT),
+                                        transcript=transcript, context=context, history=history,
+                                        observations=obs_at_k)
+                if not feedback or feedback.get('feedback', {}).get('reason') != 'information_already_available':
+                    continue
+                _, prompt = build_step_prompt(transcript, context, history, enabled, deepcopy(obs_at_k) + [feedback],
+                                              transcript_source=prepared_transcript.get('prompt_transcript_source'))
+                results.append({
+                    'sample_id': record['id'], 'step': 0, 'full_trajectory': False, 'train': True,
+                    'transcript_source': prepared_transcript.get('transcript_source'),
+                    'recovery': {'kind': 'guard_missing_info', 'stage': 'missing_info_guard',
+                                 'failed_tool': 'sys.ask_missing_info', 'target_tool': name},
+                    'messages': [{'role': 'system', 'content': SYSTEM_PROMPT},
+                                 {'role': 'user', 'content': prompt},
+                                 {'role': 'assistant', 'content': json.dumps(decision, ensure_ascii=False, separators=(',', ':'))}],
+                })
+                break
 
         if len(results) < max_examples_per_trajectory and kind == "write" and name != "sys.ask_missing_info":
             params_schema = spec.get("parameters") or {}
@@ -491,7 +529,8 @@ def build_guard_recovery_examples(
                 )
                 if feedback and feedback.get("stage") == "validate":
                     obs_with_error = deepcopy(obs_at_k) + [feedback]
-                    _, prompt = build_step_prompt(transcript, context, history, enabled, obs_with_error)
+                    _, prompt = build_step_prompt(transcript, context, history, enabled, obs_with_error,
+                                                  transcript_source=prepared_transcript.get('prompt_transcript_source'))
                     results.append({
                         "sample_id": record["id"],
                         "step": 0,

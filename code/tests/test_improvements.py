@@ -154,7 +154,7 @@ def test_real_qwen35_tokenizer_full_trajectory_and_fuzzy_weights():
     assert "done" in "".join(exact_tokens)
 
 
-def test_pre_execution_guards_xref_retry_cap_and_filters():
+def test_pre_execution_guards_xref_distinct_reads_and_filters():
     catalog = {
         **CATALOG,
         "contacts.search": {
@@ -194,7 +194,7 @@ def test_pre_execution_guards_xref_retry_cap_and_filters():
         json.dumps({"action": "call", "name": "contacts.search", "arguments": {"query": "A", "tag": ""}}),
         # 3. Second empty search -> allowed
         json.dumps({"action": "call", "name": "contacts.search", "arguments": {"query": "B"}}),
-        # 4. Third empty search -> blocked by retry_cap=2!
+        # 4. Third distinct empty search -> allowed without an empty-read cap
         json.dumps({"action": "call", "name": "contacts.search", "arguments": {"query": "C"}}),
         # 5. Unmentioned default profile city -> popped from weather.get_current
         json.dumps({"action": "call", "name": "weather.get_current", "arguments": {"location": "Huế"}}),
@@ -208,13 +208,14 @@ def test_pre_execution_guards_xref_retry_cap_and_filters():
     stats = LifeMateAgent(StubASR(), StubLLM(outputs), catalog, AgentConfig(max_invalid=5)).run(
         entry, env, Path("/unused"), "train", prepared_transcript=prepared
     )
-    assert stats["invalid_proposals"] == 2  # fake_id x-ref + 3rd empty search retry cap
+    assert stats["invalid_proposals"] == 1  # Only the guessed x-ref ID is blocked.
     assert [c["name"] for c in env.calls] == [
-        "contacts.search", "contacts.search", "weather.get_current", "smart_home.get_status", "smart_home.light_set"
+        "contacts.search", "contacts.search", "contacts.search", "weather.get_current",
+        "smart_home.get_status", "smart_home.light_set"
     ]
     assert env.calls[0]["arguments"] == {"query": "A"}  # empty tag stripped
-    assert env.calls[2]["arguments"] == {}  # default Huế popped
-    assert env.calls[4]["arguments"] == {"device_id": "light_living", "power": "on"}
+    assert env.calls[3]["arguments"] == {}  # default Huế popped
+    assert env.calls[5]["arguments"] == {"device_id": "light_living", "power": "on"}
 
 
 def test_cross_app_contact_id_observed_in_history_passes_xref():
@@ -246,7 +247,8 @@ def test_cross_app_contact_id_observed_in_history_passes_xref():
     assert env.calls == [{"name": "sms.send", "arguments": {"contact_id": "c_778", "content": "ok"}}]
 
 
-def test_build_recovery_trajectory_honorific_masks_wrong_search():
+@pytest.mark.parametrize('prompt_source', [None, 'asr'])
+def test_build_recovery_trajectory_honorific_masks_wrong_search(prompt_source):
     catalog = {
         "sys.ask_missing_info": CATALOG["sys.ask_missing_info"],
         "contacts.search": {
@@ -286,6 +288,8 @@ def test_build_recovery_trajectory_honorific_masks_wrong_search():
         ]},
     }
     prepared = {"id": "train_rec", "transcript": "nhắn cho anh dũng là mai họp", "history": [], "transcript_source": "asr"}
+    if prompt_source is not None:
+        prepared['prompt_transcript_source'] = prompt_source
     steps = replay_sample(record, catalog, ContactEnv(), Path("/unused"), prepared_transcript=prepared, include_date_helpers=False)
     rec = build_recovery_trajectory(record, prepared, steps, catalog, ContactEnv)
     assert rec is not None
@@ -294,6 +298,9 @@ def test_build_recovery_trajectory_honorific_masks_wrong_search():
     assert [s.get("train", True) for s in rec_steps] == [False, True, True, True]
     traj = collapse_trajectory(rec_steps)
     assert traj["assistant_train_mask"] == [False, True, True, True]
+    assert all(json.loads(s['messages'][1]['content']).get('request_transcript_source') == prompt_source
+               for s in rec_steps)
+    assert json.loads(traj['messages'][1]['content']).get('request_transcript_source') == prompt_source
 
 
 def test_weighted_loss_trainer_matches_full_vocab_loss_and_gradients(tmp_path):

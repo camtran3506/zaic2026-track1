@@ -17,13 +17,21 @@ from .text import normalize_transcript
 # rendered/tokenized in full. Never infer arbitrary Jinja semantics from a probe.
 _QWEN35_TEMPLATE_SHA256 = "273d8e0e683b885071fb17e08d71e5f2a5ddfb5309756181681de4f5a1822d80"
 _ANCHOR = {"role": "user", "content": "LifeMate observation boundary"}
+_TRANSCRIPT_SOURCE_NOTES = {
+    'audio_text': 'request_transcript là audio_text gốc do dataset cung cấp cho yêu cầu hiện tại, '
+                  'không phải đầu ra nhận dạng của model ASR. Dùng nội dung này cùng context/history để xử lý yêu cầu.',
+    'asr': 'request_transcript là bản nhận dạng từ model ASR, có thể sai tên riêng, từ, số hoặc dấu câu. '
+           'Đối chiếu context/history và kết quả read; khi tìm kiếm rỗng, thử truy vấn rút gọn hoặc công cụ danh sách. '
+           'Không tự bịa hay tự đổi ý định. Không hỏi thêm chỉ vì nguồn là ASR; chỉ hỏi khi thông tin bắt buộc '
+           'vẫn chưa xác định sau khi đối chiếu các nguồn sẵn có.',
+}
 
 
 def _json(value):
     return json.dumps(value, ensure_ascii=False, default=str, separators=(",", ":"))
 
 
-def fixed_prompt_payload(transcript, context, history, enabled):
+def fixed_prompt_payload(transcript, context, history, enabled, *, transcript_source=None):
     """The same ordered payload used by the reference SFT/inference builder."""
     tools = prompt_catalog(with_local_tools(enabled))
     transcript = normalize_transcript(transcript)
@@ -50,8 +58,17 @@ def fixed_prompt_payload(transcript, context, history, enabled):
                 apps[app["id"]] = summary
     if apps and "apps" not in user_context:
         user_context["apps"] = apps
+    # Only original dual SFT variants opt in. No source is inferred from text,
+    # and the paired gold text is never exposed to the ASR variant.
+    source_info = {}
+    if transcript_source is not None:
+        if transcript_source not in _TRANSCRIPT_SOURCE_NOTES:
+            raise ValueError(f'Unknown prompt transcript source: {transcript_source!r}')
+        source_info = {'request_transcript_source': transcript_source,
+                       'request_transcript_note': _TRANSCRIPT_SOURCE_NOTES[transcript_source]}
     return tools, {
         "request_transcript": transcript,
+        **source_info,
         "itn_policy": ITN_POLICY,
         "automatic_execution_policy": EXECUTION_POLICY,
         "itn_candidates": detect_candidates(transcript),

@@ -10,8 +10,12 @@ from types import SimpleNamespace
 import pytest
 
 from lifemate.evaluation import StateToolEvaluator
-from lifemate.sft import assign_transcript_sources, prepare_train_transcript
+from lifemate.asr import DEFAULT_SFT_ASR_MODEL
+from lifemate.function_calling import native_chat
+from lifemate.sft import (assign_transcript_sources, collapse_trajectory, encode_example,
+                          prepare_train_transcript, replay_sample)
 from test_baseline import CATALOG, FakeEnv
+from test_prompt_session import bpe_tokenizer
 from test_sft import labeled
 
 
@@ -63,18 +67,35 @@ def test_asr_error_is_not_replaced_by_existing_audio_text(tmp_path):
         prepare_train_transcript(entry, tmp_path, transcript_source='asr')
 
 
-@pytest.mark.parametrize('script', ['finetune.py', 'prepare_sft.py'])
-@pytest.mark.parametrize('ratio', [0.5, 1])
-def test_asr_mix_requires_asr_before_creating_output(script, ratio, tmp_path):
-    app = Path(__file__).resolve().parents[1]
-    output = tmp_path / 'run'
-    command = [sys.executable, app / script, '--data-root', 'unused', '--output-dir', output,
-               '--asr-transcript-ratio', str(ratio)]
-    if script == 'finetune.py':
-        command += ['--base-model', 'unused']
-    result = subprocess.run(command, capture_output=True, text=True)
-    assert result.returncode != 0 and '--asr-model is required' in result.stderr
-    assert not output.exists()
+@pytest.mark.parametrize('mode', ['dual', 'mix'])
+@pytest.mark.parametrize('override', [False, True])
+def test_finetune_forwards_finetuned_asr_default_or_explicit_override(tmp_path, monkeypatch, mode, override):
+    import finetune
+    commands = []
+
+    class Child:
+        def __init__(self, command, **kwargs):
+            commands.append(command)
+            self.stdout = ()
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def wait(self): return 0
+
+    base = tmp_path / 'base'
+    base.mkdir()
+    args = ['finetune.py', '--data-root', 'unused', '--base-model', str(base),
+            '--output-dir', str(tmp_path / 'run'), '--transcript-mode', mode]
+    expected = tmp_path / 'explicit-asr' if override else DEFAULT_SFT_ASR_MODEL
+    if override:
+        args += ['--asr-model', str(expected)]
+    monkeypatch.setattr(sys, 'argv', args)
+    monkeypatch.setattr(finetune.subprocess, 'Popen', Child)
+    finetune.main()
+    prepare, train = commands
+    assert Path(prepare[1]).name == 'prepare_sft.py'
+    assert prepare[prepare.index('--asr-model') + 1] == str(expected)
+    assert prepare[prepare.index('--transcript-mode') + 1] == mode
+    assert Path(train[1]).name == 'train_lora.py'
 
 
 @pytest.mark.parametrize('samples,validation_fraction', [(20, 0), (1, 0), (20, 0.2), (10, 0.1)])
@@ -187,7 +208,8 @@ def test_explicit_single_source_ablation(ratio, source):
     assert set(assign_transcript_sources(records, ratio).values()) == {source}
 
 
-def test_default_dual_mode_replays_both_gold_and_asr(tmp_path, monkeypatch):
+@pytest.mark.parametrize('mode', ['dual', 'mix'])
+def test_preparation_defaults_to_finetuned_asr_in_dual_and_mix(tmp_path, monkeypatch, mode):
     import lifemate.models
     import lifemate.transcripts
     import prepare_sft
@@ -199,23 +221,62 @@ def test_default_dual_mode_replays_both_gold_and_asr(tmp_path, monkeypatch):
         (source / f'train_{i}.wav').write_bytes(b'audio')
     (source / 'train_tools_catalog.json').write_text(json.dumps({'apps': [{'tools': list(CATALOG.values())}]}))
     (source / 'train.jsonl').write_text(''.join(json.dumps(r) + '\n' for r in records))
+    selected_models = []
     class ASR:
-        def __init__(self, *a, **kw): pass
+        def __init__(self, model_path, **kw): selected_models.append(model_path)
         def transcribe(self, path): return f'ASR {path.stem}'
     class Env(FakeEnv):
         def __init__(self, *a, **kw): super().__init__()
         def get_state_hash(self): return 'fixture-state'
     monkeypatch.setattr(lifemate.models, 'LocalASR', ASR)
-    monkeypatch.setattr(lifemate.transcripts, 'asr_identity', lambda *a: {'model': 'stub-asr', 'precision': 'int8'})
+    monkeypatch.setattr(lifemate.transcripts, 'asr_identity', lambda path, *a: {'model_path': str(path)})
     monkeypatch.setitem(sys.modules, 'zaic_tools', SimpleNamespace(ToolEnv=Env))
     output = tmp_path / 'sft-dual'
     monkeypatch.setattr(sys, 'argv', ['prepare_sft.py', '--data-root', str(source),
-        '--output-dir', str(output), '--asr-model', 'stub-asr', '--validation-fraction', '0'])
+        '--output-dir', str(output), '--transcript-mode', mode, '--validation-fraction', '0'])
     prepare_sft.main()
     saved = json.loads((output / 'manifest.json').read_text())
     info = saved['partitions']['train']
-    assert saved['sft_format']['transcript_mode'] == 'dual'
-    assert info['transcript_source_counts'] == {'audio_text': 4, 'asr': 4}
+    assert selected_models == [DEFAULT_SFT_ASR_MODEL]
+    assert saved['asr']['model_path'] == str(DEFAULT_SFT_ASR_MODEL)
+    assert saved['sft_format']['transcript_mode'] == mode
+    assert saved['sft_format']['dual_transcript_source_prompt'] is (mode == 'dual')
+    expected_counts = {'audio_text': 4, 'asr': 4} if mode == 'dual' else {'audio_text': 2, 'asr': 2}
+    assert info['transcript_source_counts'] == expected_counts
     rows = [json.loads(line) for line in (output / 'train.jsonl').read_text().splitlines()]
-    assert {(r['sample_id'], r['transcript_source']) for r in rows} == {
-        (f'train_{i}', src) for i in range(4) for src in ('audio_text', 'asr')}
+    expected = ({(f'train_{i}', src) for i in range(4) for src in ('audio_text', 'asr')}
+                if mode == 'dual' else set(assign_transcript_sources(records).items()))
+    assert {(r['sample_id'], r['transcript_source']) for r in rows} == expected
+    for row in rows:
+        payload = json.loads(row['messages'][1]['content'])
+        if mode != 'dual':
+            assert 'request_transcript_source' not in payload and 'request_transcript_note' not in payload
+            continue
+        assert payload['request_transcript_source'] == row['transcript_source']
+        chat, _ = native_chat(row['messages'])
+        request, = [json.loads(m['content']) for m in chat if m['role'] == 'user'
+                    and 'request_transcript' in json.loads(m['content'])]
+        assert request['request_transcript_source'] == row['transcript_source']
+        assert request['request_transcript_note'] == payload['request_transcript_note']
+        if row['transcript_source'] == 'asr':
+            assert 'Human' not in row['messages'][1]['content']
+            assert 'có thể sai' in payload['request_transcript_note']
+            assert 'Không hỏi thêm chỉ vì nguồn là ASR' in payload['request_transcript_note']
+        else:
+            assert 'audio_text gốc' in payload['request_transcript_note']
+
+
+@pytest.mark.parametrize('source', ['audio_text', 'asr'])
+def test_dual_source_survives_full_trajectory_and_native_encoding(source, bpe_tokenizer):
+    entry = labeled()
+    prepared = prepare_train_transcript(entry, Path('/unused'))
+    prepared.update(transcript_source=source, prompt_transcript_source=source)
+    steps = replay_sample(entry, CATALOG, FakeEnv(), Path('/unused'), prepared_transcript=prepared)
+    full = collapse_trajectory(steps)
+    chat, _ = native_chat(full['messages'])
+    request, = [json.loads(m['content']) for m in chat if m['role'] == 'user'
+                and 'request_transcript' in json.loads(m['content'])]
+    assert request['request_transcript_source'] == source
+    assert request['request_transcript_note']
+    encoded = encode_example(full, bpe_tokenizer, 16384)
+    assert any(label != -100 for label in encoded['labels'])

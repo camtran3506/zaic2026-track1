@@ -28,7 +28,7 @@ LifeMate hoạt động theo nguyên lý **2 giai đoạn độc lập tuyệt �
 2. **Giai đoạn LLM (Chữ viết -> Tool Execution Agent):**
    - Sử dụng mô hình `Qwen/Qwen3.5-4B` tải ở định dạng `bfloat16` kết hợp LoRA Adapter.
    - Tự động nạp `user_context` (bao gồm `date_reference` tính sẵn và danh mục app), kết hợp dynamic prefix caching, schema snapshot caching.
-   - Inference mặc định **tắt thinking** (`enable_thinking=False`, `thinking_budget=0`): tối đa **16.000 input / 384 output tokens** mỗi lượt, không cấp riêng 256 token thinking. Dữ liệu SFT mặc định **bật Short Checked Reasoning** trong thẻ `<think>` để huấn luyện.
+   - Inference mặc định **tắt thinking** (`enable_thinking=False`, `thinking_budget=0`): tối đa **16.000 input / 384 output tokens** mỗi lượt, không cấp riêng 256 token thinking. Dữ liệu SFT mặc định dùng **Step-wise SFT** (`--step-wise-sft`) và tắt Short Checked Reasoning (`--no-short-reasoning`) để đồng bộ prefix `<think>\n\n</think>\n\n` giữa train và inference (có thể bật lại reasoning khi thử nghiệm bằng `--short-reasoning`).
    - Tương tác nhiều lượt với môi trường công cụ (Tool Environment) cho đến khi ra kết quả cuối cùng hoặc đạt giới hạn số bước.
 
 ### 1.2. Cấu trúc cây thư mục chuẩn
@@ -197,6 +197,10 @@ cd /mnt/mmlab2024nas/trantran/lifemate/code
 ```
 *Xác nhận:* Thư mục `code/models/asr_ft` sẽ chứa đầy đủ `encoder.onnx`, `decoder.onnx`, `joiner.onnx`, `tokens.txt`, `bpe.model` và tệp kê khai `lifemate_manifest.json`.
 
+Inference nạp các file ONNX đã xuất trong `models/asr_ft`, không nạp trực tiếp
+`result/asr_sft/best.pt`. Sau mỗi lần train ASR tạo checkpoint mới, cần chạy lại
+bước export này để cập nhật ONNX trước khi tạo transcript mới.
+
 ---
 
 ## 5. BƯỚC 3: FINE-TUNE MÔ HÌNH LLM LORA ADAPTER
@@ -204,17 +208,37 @@ cd /mnt/mmlab2024nas/trantran/lifemate/code
 Quá trình fine-tune LLM huấn luyện mô hình `Qwen3.5-4B` thực hiện gọi công cụ (tool call) chính xác theo giọng nói và văn cảnh người dùng.
 
 Pipeline đã tích hợp toàn bộ các kỹ thuật tối ưu hóa cao nhất:
-- **Full-Trajectory SFT:** Gộp toàn bộ các lượt gọi công cụ của 1 mẫu thành 1 trajectory liền mạch.
-- **Dual Gold + ASR (`--transcript-mode dual`):** Nhân đôi dữ liệu với 100% bản chép lời chuẩn (Gold) và 100% bản nhận dạng giọng nói ASR.
-- **Weighted Loss Trainer (`--fuzzy-weight 0.3`, `--reasoning-weight 0.25`):** Giảm trọng số phạt sai sót trên các tham số tìm kiếm mờ (`fuzzy`) và token reasoning, ưu tiên độ chính xác của lệnh gọi công cụ (`tool_call`).
+- **Step-wise SFT (mặc định bật `--step-wise-sft`):** Mỗi lượt quyết định là một dòng SFT riêng biệt, đồng bộ prefix `<think>\n\n</think>\n\n` giữa toàn bộ các bước đọc/ghi trong lúc train và lúc suy luận (`--no-step-wise-sft` để chuyển về full-trajectory packing).
+- **Dual Gold + ASR (`--transcript-mode dual`):** Nhân đôi dữ liệu với 100% bản chép lời chuẩn (Gold) và 100% bản nhận dạng giọng nói ASR. Prompt của mỗi bản có nhãn nguồn riêng để model phân biệt.
+- **Weighted Loss Trainer (`--fuzzy-weight 0.3`):** Giảm trọng số phạt sai sót trên các tham số tìm kiếm mờ (`fuzzy`), ưu tiên độ chính xác của lệnh gọi công cụ (`tool_call`).
 - **Lọc ASR lỗi nặng (`--filter-damaged-asr`):** Bỏ qua các bản sao ASR nếu bị ASR làm mất hoàn toàn tham số thực thi chuẩn.
 - **Search Recovery Trajectories:** Bổ sung kịch bản xử lý tự phục hồi khi kết quả tìm kiếm rỗng.
-- **Self-Correction Guard Recovery (`--guard-recovery-ratio 0.18`):** Bổ sung các mẫu phục hồi đơn bước khi gặp từ chối từ guard (`xref_guard` và schema `validate`), dạy mô hình phản xạ sửa lỗi chính xác trong 3 lượt `max_invalid` khi suy luận.
-- **Short Checked Reasoning mặc định bật (`--short-reasoning`):** Dữ liệu SFT thêm dòng reasoning ngắn đã kiểm chứng và các mẫu reasoning từng bước. Khi inference vẫn dùng `enable_thinking=False`, `thinking_budget=0`.
+- **Self-Correction Guard Recovery (`--guard-recovery-ratio 0.18`):** Bổ sung các mẫu phục hồi đơn bước khi gặp từ chối từ guard (`xref_guard`, schema `validate`, và hỏi thừa `missing_info_guard`). Chỉ tính loss trên lượt sửa đúng, không dạy sinh lệnh hỏi thừa.
+- **Guard dùng chung cho SFT và inference:** Kiểm tra nguồn ID `x-ref`, giới hạn hai lượt đọc rỗng/lỗi cho mỗi tool khi trạng thái chưa đổi, chặn gọi lặp `local_*` helper với cùng tham số đã có kết quả (`loop_guard`), và chặn `sys.ask_missing_info` khi tham số sai tên hoặc giá trị đã xác định chắc chắn từ dữ kiện nhìn thấy.
+- **Short Checked Reasoning mặc định tắt (`--no-short-reasoning`):** Giữ đồng bộ 100% với chế độ suy luận `enable_thinking=False`, `thinking_budget=0` (có thể bật lại khi thử nghiệm bằng `--short-reasoning`).
 - **Pre-computed `date_reference`:** Tự động giải quyết thời gian biểu mà không cần sinh các lệnh gọi helper thời gian dư thừa.
 
 ### 5.1. Chạy Fine-tune LLM toàn diện bằng `nohup` (Khuyên dùng)
-Chạy kịch bản 1 lệnh [`finetune.py`](code/finetune.py) (mặc định kích hoạt Guard Recovery và Short Checked Reasoning):
+Chạy kịch bản 1 lệnh [`finetune.py`](code/finetune.py) (mặc định sử dụng Step-wise SFT, 3 epochs, kích hoạt Guard Recovery và tắt Short Checked Reasoning để đồng bộ với inference `thinking_budget=0`):
+
+`finetune.py` và `prepare_sft.py` mặc định dùng `code/models/asr_ft` để tạo
+transcript ở **cả dual và mix**, cùng nguồn ASR fine-tune với inference. Các lệnh
+bên dưới cũng ghi rõ đường dẫn này. Nếu chưa có bộ ONNX fine-tune đầy đủ, chạy
+bước export 4.4; chương trình báo lỗi thay vì tự dùng ASR gốc. Có thể chỉ định
+model khác bằng `--asr-model` khi chủ động làm ablation.
+
+Đổi model ASR cần dựng lại SFT trong thư mục output mới; dữ liệu SFT đã tạo bằng
+ASR gốc không tự được cập nhật. Chế độ chỉ dùng `audio_text` (tỷ lệ ASR bằng 0,
+không có audio history cần nhận dạng) và tập chỉ gồm synthetic không nạp ASR.
+
+Khi dual thực sự tạo hai bản (`0 < --asr-transcript-ratio < 1`), prompt của mẫu
+gốc có `request_transcript_source: "audio_text"` hoặc `"asr"`, cùng
+`request_transcript_note` giải thích nguồn. Bản ASR nhắc có thể nhận dạng sai và
+cần đối chiếu context/history/kết quả đọc; không hỏi thêm chỉ vì nguồn là ASR.
+Mỗi bản chỉ chứa transcript của chính nó. Nhãn áp dụng cho yêu cầu hiện tại,
+không gán nguồn cho toàn bộ history. Recovery, augmentation và full-trajectory
+của bản dual giữ cùng nhãn. Chế độ mix, các ablation tỷ lệ 0/1, mẫu synthetic,
+partition chẩn đoán và prompt inference không thêm nhãn này.
 
 ```bash
 cd /mnt/mmlab2024nas/trantran/lifemate/code
@@ -223,8 +247,8 @@ nohup /usr/bin/python3.12 finetune.py \
   --cuda-visible-devices 0 \
   --data-root /mnt/mmlab2024nas/trantran/lifemate/train+public_test \
   --base-model /mnt/mmlab2024nas/trantran/lifemate/code/models/llm \
-  --output-dir /mnt/mmlab2024nas/trantran/lifemate/code/result/run_sft_noreason \
-  --asr-model /mnt/mmlab2024nas/trantran/lifemate/code/models/asr \
+  --output-dir /mnt/mmlab2024nas/trantran/lifemate/code/result/run_sft_stepwise \
+  --asr-model /mnt/mmlab2024nas/trantran/lifemate/code/models/asr_ft \
   --transcript-mode dual \
   --asr-transcript-ratio 0.5 \
   --asr-precision auto \
@@ -233,8 +257,9 @@ nohup /usr/bin/python3.12 finetune.py \
   --filter-damaged-asr \
   --fuzzy-weight 0.3 \
   --guard-recovery-ratio 0.18 \
+  --step-wise-sft \
   --no-short-reasoning \
-  --epochs 2 \
+  --epochs 3 \
   --batch-size 1 \
   --gradient-accumulation 8 \
   --learning-rate 1e-4 \
@@ -242,35 +267,49 @@ nohup /usr/bin/python3.12 finetune.py \
   --lora-alpha 32 \
   --lora-dropout 0.0 \
   --save-strategy epoch \
-  > /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/train_llm3.log 2>&1 &
+  > /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/train_llm_stepwise.log 2>&1 &
 ```
 
 *Kiểm tra tiến trình:*
 ```bash
-tail -f /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/train_llm.log
+tail -f /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/train_llm_stepwise.log
 ```
 *Kết quả đầu ra:* Adapter hoàn chỉnh sẽ được lưu tại:
-`/mnt/mmlab2024nas/trantran/lifemate/code/result/run_sft_dual/training/adapter`
+`/mnt/mmlab2024nas/trantran/lifemate/code/result/run_sft_stepwise/training/adapter`
 
 ### 5.2. Chạy tách riêng từng bước (Dành cho Debug hoặc tùy biến)
 Nếu bạn muốn chia nhỏ để kiểm tra tập dữ liệu trước khi train:
 
 #### Bước 3a: Chuẩn bị dữ liệu SFT
+Lệnh sau tạo hai bộ riêng `sft_dual_asr_ft` và `sft_mix_asr_ft`, dùng cùng ASR
+fine-tune, tỷ lệ 0.5 và toàn bộ tập train. Nếu các thư mục đã có dữ liệu, chọn tên
+output mới; prepare không ghi đè SFT cũ.
+
 ```bash
 cd /mnt/mmlab2024nas/trantran/lifemate/code
 
-/usr/bin/python3.12 prepare_sft.py \
-  --data-root /mnt/mmlab2024nas/trantran/lifemate/train+public_test \
-  --tokenizer /mnt/mmlab2024nas/trantran/lifemate/code/models/llm \
-  --output-dir /mnt/mmlab2024nas/trantran/lifemate/code/result/sft_prepared \
-  --asr-model /mnt/mmlab2024nas/trantran/lifemate/code/models/asr \
-  --transcript-mode dual \
-  --asr-transcript-ratio 0.5 \
-  --filter-damaged-asr \
-  --guard-recovery-ratio 0.18 \
-  --short-reasoning \
-  --validation-fraction 0.0
+for SFT_TRANSCRIPT_MODE in dual mix; do
+  /usr/bin/python3.12 prepare_sft.py \
+    --data-root /mnt/mmlab2024nas/trantran/lifemate/train+public_test \
+    --tokenizer /mnt/mmlab2024nas/trantran/lifemate/code/models/llm \
+    --output-dir "/mnt/mmlab2024nas/trantran/lifemate/code/result/sft_${SFT_TRANSCRIPT_MODE}_asr_ft" \
+    --asr-model /mnt/mmlab2024nas/trantran/lifemate/code/models/asr_ft \
+    --asr-precision fp32 \
+    --asr-decoding-method modified_beam_search \
+    --asr-beam-size 4 \
+    --transcript-mode "$SFT_TRANSCRIPT_MODE" \
+    --asr-transcript-ratio 0.5 \
+    --filter-damaged-asr \
+    --guard-recovery-ratio 0.18 \
+    --step-wise-sft \
+    --no-short-reasoning \
+    --validation-fraction 0.0 || break
+done
 ```
+
+Kiểm tra `asr.model_path` trong `manifest.json` của mỗi bộ: phải trỏ vào
+`code/models/asr_ft`. Nhãn nguồn trong prompt vẫn chỉ bật cho dual; mix giữ định
+dạng prompt hiện có. Mẫu synthetic luôn dùng một bản `audio_text`, không qua ASR.
 
 #### Bước 3b: Huấn luyện LoRA với Unsloth
 ```bash
@@ -279,12 +318,12 @@ cd /mnt/mmlab2024nas/trantran/lifemate/code
 nohup /usr/bin/python3.12 train_lora.py \
   --cuda-visible-devices 0 \
   --base-model /mnt/mmlab2024nas/trantran/lifemate/code/models/llm \
-  --sft-dir /mnt/mmlab2024nas/trantran/lifemate/code/result/sft_prepared \
+  --sft-dir /mnt/mmlab2024nas/trantran/lifemate/code/result/sft_dual_asr_ft \
   --output-dir /mnt/mmlab2024nas/trantran/lifemate/code/result/training_lora \
   --backend unsloth \
   --quantization none \
   --fuzzy-weight 0.3 \
-  --epochs 2 \
+  --epochs 3 \
   --batch-size 1 \
   --gradient-accumulation 8 \
   --learning-rate 1e-4 \
@@ -294,6 +333,9 @@ nohup /usr/bin/python3.12 train_lora.py \
   --save-strategy epoch \
   > /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/train_lora_only.log 2>&1 &
 ```
+
+Để train bộ mix, thay `--sft-dir` bằng `.../result/sft_mix_asr_ft` và chọn
+`--output-dir` huấn luyện riêng.
 
 ### 5.3. (Tùy chọn) Gộp LoRA Adapter vào Base Model (`merge_lora.py`)
 Nếu muốn xuất ra một thư mục checkpoint mô hình đầy đủ không cần nạp PEFT adapter lúc suy luận:
@@ -309,43 +351,147 @@ cd /mnt/mmlab2024nas/trantran/lifemate/code
 
 ---
 
+### 5.4. Bổ sung mẫu synthetic không có audio hoặc ToolEnv
+
+Giữ cách chọn tập train và catalog hiện tại. Trong tập train đã ghép, mẫu được nhận diện
+là synthetic nếu `id` bắt đầu bằng `synthetic_` hoặc có trường `"synthetic": true`.
+Không dùng việc thiếu file WAV để nhận diện synthetic, nhằm giữ lỗi dữ liệu audio của
+mẫu gốc được phát hiện như trước.
+
+- Mẫu gốc vẫn dùng ToolEnv và chính sách `dual`/`mix` đang chọn. Tỷ lệ ASR chỉ tính
+  trên mẫu gốc; thêm synthetic không thay đổi lịch chọn transcript của chúng.
+- Synthetic phải có `audio_text` không rỗng, `label.tool_calls` và `label.tool_results`
+  là hai danh sách cùng độ dài. Mỗi kết quả tool phải là một JSON object; các call
+  phải phù hợp với schema trong catalog và `context.installed_apps` của mẫu.
+- Synthetic chỉ tạo **một nguồn transcript `audio_text`**, kể cả khi bật `dual` hoặc
+  tỷ lệ ASR bằng 1. Không chạy ASR cho audio hiện tại hay history synthetic. History
+  cần có sẵn text hoặc `audio_text`; đường dẫn WAV giả trong synthetic được bỏ qua.
+- Trajectory synthetic được dựng lần lượt từ call/result đã ghi: chỉ sau call thứ
+  `i` mới thêm result thứ `i` vào observations. `label.final_state` không đưa vào prompt.
+  Không khởi tạo ToolEnv, không yêu cầu/tạo state hash và không chạy search recovery
+  hoặc guard recovery cho các mẫu này.
+- Việc gộp call, augmentation và reasoning SFT vẫn áp dụng theo cấu hình, nên một
+  nguồn transcript có thể tạo nhiều dòng huấn luyện. Kiểm tra schema cục bộ không
+  chứng minh nghiệp vụ hoặc trạng thái cuối đã được thực thi đúng.
+
+Synthetic chỉ nằm trong partition train, không được đưa vào rollout validation hoặc
+app-heldout. Nếu synthetic lộ app đang giữ riêng cho app-heldout, bước prepare báo lỗi.
+Manifest ghi `synthetic_training`, `synthetic_samples`, `trajectory_sources` và
+`transcript_sources` để kiểm tra nguồn dữ liệu. Tập chỉ gồm synthetic dùng
+`--asr-transcript-ratio 0` và không cần `--asr-model` hay module ToolEnv.
+
+### 5.5. Guard hỏi thừa và dữ liệu mâu thuẫn
+
+Guard `sys.ask_missing_info` chạy trước `env.validate/call` ở cả inference và lúc
+dựng SFT. Nó đối chiếu tên tham số với schema, các giá trị cố định (hoặc mặc định khi
+người dùng chọn dùng mặc định), phép gán
+trường rõ ràng trong yêu cầu, entity khớp duy nhất từ context/history/kết quả đọc thành
+công, và ngày giờ tính được bằng helper Python hiện có. Khi đã biết một lựa chọn
+hợp lệ của `x-one-of`, không cần hỏi lựa chọn còn lại. Thông tin mơ hồ hoặc thực sự
+chưa có vẫn được hỏi, kể cả trường optional cần thiết cho yêu cầu cụ thể.
+
+Nếu bị chặn, model nhận `agent_feedback` gồm bằng chứng, `known_arguments` và phần
+còn thiếu để tiếp tục sửa trong giới hạn `max_invalid` hiện có. Guard không tự gọi
+write hay lấy đáp án từ nhãn gold. Các mẫu recovery hỏi thừa chỉ được chèn trên mẫu
+gốc theo `--guard-recovery-ratio`; synthetic vẫn không chạy recovery qua ToolEnv.
+
+Khi gold mâu thuẫn với guard, prepare mặc định **bỏ cả sample**, ghi rõ lý do và
+phản hồi guard vào `<partition>_skipped.jsonl`. Dùng `--guard-conflict-policy error`
+để dừng ngay khi gặp mâu thuẫn (hỗ trợ cả `finetune.py` và `prepare_sft.py`). Không
+sửa nhãn hay sửa file train nguồn. Manifest ghi `training_guards` để kiểm tra cấu hình.
+
+SFT (gốc và synthetic), recovery và inference đều tắt giới hạn số read trả rỗng
+hoặc chưa hoàn tất (`empty_read_limit=0`). Model được đọc tiếp với arguments khác;
+guard vẫn chặn lặp nguyên read + arguments khi trạng thái chưa đổi. Guard ngăn
+tự đoán ID (`enforce_observed_xref=True`) và các giới hạn tổng call/invalid/step
+vẫn giữ nguyên. Chạy lại inference để áp dụng; dựng lại SFT nếu muốn khôi phục các
+mẫu từng bị bỏ vì chạm ngưỡng read rỗng cũ.
+
+Sau thay đổi này, cần dựng lại SFT ở thư mục output mới với policy
+`full-trajectory-date-apps-v17-dual-transcript-source`, rồi train adapter từ dữ liệu mới.
+Guard inference có hiệu lực ngay khi chạy code mới; adapter cũ chưa học các mẫu
+recovery mới. Đường dẫn dataset/catalog và cách chọn dual của mẫu gốc giữ nguyên.
+
 ## 6. BƯỚC 4: CHẠY SUY LUẬN (INFERENCE PIPELINE)
 
 Giai đoạn suy luận đọc tập kiểm thử (`public_test` hoặc `private_test`), phiên âm giọng nói qua ASR, gửi văn bản và schema công cụ cho LLM, thực thi môi trường mô phỏng và xuất tệp nộp bài `submission.jsonl`.
 
+Với `--thinking-budget 0` (mặc định), inference dùng **guard chọn token** để đầu ra
+bắt đầu trực tiếp bằng `<tool_call>` ở native function calling hoặc `{` cho JSON.
+Prefix mở `<think>` và lời suy luận đứng trước hành động bị chặn ngay khi sinh,
+không chỉ xóa khỏi kết quả sau đó. Guard giữ nguyên nội dung tham số, kể cả chuỗi
+literal `<think>...</think>` bên trong dữ liệu tool. Đây là kiểm tra đầu ra bắt đầu
+đúng dạng; parser và schema tiếp tục kiểm tra phần JSON/XML còn lại.
+
+Guard chạy ở cả đường có cache và fallback. Nếu chủ động đặt ngân sách thinking
+lớn hơn 0 và còn đủ context/thời gian, cơ chế thinking có giới hạn vẫn hoạt động;
+nếu ngân sách hiệu lực về 0 thì guard tự bật. SFT/Short Checked Reasoning giữ cấu
+hình riêng. Khởi động lại tiến trình inference để áp dụng code mới với adapter hiện có.
+
+Cách chọn ASR phụ thuộc lệnh chạy:
+
+- `run_server.sh`: tự chọn `models/asr_ft` khi `models/asr_ft/tokens.txt` tồn tại
+  và không rỗng; nếu chưa có thì chọn `models/asr`. Đây là điều kiện chọn thư mục;
+  bộ ONNX trong thư mục được chọn vẫn phải đầy đủ.
+- `main.py --stage full` hoặc `--stage asr`: dùng chính xác thư mục truyền qua
+  `--asr-model`, không tự chọn checkpoint mới nhất hoặc tự export `best.pt`.
+- `main.py --stage llm`: chỉ đọc transcript cache; không nạp hay chuyển model ASR.
+
+Các lệnh bên dưới dùng cache riêng `transcripts_asr_ft.jsonl` cho ASR fine-tune.
+Nếu đổi checkpoint, model hoặc cấu hình giải mã mà vẫn dùng cùng đường dẫn cache,
+hãy chạy lại bước ASR với `--refresh-transcripts` hoặc chọn một đường dẫn cache mới.
+Bước `full/asr` báo lỗi khi cache không khớp model/settings, không tự thay cache cũ.
+Chỉ chạy `--stage llm` sẽ tiếp tục dùng nguồn ASR ghi trong manifest của cache đó.
+
+Sau khi bước ASR hoàn tất, kiểm tra nguồn model và cấu hình giải mã của cache:
+
+```bash
+rg -n '"model_path"|"precision"|"decoding_method"|"max_active_paths"' \
+  /mnt/mmlab2024nas/trantran/lifemate/code/result/transcripts_asr_ft.manifest.json
+```
+
+`model_path` phải trỏ tới `code/models/asr_ft` khi muốn dùng ASR đã fine-tune.
+
 ### 6.1. Kịch bản 1: Chạy chuẩn qua launcher `run_server.sh` (Khuyên dùng)
-Script [`code/run_server.sh`](file:///mnt/mmlab2024nas/trantran/lifemate/code/run_server.sh) đã cấu hình sẵn tự động:
-- Ưu tiên chọn `models/asr_ft` nếu có; nếu không có sẽ tự động dùng `models/asr`.
+Script [`code/run_server.sh`](code/run_server.sh) đã cấu hình sẵn tự động:
+
+- Ưu tiên chọn `models/asr_ft` theo điều kiện `tokens.txt` ở trên; nếu chưa có sẽ dùng `models/asr`.
 - Tự động truyền các cờ tối ưu hóa runtime tốt nhất.
 - Chạy tách bạch 2 tiến trình ASR và LLM.
+
+Launcher cố định đường dẫn model trong script và truyền chúng sau các tham số CLI.
+Biến môi trường `ASR_MODEL`/`LLM_MODEL` hoặc cờ `--asr-model`/`--llm-model` truyền
+vào launcher không ghi đè lựa chọn này. Dùng `main.py` ở mục 6.2 nếu cần chỉ định
+thư mục model khác. Log khởi động ghi `[run_server] ASR_MODEL=...` để kiểm tra.
 
 Chạy ngầm với `nohup`:
 ```bash
 cd /mnt/mmlab2024nas/trantran/lifemate/code
 
-# Gán adapter vừa huấn luyện vào biến LLM_ADAPTER (nếu có)
+# Chọn adapter vừa huấn luyện qua --llm-adapter
 nohup env \
   PYTHON_BIN="/usr/bin/python3.12" \
   DATA_ROOT="/mnt/mmlab2024nas/trantran/lifemate/train+public_test" \
   SPLIT="public_test" \
-  OUTPUT="/mnt/mmlab2024nas/trantran/lifemate/code/result/submission1.jsonl" \
+  OUTPUT="/mnt/mmlab2024nas/trantran/lifemate/code/result/submission5.jsonl" \
   TRANSCRIPT_CACHE="/mnt/mmlab2024nas/trantran/lifemate/code/result/transcripts.jsonl" \
   DEVICE="cuda" \
   bash run_server.sh \
-  --llm-adapter /mnt/mmlab2024nas/trantran/lifemate/code/result/run_sft_dual/training/adapter \
+  --llm-adapter /mnt/mmlab2024nas/trantran/lifemate/code/result/run_sft_synth/training/adapter \
   --asr-precision fp32 \
   --asr-decoding-method modified_beam_search \
   --asr-beam-size 4 \
   --asr-batch-size 16 \
+  --thinking-budget 0 \
   --prefix-cache auto \
   --schema-cache auto \
   --sample-schedule schema \
-  > /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/inference_server1.log 2>&1 &
+  > /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/inference_server5.log 2>&1 &
 ```
 
 *Theo dõi tiến độ:*
 ```bash
-tail -f /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/inference_server.log
+tail -f /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/inference_server1.log
 ```
 
 ---
@@ -361,7 +507,7 @@ nohup /usr/bin/python3.12 main.py \
   --split public_test \
   --stage full \
   --output /mnt/mmlab2024nas/trantran/lifemate/code/result/submission.jsonl \
-  --transcript-cache /mnt/mmlab2024nas/trantran/lifemate/code/result/transcripts.jsonl \
+  --transcript-cache /mnt/mmlab2024nas/trantran/lifemate/code/result/transcripts_asr_ft.jsonl \
   --asr-model /mnt/mmlab2024nas/trantran/lifemate/code/models/asr_ft \
   --asr-precision fp32 \
   --asr-decoding-method modified_beam_search \
@@ -397,7 +543,7 @@ nohup /usr/bin/python3.12 main.py \
   --stage asr \
   --data-root /mnt/mmlab2024nas/trantran/lifemate/train+public_test \
   --split public_test \
-  --transcript-cache /mnt/mmlab2024nas/trantran/lifemate/code/result/transcripts.jsonl \
+  --transcript-cache /mnt/mmlab2024nas/trantran/lifemate/code/result/transcripts_asr_ft.jsonl \
   --asr-model /mnt/mmlab2024nas/trantran/lifemate/code/models/asr_ft \
   --asr-precision fp32 \
   --asr-decoding-method modified_beam_search \
@@ -415,7 +561,7 @@ nohup /usr/bin/python3.12 main.py \
   --stage llm \
   --data-root /mnt/mmlab2024nas/trantran/lifemate/train+public_test \
   --split public_test \
-  --transcript-cache /mnt/mmlab2024nas/trantran/lifemate/code/result/transcripts.jsonl \
+  --transcript-cache /mnt/mmlab2024nas/trantran/lifemate/code/result/transcripts_asr_ft.jsonl \
   --llm-model /mnt/mmlab2024nas/trantran/lifemate/code/models/llm \
   --llm-adapter /mnt/mmlab2024nas/trantran/lifemate/code/result/run_sft_dual/training/adapter \
   --output /mnt/mmlab2024nas/trantran/lifemate/code/result/submission.jsonl \
@@ -431,7 +577,8 @@ nohup /usr/bin/python3.12 main.py \
 ---
 
 ### 6.4. Kịch bản 4: Chạy Zero-Shot Inference (Không có Adapter)
-Để đánh giá khả năng gốc của mô hình `Qwen3.5-4B` khi chưa qua fine-tune:
+Để đánh giá khả năng gốc của mô hình `Qwen3.5-4B` khi chưa qua fine-tune, dùng cùng
+ASR fine-tune và cấu hình giải mã như các lệnh có adapter ở trên để đối chiếu LLM:
 Bỏ tham số `--llm-adapter`:
 ```bash
 cd /mnt/mmlab2024nas/trantran/lifemate/code
@@ -441,10 +588,13 @@ nohup /usr/bin/python3.12 main.py \
   --data-root /mnt/mmlab2024nas/trantran/lifemate/train+public_test \
   --split public_test \
   --stage full \
-  --asr-model /mnt/mmlab2024nas/trantran/lifemate/code/models/asr \
+  --asr-model /mnt/mmlab2024nas/trantran/lifemate/code/models/asr_ft \
+  --asr-precision fp32 \
+  --asr-decoding-method modified_beam_search \
+  --asr-beam-size 4 \
   --llm-model /mnt/mmlab2024nas/trantran/lifemate/code/models/llm \
   --output /mnt/mmlab2024nas/trantran/lifemate/code/result/submission_zeroshot.jsonl \
-  --transcript-cache /mnt/mmlab2024nas/trantran/lifemate/code/result/transcripts_zeroshot.jsonl \
+  --transcript-cache /mnt/mmlab2024nas/trantran/lifemate/code/result/transcripts_asr_ft_zeroshot.jsonl \
   > /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/inference_zeroshot.log 2>&1 &
 ```
 
@@ -455,7 +605,7 @@ nohup /usr/bin/python3.12 main.py \
 ### 7.1. Tham số ASR (Nhận dạng âm thanh)
 | Tham số | Giá trị khuyên dùng | Các giá trị khả dĩ | Ý nghĩa & Mô tả |
 | :--- | :--- | :--- | :--- |
-| `--asr-model` | `models/asr_ft` | Đường dẫn thư mục | Thư mục chứa ONNX ASR (`asr_ft` ưu tiên hơn `asr`). |
+| `--asr-model` | `models/asr_ft` | Đường dẫn thư mục | Mặc định của `finetune.py`/`prepare_sft.py` cho dual và mix, không tự dùng ASR gốc khi thiếu weights. `main.py` cần truyền đường dẫn; launcher ưu tiên `asr_ft` rồi mới dùng `asr`. |
 | `--asr-precision` | `fp32` | `auto`, `fp32`, `int8` | Độ chính xác ONNX. `fp32` cho WER tiếng Việt tốt nhất (~4.1% so với 4.8% của int8). |
 | `--asr-decoding-method` | `modified_beam_search` | `modified_beam_search`, `greedy_search` | Thuật toán giải mã RNNT. Modified beam search vượt trội trên các từ hiếm. |
 | `--asr-beam-size` | `4` | Số nguyên >= 1 | Độ rộng chùm beam search (`max_active_paths`). Mức 4 cân bằng giữa độ chính xác và tốc độ. |
@@ -468,13 +618,14 @@ nohup /usr/bin/python3.12 main.py \
 | :--- | :--- | :--- | :--- |
 | `--transcript-mode` | `dual` | `dual`, `mix` | `dual`: nhân bản 100% Gold + 100% ASR; `mix`: chia tỷ lệ. |
 | `--fuzzy-weight` | `0.3` | `0.0` đến `1.0` | Trọng số phạt loss trên các tham số `fuzzy` (giá trị < 1.0 giúp tránh overfitting chuỗi tìm kiếm). |
-| `--reasoning-weight` | `0.25` | `0.0` đến `1.0` | Trọng số loss của token reasoning trong dữ liệu SFT; reasoning mặc định bật khi huấn luyện. |
-| `--guard-recovery-ratio` | `0.18` | `0.0` đến `1.0` | Tỷ lệ mẫu chèn quỹ đạo tự sửa lỗi Guard Recovery (`xref_guard` và schema `validate` trong `prepare_sft.py`). |
-| `--reasoning-stepwise-ratio` | `0.5` | `0.0` đến `1.0` | Tỷ lệ sinh thêm mẫu reasoning từng bước khi bật `--short-reasoning` (mặc định bật). |
+| `--reasoning-weight` | `0.25` | `0.0` đến `1.0` | Trọng số loss của token reasoning trong dữ liệu SFT; chỉ áp dụng khi chủ động bật `--short-reasoning` (mặc định tắt). |
+| `--guard-recovery-ratio` | `0.18` | `0.0` đến `1.0` | Tỷ lệ mẫu chèn Guard Recovery (`xref_guard`, schema `validate`, hỏi thừa `missing_info_guard`). |
+| `--reasoning-stepwise-ratio` | `0.5` | `0.0` đến `1.0` | Tỷ lệ sinh thêm mẫu reasoning từng bước khi bật `--short-reasoning` ở chế độ full-trajectory (`--no-step-wise-sft`). |
 | `--no-inject-guard-recovery` | Tắt (cờ) | Bật / Tắt | Cờ tắt hoàn toàn việc chèn các mẫu Guard Recovery trong `prepare_sft.py`. |
-| `--short-reasoning` | Đã bật mặc định | Bật / Tắt | Sinh reasoning trong `prepare_sft.py` và `finetune.py`; dùng `--no-short-reasoning` để tắt. |
+| `--step-wise-sft` | Đã bật mặc định | Bật / Tắt | Xuất mỗi lượt quyết định thành một dòng SFT riêng (Step-wise SFT), giữ đồng bộ `<think>\n\n</think>\n\n` ở mọi bước trung gian; dùng `--no-step-wise-sft` để chuyển về full-trajectory packing. |
+| `--short-reasoning` | Đã tắt mặc định | Bật / Tắt | Mặc định tắt (`--no-short-reasoning`) để đồng bộ `thinking_budget=0`; truyền `--short-reasoning` để sinh reasoning trong `prepare_sft.py` và `finetune.py`. |
 | `--filter-damaged-asr` | Đã bật (cờ) | Bật / Tắt | Loại bỏ bản sao ASR khỏi SFT nếu ASR làm hỏng các đối số chuẩn của tool call. |
-| `--epochs` | `2` | Số thực > 0 | Số epoch huấn luyện LoRA (2 epoch là tối ưu chống suy giảm chất lượng). |
+| `--epochs` | `3` | Số thực > 0 | Số epoch huấn luyện LoRA (mặc định `3` cho Step-wise SFT). |
 | `--batch-size` | `1` | Số nguyên | Batch size cục bộ trên mỗi GPU. |
 | `--gradient-accumulation` | `8` | Số nguyên | Tích lũy gradient (tương đương effective batch size = 8). |
 | `--learning-rate` | `1e-4` | Số thực | Tốc độ học của optimizer AdamW cho LoRA. |
@@ -490,7 +641,7 @@ nohup /usr/bin/python3.12 main.py \
 | `--sample-schedule` | `schema` | `schema`, `original` | Sắp xếp các mẫu có cùng tập installed apps chạy liền kề nhau để tối đa hóa tỷ lệ trúng schema cache. |
 | `--max-input-tokens` | `16000` | Số nguyên | Giới hạn token đầu vào cho prompt; tổng input + output tối đa 16.384 tokens. |
 | `--max-new-tokens` | `384` | Số nguyên | Toàn bộ ngân sách token đầu ra cho quyết định hoặc tool call mỗi lượt. |
-| `--thinking-budget` | `0` | Số nguyên >= 0 | Mặc định tắt thinking, không dành 256 token riêng cho suy nghĩ. |
+| `--thinking-budget` | `0` | Số nguyên >= 0 | 0 tắt thinking và chặn prefix reasoning bằng logits guard, yêu cầu mở đầu JSON/tool call. Giá trị lớn hơn 0 cho phép thinking khi còn đủ ngân sách. |
 | `--thinking-reserve-seconds` | `2.0` | Số thực >= 0 | Chỉ có tác dụng nếu chủ động bật thinking; không dùng với mặc định `--thinking-budget 0`. |
 | `--max-calls` | `8` | Số nguyên | Giới hạn tối đa số bước gọi công cụ trên mỗi mẫu để tránh vòng lặp vô hạn. |
 | `--max-invalid` | `3` | Số nguyên | Số lần tối đa môi trường cho phép gọi sai cú pháp trước khi hủy lượt. |
@@ -512,7 +663,7 @@ tail -n 50 -f /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/train_asr.l
 tail -n 50 -f /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/train_llm.log
 
 # Xem log suy luận
-tail -n 50 -f /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/inference_server.log
+tail -n 50 -f /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/inference_server1.log
 ```
 
 ### 8.2. Kiểm tra trạng thái GPU và tiến trình
@@ -561,7 +712,7 @@ pkill -f "main.py"
 
 ### 9.4. Lỗi `Missing fine-tuned GIPformer ONNX artifacts`
 - **Nguyên nhân:** Chạy `main.py` với đường dẫn `--asr-model models/asr_ft` nhưng thư mục này chưa được xuất file bằng `export_gipformer.py`.
-- **Cách khắc phục:** Nếu chưa fine-tune ASR, hãy trỏ `--asr-model models/asr` (mô hình gốc tải về từ Hugging Face luôn đầy đủ ONNX). Nếu dùng `run_server.sh`, script sẽ tự động kiểm tra xem `models/asr_ft/tokens.txt` có tồn tại hay không để chọn thư mục thích hợp.
+- **Cách khắc phục:** Export lại theo mục 4.4 và kiểm tra đủ `encoder.onnx`, `decoder.onnx`, `joiner.onnx`, `tokens.txt`. Nếu chưa có ASR fine-tune, chạy `main.py` với `--asr-model models/asr`. Launcher chỉ kiểm tra `models/asr_ft/tokens.txt` tồn tại và không rỗng để chọn thư mục; nếu ONNX còn thiếu trong thư mục được chọn thì bước ASR báo lỗi, không tự chuyển sang model gốc. Khi đổi nguồn ASR, dùng cache mới hoặc `--refresh-transcripts` ở bước `asr/full`.
 
 ---
 *Tài liệu được cập nhật tự động và đồng bộ với kiến trúc LifeMate Baseline mới nhất.*

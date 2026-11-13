@@ -8,6 +8,7 @@ import subprocess
 import sys
 
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
+from lifemate.asr import DEFAULT_SFT_ASR_MODEL
 from lifemate.sft import DEFAULT_ASR_TRANSCRIPT_RATIO, asr_transcript_ratio
 from lifemate.reasoning import DEFAULT_REASONING_STEPWISE_RATIO, DEFAULT_SHORT_REASONING
 from lifemate.recovery import DEFAULT_GUARD_RECOVERY_RATIO
@@ -22,7 +23,8 @@ def main():
     p.add_argument("--base-model", required=True, help="Local directory or Hugging Face model ID")
     p.add_argument("--revision", default="main", help="HF commit or revision; resolved SHA is logged")
     p.add_argument("--output-dir", type=Path, required=True)
-    p.add_argument("--asr-model", type=Path, help="Local ASR weights; required when --asr-transcript-ratio > 0 or history needs ASR")
+    p.add_argument("--asr-model", type=Path, default=DEFAULT_SFT_ASR_MODEL,
+                   help="ASR ONNX weights for dual/mix transcripts; default: code/models/asr_ft (no base-ASR fallback)")
     p.add_argument("--asr-transcript-ratio", type=asr_transcript_ratio, default=DEFAULT_ASR_TRANSCRIPT_RATIO,
                    help="Fraction of sample IDs using ASR transcripts in mix mode (0 disables ASR)")
     p.add_argument("--transcript-mode", choices=["dual", "mix"], default="dual",
@@ -32,16 +34,16 @@ def main():
     p.add_argument("--no-inject-recovery", dest="inject_recovery", action="store_false",
                    help="Disable injecting failed-search + recovery trajectories on eligible TRAIN samples")
     p.add_argument("--no-inject-guard-recovery", dest="inject_guard_recovery", action="store_false",
-                   help="Disable injecting xref_guard/validate self-correction step-wise rows on TRAIN samples")
+                   help="Disable injecting xref/validation/redundant-ask self-correction rows on TRAIN samples")
     p.add_argument("--guard-recovery-ratio", type=float, default=DEFAULT_GUARD_RECOVERY_RATIO,
                    help="Deterministic hash ratio of eligible TRAIN samples for guard self-correction rows (0..1)")
     p.add_argument("--short-reasoning", action=argparse.BooleanOptionalAction,
                    default=DEFAULT_SHORT_REASONING,
-                   help="Add Short Checked Reasoning inside <think>...</think> (default: enabled)")
+                   help="Add Short Checked Reasoning inside <think>...</think> (default: disabled)")
     p.add_argument("--reasoning-stepwise-ratio", type=float, default=DEFAULT_REASONING_STEPWISE_RATIO,
                    help="Fraction of intermediate call turns emitted as step-wise <think> rows in full-trajectory mode")
-    p.add_argument("--step-wise-sft", action="store_true",
-                   help="Keep separate per-step SFT rows instead of full-trajectory packing")
+    p.add_argument("--step-wise-sft", action=argparse.BooleanOptionalAction, default=True,
+                   help="Write step-wise SFT rows instead of full-trajectory packing (default: enabled)")
     p.add_argument("--asr-device", choices=["cpu"], default="cpu")
     p.add_argument("--asr-precision", choices=["auto", "int8", "fp32"], default="auto")
     p.add_argument("--asr-decoding-method", choices=["modified_beam_search", "greedy_search"],
@@ -53,6 +55,7 @@ def main():
     p.add_argument("--validation-fraction", type=float, choices=[0.0], default=0.0,
                    help="Training uses the complete train set, without validation")
     p.add_argument("--missing-tool-policy", choices=["error", "skip"], default="error")
+    p.add_argument("--guard-conflict-policy", choices=["error", "skip"], default="skip")
     p.add_argument("--seed", type=int, default=42)
     p.add_argument("--export-merged", action="store_true", help="Needs RAM/disk for full-precision base + adapter")
     add_arguments(p, enabled=False)
@@ -64,8 +67,6 @@ def main():
     validate_training_length(args.max_length)
     if args.heldout_apps != "none" or args.heldout_groups:
         p.error("Training uses all samples; --heldout-apps must be none and --heldout-groups must be empty")
-    if args.asr_model is None and args.asr_transcript_ratio > 0:
-        p.error("--asr-model is required when --asr-transcript-ratio > 0")
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise FileExistsError("Choose an empty run directory. To resume training use train_lora.py directly.")
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -97,7 +98,8 @@ def main():
                "--validation-fraction", args.validation_fraction, "--seed", args.seed,
                "--asr-transcript-ratio", args.asr_transcript_ratio,
                "--transcript-mode", args.transcript_mode,
-               "--missing-tool-policy", args.missing_tool_policy]
+               "--missing-tool-policy", args.missing_tool_policy,
+               "--guard-conflict-policy", args.guard_conflict_policy]
     if args.include_date_helpers:
         prepare.append("--include-date-helpers")
     if not args.inject_recovery:
@@ -107,8 +109,7 @@ def main():
     prepare.extend(["--guard-recovery-ratio", args.guard_recovery_ratio])
     prepare.append("--short-reasoning" if args.short_reasoning else "--no-short-reasoning")
     prepare.extend(["--reasoning-stepwise-ratio", args.reasoning_stepwise_ratio])
-    if args.step_wise_sft:
-        prepare.append("--step-wise-sft")
+    prepare.append("--step-wise-sft" if args.step_wise_sft else "--no-step-wise-sft")
     prepare.extend(['--tokenizer', base, '--max-length', args.max_length,
         '--rename-variants', args.rename_variants, '--distractor-probability', args.distractor_probability,
         '--heldout-apps', args.heldout_apps, '--heldout-fraction', args.heldout_fraction,

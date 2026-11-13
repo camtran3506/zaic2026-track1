@@ -62,7 +62,10 @@ def test_helpers_do_not_consume_official_call_budget():
 
 def test_valid_helper_turns_have_no_local_or_hidden_planner_count_limit():
     env = FakeEnv()
-    outputs = [DURATION]*40 + ['{"action":"done"}']
+    outputs = [
+        decision("local_time.duration_between", start="2026-10-13T19:30:00+07:00", end=f"2026-10-13T20:{10 + i:02d}:00+07:00")
+        for i in range(40)
+    ] + ['{"action":"done"}']
     stats = LifeMateAgent(StubASR(), StubLLM(outputs), CATALOG, AgentConfig(max_total_steps=1)).run(
         item(), env, Path('/unused'), 'train')
     assert stats['stop_reason'] == 'done' and stats['local_executed'] == 40
@@ -178,12 +181,21 @@ def test_identical_local_helper_observations_are_deduplicated():
     stats = LifeMateAgent(StubASR(), CapturingLLM(), CATALOG, AgentConfig()).run(
         entry, env, Path("/unused"), "train")
     assert stats["stop_reason"] == "done"
-    assert stats["local_executed"] == 2
+    assert stats["local_executed"] == 1
+    assert stats["invalid_proposals"] == 1
     assert len(prompts) == 3
-    # Step 3 prompt (after 2 DURATION calls) only has 1 local observation entry
+    # Step 3 prompt keeps 1 local observation and adds loop_guard feedback to break greedy repetition
     obs = prompts[2]["previous_actions_and_results"]
-    assert len(obs) == 1
-    assert obs[0]["name"] == "local_time.duration_between"
+    assert sum(1 for o in obs if o.get("scope") == "local") == 1
+    assert any(o.get("stage") == "loop_guard" and o.get("name") == "local_time.duration_between" for o in obs)
+
+    # Repeating the exact same helper forever stops cleanly via max_invalid rather than running 64 LLM steps
+    endless_stats = LifeMateAgent(StubASR(), StubLLM([DURATION] * 20), CATALOG, AgentConfig()).run(
+        entry, FakeEnv(), Path("/unused"), "train")
+    assert endless_stats["stop_reason"] == "max_invalid"
+    assert endless_stats["local_executed"] == 1
+    assert endless_stats["invalid_proposals"] == 3
+    assert endless_stats["llm_steps"] == 4
 
 
 def test_successful_helper_cleans_up_prior_rejections():
@@ -226,11 +238,65 @@ def test_max_llm_steps_hard_ceiling():
     env = FakeEnv()
 
     class EndlessHelperLLM:
+        def __init__(self):
+            self.i = 0
+
         def generate(self, system, user):
-            return DURATION
+            self.i += 1
+            return decision(
+                "local_time.duration_between",
+                start="2026-10-13T19:30:00+07:00",
+                end=f"2026-10-13T20:{self.i:02d}:00+07:00",
+            )
 
     stats = LifeMateAgent(StubASR(), EndlessHelperLLM(), CATALOG, AgentConfig(max_llm_steps=10)).run(
         entry, env, Path("/unused"), "train")
     assert stats["stop_reason"] == "max_llm_steps"
     assert stats["llm_steps"] == 10
     assert stats["local_executed"] == 10
+
+
+def test_duplicate_local_helper_after_local_batch_is_rejected():
+    entry = item()
+    entry["audio_text"] = (
+        "Tính thời lượng từ 2026-10-13T19:30:00+07:00 đến 2026-10-13T20:10:00+07:00 "
+        "và giờ xuất phát trước 2026-09-22T09:00:00+07:00 đi 15 phút sớm 15 phút."
+    )
+    depart = {
+        "name": "local_time.departure_time",
+        "arguments": {"arrival": "2026-09-22T09:00:00+07:00", "travel_minutes": 15, "early_minutes": 15},
+    }
+    dur = {
+        "name": "local_time.duration_between",
+        "arguments": {"start": "2026-10-13T19:30:00+07:00", "end": "2026-10-13T20:10:00+07:00"},
+    }
+    batch_call = decision("local_batch.run", calls=[depart, dur])
+    prompts = []
+
+    class CapturingLLM:
+        def __init__(self):
+            self.outputs = [batch_call, DURATION, '{"action":"done"}']
+            self.idx = 0
+
+        def generate(self, system, user):
+            prompts.append(json.loads(user))
+            out = self.outputs[self.idx]
+            self.idx += 1
+            return out
+
+    prepared = {"id": entry["id"], "transcript": entry["audio_text"], "history": entry.get("history", [])}
+    stats = LifeMateAgent(StubASR(), CapturingLLM(), CATALOG, AgentConfig()).run(
+        entry, FakeEnv(), Path("/unused"), "train", prepared_transcript=prepared)
+    assert stats["stop_reason"] == "done"
+    assert stats["batches"] == 1
+    assert stats["local_executed"] == 2
+    assert stats["invalid_proposals"] == 1
+    obs = prompts[2]["previous_actions_and_results"]
+    assert any(o.get("stage") == "loop_guard" and o.get("name") == "local_time.duration_between" for o in obs)
+
+    endless_after_batch = LifeMateAgent(
+        StubASR(), StubLLM([batch_call] + [DURATION] * 10), CATALOG, AgentConfig()).run(
+        entry, FakeEnv(), Path("/unused"), "train", prepared_transcript=prepared)
+    assert endless_after_batch["stop_reason"] == "max_invalid"
+    assert endless_after_batch["invalid_proposals"] == 3
+    assert endless_after_batch["local_executed"] == 2

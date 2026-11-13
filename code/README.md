@@ -18,9 +18,23 @@ Qwen3.5 uses its native conditional-generation checkpoint through
 `AutoModelForImageTextToText`, with text-only prompts. The same loader is used for
 inference, Transformers fine-tuning and adapter merge. Inference uses
 `enable_thinking=False` and `--thinking-budget 0` by default, with all 384 generated
-tokens available for the decision or tool call. SFT preparation enables checked
-reasoning by default (`--short-reasoning`); `--no-short-reasoning` disables it.
-SFT reasoning targets do not enable thinking during inference. Unsloth uses
+tokens available for the decision or tool call. SFT preparation uses step-wise
+rows (`--step-wise-sft`) and disables checked reasoning by default
+(`--no-short-reasoning`) to match zero-thinking inference; pass `--short-reasoning`
+to enable checked reasoning or `--no-step-wise-sft` for collapsed full-trajectory
+SFT. With effective
+thinking budget 0, `DirectActionLogitsProcessor` masks token choices before
+generation so the response starts with a JSON object or, for native FC, a
+`<tool_call>` opener. This blocks a leading think block or free-form reasoning,
+including split-token spellings, instead of merely hiding it after generation.
+The gate releases after the structured opener, preserving arbitrary argument
+text, including literal think tags. Existing parsers/schema guards still own
+the rest of the action; this is not a complete JSON/XML grammar. Vocabulary
+filters are cached per tokenizer and processors reset on cache fallback. Explicit
+positive thinking budgets retain their existing bounded reasoning mode; a budget
+clamped to 0 enables the direct-action guard. Restart inference to apply this
+controller change with existing adapters. SFT data and weights need no changes.
+Unsloth uses
 `FastVisionModel`; LoRA targets only language attention/MLP projections. Stage
 Qwen3.5 weights in a fresh directory and train a new adapter; Qwen3 adapters
 are incompatible. Other inference and training budgets are unchanged.
@@ -568,7 +582,7 @@ bash run_server.sh --cuda-visible-devices 2
 # Select GPU 2 for preparation and Unsloth training.
 python finetune.py --cuda-visible-devices 2 \
     --data-root /path/to/data --base-model "$PWD/models/llm" \
-    --asr-model "$PWD/models/asr" --output-dir "$PWD/result/finetune_gpu2"
+    --asr-model "$PWD/models/asr_ft" --output-dir "$PWD/result/finetune_gpu2"
 ```
 
 The chosen physical GPU is remapped to local CUDA device 0 in each process. Do
@@ -597,7 +611,7 @@ nohup bash -c '
   python scripts/download_models.py
   python finetune.py --cuda-visible-devices "$GPU" \
     --data-root /path/to/data --base-model "$PWD/models/llm" \
-    --asr-model "$PWD/models/asr" --output-dir "$RUN_DIR"
+    --asr-model "$PWD/models/asr_ft" --output-dir "$RUN_DIR"
   bash run_server.sh --cuda-visible-devices "$GPU" \
     --data-root /path/to/data --llm-adapter "$RUN_DIR/training/adapter"
 ' > logs/finetune_pipeline.log 2>&1 < /dev/null &
@@ -747,8 +761,10 @@ or inspect hidden app state. See [HELPERS.md](HELPERS.md) for the complete rules
 Both inference and gold SFT replay use the same `tool_execution` boundary and
 `automatic_execution_feedback`. These guards run automatically; the model does
 not call them as tools. Blocked reads report the original cached result/source
-without creating a fake executed call. A conflicting gold proposal fails SFT
-preparation rather than silently changing labels. Technical exceptions are
+without creating a fake executed call. A conflicting gold proposal raises
+`GoldGuardConflict`. Preparation skips the entire sample by default and records
+the rejection in `<partition>_skipped.jsonl`; `--guard-conflict-policy error`
+stops instead. Gold arguments and source datasets are never rewritten. Technical exceptions are
 separate from schema refusals and receive at most one retry per exact proposal.
 The existing call/invalid/step limits remain in force. No local type coercion,
 temporal repair, or automatic name/ID substitution is applied; organizer
@@ -758,6 +774,42 @@ SFT gold replay uses the same `env.validate` acceptance rule and preserves gold
 arguments verbatim. Gold rejected by ToolEnv stops preparation with a schema error.
 Structured historical tool results remain available to the planner in SFT and
 inference; historical calls are not re-executed. No environment state files are read.
+
+The observed `x-ref` ID guard applies during inference, SFT replay and search
+recovery. The empty/failed-read count limit is disabled (`empty_read_limit=0`)
+across these paths: distinct read arguments remain allowed after empty results,
+while exact repeats are still blocked by the state-scoped read cache. Overall
+call/invalid/step limits still apply. Synthetic replay uses IDs from visible
+context/history and earlier successful recorded results; it still requires
+neither ToolEnv nor a state hash.
+
+`sys.ask_missing_info` also passes a shared visible-evidence guard. It rejects
+unknown parameter names and redundant asks when schema constants, explicitly
+requested defaults, an
+explicit field assignment, an exact unambiguous entity match, or a deterministic
+date/time resolution establishes the requested value. A known `x-one-of`
+alternative can satisfy the request too. Optional fields are allowed when their
+values are actually unknown. Ambiguous names/dates, failed reads, future results
+and gold labels do not establish values. Rejection produces `agent_feedback`
+with `known_arguments`, evidence and remaining unresolved fields before any env
+validation/call; the model can continue within the existing invalid-step budget.
+
+Original TRAIN samples selected for guard recovery can now teach continuing the
+correct action after this redundant-ask feedback. Only the corrective assistant
+turn is supervised; no erroneous ask is an assistant target. Synthetic samples
+receive guard checks but no environment-dependent recovery augmentation.
+Regenerate prepared SFT in a new directory for prompt policy
+`full-trajectory-date-apps-v17-dual-transcript-source`; existing prepared data is rejected.
+
+Original TRAIN variants created by dual mode (`0 < --asr-transcript-ratio < 1`)
+carry `request_transcript_source` (`audio_text` or `asr`) and a
+`request_transcript_note` inside the model prompt, including native function
+calling, recovery, augmentation and packed trajectories. The ASR note explains
+recognition errors and checking available context/history/read results without
+asking merely because the input came from ASR. Each variant contains only its
+own current transcript. Mix mode, ratio 0/1 ablations, synthetic records,
+diagnostic partitions and inference prompts keep the existing unannotated format.
+The manifest records `sft_format.dual_transcript_source_prompt`.
 
 ## Fine-tune the LLM for next-tool calling with Unsloth (LoRA / QLoRA)
 
@@ -778,13 +830,21 @@ throughout its trajectory; samples are not duplicated across partitions. History
 uses the existing full text/audio resolver unchanged. Checkpoint-selection
 rollouts use ASR for **every** held-out sample, independently of its SFT source.
 
-Pass local GIPformer weights via `--asr-model`, including when all train records
-already contain `audio_text`. ASR-selected samples are transcribed once during
+Both `finetune.py` and `prepare_sft.py` default to `code/models/asr_ft` beside the
+entrypoints for dual and mix SFT preparation. Export or download the fine-tuned
+ONNX artifacts first. Missing fine-tuned weights fail instead of silently using
+the original `models/asr`. An explicit `--asr-model` overrides the default for
+controlled ablations. The selected path and settings are saved in `manifest.json`.
+Rebuild prepared SFT in a new directory after changing ASR; old SFT transcripts
+are not regenerated automatically.
+
+ASR-selected samples are transcribed once during
 preparation and **ignore** the supplied current `audio_text`. A missing selected
 source or ASR failure stops preparation; it never silently substitutes clean text.
 `--asr-transcript-ratio 0` is an explicit clean-text SFT ablation; `1` selects ASR
-for all SFT samples. **Both still require `--asr-model`**, because checkpoint
-selection always evaluates ASR input. Notebook defaults match the CLI through
+for all original SFT samples. Clean-only runs with text-complete history and
+synthetic-only runs do not load ASR. Optional diagnostic splits and audio-only
+history still use ASR. Notebook defaults match the CLI through
 `TRAIN_ASR_TRANSCRIPT_RATIO`.
 
 Each SFT row records `transcript_source`. The manifest saves the ratio, seed,
@@ -880,7 +940,7 @@ python -m pip install -r requirements.txt
 python finetune.py \
   --data-root /path/to/lifemate_data \
   --base-model Qwen/Qwen3.5-4B \
-  --asr-model ./models/asr --asr-transcript-ratio 0.5 \
+  --asr-model ./models/asr_ft --asr-transcript-ratio 0.5 \
   --output-dir /path/to/runs/toolcalling_v1 \
   --backend unsloth --epochs 3 --quantization none --max-length 16384 \
   --batch-size 1 --gradient-accumulation 8 --learning-rate 2e-4

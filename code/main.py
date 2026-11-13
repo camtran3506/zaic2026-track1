@@ -72,7 +72,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--max-input-tokens", type=int, default=DEFAULT_MAX_INPUT_TOKENS)
     p.add_argument("--max-new-tokens", type=int, default=DEFAULT_MAX_NEW_TOKENS)
     p.add_argument("--thinking-budget", type=int, default=DEFAULT_THINKING_BUDGET,
-                   help="Per-turn <think> token cap when time and context allow (default: 0, thinking disabled)")
+                   help="Per-turn <think> token cap when time/context allow; 0 disables thinking and enforces a direct action output prefix")
     p.add_argument("--thinking-reserve-seconds", type=float, default=2.0,
                    help="Additional remaining-time buffer required before opening <think>")
     p.add_argument("--max-calls", type=int, default=8)
@@ -185,6 +185,7 @@ def run_llm_stage(args, items, transcript_rows, split_dir, env_root):
     LOG.info("LLM-only stage: reading complete transcript cache; GIPformer is not loaded")
     llm = LocalLLM(args.llm_model, device=args.device, dtype=args.llm_dtype,
                    max_input_tokens=args.max_input_tokens, max_new_tokens=args.max_new_tokens,
+                   thinking_budget=getattr(args, "thinking_budget", DEFAULT_THINKING_BUDGET),
                    adapter_path=args.llm_adapter, device_map=args.llm_device_map,
                    seed=args.seed,
                    prefix_cache=args.prefix_cache, prompt_cache=args.prompt_cache,

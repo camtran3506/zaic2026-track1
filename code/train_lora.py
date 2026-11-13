@@ -126,7 +126,7 @@ def main():
     p.add_argument("--backend", choices=["unsloth", "transformers"], default="unsloth")
     p.add_argument("--quantization", choices=["4bit", "none"], default="none")
     p.add_argument("--max-length", type=int, default=MAX_CONTEXT_TOKENS)
-    p.add_argument("--epochs", type=float, default=2)
+    p.add_argument("--epochs", type=float, default=3)
     p.add_argument("--max-steps", type=int, default=-1)
     p.add_argument("--batch-size", type=int, default=1)
     p.add_argument("--gradient-accumulation", type=int, default=8)
