@@ -34,6 +34,24 @@ def _canonical(value):
         return None
 
 
+_APP_ALTERNATIVE_READ_TOOLS = {
+    "contacts": (
+        ("phone.recent_calls", "lấy phone_number cho phone.call/sms.send"),
+        ("chat_ott.list_chats", "lấy chat_id cho chat_ott"),
+        ("sms.read_recent", "lấy phone_number từ tin nhắn SMS"),
+        ("email.list", "lấy email người gửi/nhận từ hộp thư"),
+    ),
+    "sms": (
+        ("chat_ott.list_chats", "trao đổi qua chat_ott"),
+        ("phone.recent_calls", "xem lịch sử cuộc gọi"),
+    ),
+    "chat_ott": (
+        ("sms.read_recent", "xem tin nhắn SMS"),
+        ("phone.recent_calls", "xem lịch sử cuộc gọi"),
+    ),
+}
+
+
 def check_tool_access(name, catalog, enabled, local_names=()):
     """Automatic exact-name access check. Fuzzy results are suggestions only."""
     if isinstance(name, str) and name in local_names:
@@ -44,9 +62,18 @@ def check_tool_access(name, catalog, enabled, local_names=()):
               "tool_not_allowed" if name in catalog else "unknown_tool")
     exposed = sorted(set(enabled) | set(local_names))
     suggestions = get_close_matches(name, exposed, n=3, cutoff=0.45) if isinstance(name, str) else []
+    instruction = ("Tool không tồn tại hoặc không được sample cho phép. Chọn đúng tên trong tool_schemas; "
+                   "gợi ý chỉ để đối chiếu, không tự thay tool hoặc đoán mục tiêu.")
+    if status == "tool_not_allowed" and isinstance(name, str) and "." in name:
+        app = name.split(".", 1)[0]
+        alt_entries = [(tool, desc) for tool, desc in _APP_ALTERNATIVE_READ_TOOLS.get(app, ()) if tool in enabled]
+        if alt_entries:
+            fallbacks = [tool for tool, _ in alt_entries]
+            suggestions = list(dict.fromkeys([*fallbacks, *suggestions]))[:4]
+            hints = [f"{tool}({{}}) để {desc}" for tool, desc in alt_entries[:2]]
+            instruction += f" App {app} không được cài; hãy thử " + " hoặc ".join(hints) + "."
     return {"allowed": False, "status": status, "scope": "none", "suggested_tools": suggestions,
-            "instruction": "Tool không tồn tại hoặc không được sample cho phép. Chọn đúng tên trong tool_schemas; "
-                           "gợi ý chỉ để đối chiếu, không tự thay tool hoặc đoán mục tiêu."}
+            "instruction": instruction}
 
 
 def verify_result(name, result):

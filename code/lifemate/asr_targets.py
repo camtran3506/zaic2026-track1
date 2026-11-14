@@ -63,6 +63,13 @@ def needs_target_normalization(text: str, vocab_chars: set[str] | frozenset[str]
     return any(ch not in allowed for word in words for ch in word)
 
 
+def _format_decimal_match(match: re.Match[str]) -> str:
+    whole, frac = match.group(1), match.group(2)
+    if len(frac) >= 2 and frac.startswith("0"):
+        return f"{whole} PHẨY {' '.join(frac)}"
+    return f"{whole} PHẨY {frac}"
+
+
 def normalize_spoken_symbols(raw: str) -> str:
     """Normalize common spoken symbols (&, %, @, °, +, date/time/decimal delimiters) consistently."""
     text = unicodedata.normalize("NFC", raw).upper()
@@ -70,8 +77,9 @@ def normalize_spoken_symbols(raw: str) -> str:
     text = re.sub(r"\+", " CỘNG ", text)
     text = re.sub(r"(?<=\d)[.,](?=\d{3}\b)", "", text)
     text = re.sub(r"\b(\d{1,2}):(\d{2})\b", r"\1H\2", text)
-    text = re.sub(r"\b(\d{1,2})/(\d{1,2})(?:/\d{2,4})?\b", r"\1 THÁNG \2", text)
-    text = re.sub(r"\b(\d+),(\d)\b", r"\1 PHẨY \2", text)
+    text = re.sub(r"\b(\d{1,2})/(\d{1,2})/(\d{2,4})\b", r"\1 THÁNG \2 NĂM \3", text)
+    text = re.sub(r"\b(\d{1,2})/(\d{1,2})\b", r"\1 THÁNG \2", text)
+    text = re.sub(r"(?<!\d[.,])(?<!\d)(\d+),(\d+)(?![.,]\d)(?!\d)", _format_decimal_match, text)
     text = re.sub(r"\b(\d+)\s*%", r"\1 PHẦN TRĂM", text)
     text = text.replace("%", " PHẦN TRĂM ")
     text = text.replace("&", " VÀ ")

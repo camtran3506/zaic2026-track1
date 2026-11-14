@@ -312,3 +312,119 @@ def test_distinct_queries_and_write_epoch_reset_preserved():
         {"name": "notes.append", "arguments": {"text": "Alpha Beta expanded"}},
         {"name": "notes.search", "arguments": {"query": "Alpha Beta"}},
     ]
+
+
+def test_generic_companion_list_discovery_for_unseen_domain():
+    from lifemate.tool_execution import build_search_fallback
+
+    get_quote_spec = {
+        "kind": "read",
+        "description": "Tra cứu giá tài sản theo mã symbol.",
+        "parameters": {
+            "type": "object",
+            "properties": {"symbol": {"type": "string"}},
+            "required": ["symbol"],
+        },
+    }
+    list_assets_spec = {
+        "kind": "read",
+        "description": "Liệt kê tất cả mã tài sản hiện có.",
+        "parameters": {
+            "type": "object",
+            "properties": {},
+            "required": [],
+        },
+    }
+    enabled = {
+        "crypto.get_quote": get_quote_spec,
+        "crypto.list_assets": list_assets_spec,
+    }
+    fb = build_search_fallback(
+        "crypto.get_quote",
+        {"symbol": "UNKNOWN"},
+        get_quote_spec,
+        transcript="Xem giá coin UNKNOWN.",
+        enabled=enabled,
+        observations=[],
+    )
+    assert fb is not None
+    assert fb["failed_value"] == "UNKNOWN"
+    assert fb["failed_symbol"] == "UNKNOWN"
+    assert fb["fallback_call"] == {"name": "crypto.list_assets", "arguments": {}}
+
+
+def test_dynamic_token_or_mode_from_description_blocks_subset_retry():
+    from lifemate.tool_execution import _search_match_mode, prepare_call_arguments
+
+    docs_spec = {
+        "kind": "read",
+        "description": "Tìm tài liệu theo từ khóa, chỉ cần một từ khớp với truy vấn.",
+        "parameters": {
+            "type": "object",
+            "properties": {"query": {"type": "string"}},
+            "required": ["query"],
+        },
+    }
+    docs_and_spec = {
+        **docs_spec,
+        "description": "Tìm tài liệu khớp chính xác tất cả từ khóa.",
+    }
+    observations = [
+        {
+            "name": "docs.search",
+            "arguments": {"query": "Alpha Beta"},
+            "status": "empty",
+            "result": {"ok": True, "items": []},
+        }
+    ]
+    assert _search_match_mode("docs.search", docs_spec) == "token_or"
+    assert _search_match_mode("docs.search", docs_and_spec) == "substring"
+    redirected = prepare_call_arguments(
+        "docs.search",
+        {"query": "Alpha"},
+        docs_spec,
+        transcript="Tìm tài liệu Alpha Beta.",
+        observations=observations,
+    )
+    assert redirected == {"query": "*"}
+    preserved = prepare_call_arguments(
+        "docs.search",
+        {"query": "Alpha"},
+        docs_and_spec,
+        transcript="Tìm tài liệu Alpha Beta.",
+        observations=observations,
+    )
+    assert preserved == {"query": "Alpha"}
+
+
+def test_generic_optional_filter_relaxation_preserves_non_filter_params():
+    from lifemate.tool_execution import build_search_fallback
+
+    catalog_spec = {
+        "kind": "read",
+        "description": "Tìm sản phẩm trong danh mục.",
+        "parameters": {
+            "type": "object",
+            "properties": {
+                "query": {"type": "string"},
+                "category": {"type": "string"},
+                "limit": {"type": "integer"},
+            },
+            "required": ["query"],
+        },
+    }
+    fb = build_search_fallback(
+        "catalog.search",
+        {"query": "Gamma Widget", "category": "office", "limit": 5},
+        catalog_spec,
+        transcript="Tìm Gamma Widget.",
+        enabled={"catalog.search": catalog_spec},
+        observations=[],
+    )
+    assert fb is not None
+    assert fb["failed_query"] == "Gamma Widget"
+    assert fb["relaxed_call"] == {
+        "name": "catalog.search",
+        "arguments": {"query": "Gamma Widget", "limit": 5},
+    }
+

@@ -126,9 +126,20 @@ def test_extract_sample_hotwords_sanitizes_and_avoids_future_leakage():
 
     turn0_hw = extract_sample_hotwords(sample, up_to_turn=0, vocab_chars=vocab)
     assert "ANH KHOA" in turn0_hw
-    assert "VÀNG SJC" in turn0_hw
+    assert "VÀNG SJC" not in turn0_hw
+    assert "TÀU S E BA" not in turn0_hw
     assert "TOM BAKER" not in turn0_hw
     assert "SKYLINE ROOFTOP BAR" not in turn0_hw
+
+    # Structured context collections feed hotwords generically without hardcoded app hacks
+    sample_with_ctx = {
+        **sample,
+        "context": {
+            **sample["context"],
+            "collections": {"contacts.contacts": [{"name": "Phúc Long Coffee"}]},
+        },
+    }
+    assert "PHÚC LONG COFFEE" in extract_sample_hotwords(sample_with_ctx, up_to_turn=0, vocab_chars=vocab)
 
     turn2_hw = extract_sample_hotwords(sample, up_to_turn=2, vocab_chars=vocab)
     assert "N A BA" in turn2_hw
@@ -148,12 +159,12 @@ def test_post_normalize_asr_text_codes_and_negative_guards():
     assert post_normalize_asr_text("Đặt vé tàu s e năm và tàu s e ba.") == "Đặt vé tàu se5 và tàu se3."
     assert post_normalize_asr_text("Lấy tàu n a ba đi sớm.") == "Lấy tàu na3 đi sớm."
     assert post_normalize_asr_text("Chuyến rv hai mốt và rv một năm bảy.") == "Chuyến rv21 và rv157."
-    assert post_normalize_asr_text("Bật vtv sáu, htv bảy, vov ba, sctv chín.") == "Bật vtv6, htv7, vov3, sctv9."
+    assert post_normalize_asr_text("Bật vtv sáu, h t v bảy, vov ba, sctv chín.") == "Bật vtv6, htv7, vov3, sctv9."
     assert post_normalize_asr_text("Mở vov một không thì đọc thư.") == "Mở vov1 không thì đọc thư."
     assert post_normalize_asr_text("Xăng ron chín mươi lăm và lít e năm.") == "Xăng ron 95 và lít e5."
     assert post_normalize_asr_text("Tuyến r mười sáu với cà phê g bảy.") == "Tuyến r16 với cà phê g7."
-    assert post_normalize_asr_text("In giấy a bốn, chuyển s cộng sport.") == "In giấy a4, chuyển s+ sport."
-    assert post_normalize_asr_text("Gửi meo qua gia lô, giá vàng ét di xi.") == "Gửi mail qua zalo, giá vàng sjc."
+    assert post_normalize_asr_text("In giấy a bốn, check meo giúp anh.") == "In giấy a4, check mail giúp anh."
+    assert post_normalize_asr_text("Kiểm tra giá vàng s j c hôm nay.") == "Kiểm tra giá vàng sjc hôm nay."
 
     # Negative / false-positive guards must remain untouched
     unchanged = [
@@ -161,6 +172,8 @@ def test_post_normalize_asr_text_codes_and_negative_guards():
         "Bật vtv một lúc thôi.",
         "Chị ăn trưa với julia meo xong rồi.",
         "Đi bộ năm ba bước quanh sân.",
+        "Mã đặt chỗ rv hai ba hai năm ba của tôi.",
+        "Kho hàng mới ra lô hàng với da lô này.",
     ]
     for sentence in unchanged:
         assert post_normalize_asr_text(sentence) == sentence
@@ -329,21 +342,24 @@ def test_post_normalize_asr_text_branch_a1_rules_and_guards():
         post_normalize_asr_text("Kiểm tra chuyến rv bảy hai không đi Đà Nẵng giúp anh.")
         == "Kiểm tra chuyến rv720 đi Đà Nẵng giúp anh."
     )
-    assert post_normalize_asr_text("Đặt vé tàu s cộng năm và tàu s c bảy nhé.") == "Đặt vé tàu se5 và tàu se7 nhé."
-    assert post_normalize_asr_text("Bắt tiếng r một với tiếng r mười sáu rồi sang kênh sct ba chín.") == "Bắt tuyến r1 với tuyến r16 rồi sang kênh sctv9."
-    assert post_normalize_asr_text("Mở kênh h mười bảy xem thời sự.") == "Mở kênh htv7 xem thời sự."
+    assert post_normalize_asr_text("Có chuyến rv bảy hai không?") == "Có chuyến rv72 không?"
+    assert post_normalize_asr_text("Đặt vé tàu s e năm và tàu n a bảy nhé.") == "Đặt vé tàu se5 và tàu na7 nhé."
+    assert post_normalize_asr_text("Bắt tuyến r một với xe buýt r mười sáu rồi sang kênh h t v mười bảy.") == "Bắt tuyến r1 với xe buýt r16 rồi sang kênh htv17."
     assert post_normalize_asr_text("Mua năm ký gạo st hai lăm nha.") == "Mua năm ký gạo st25 nha."
-    assert post_normalize_asr_text("Coi e năm hôm nay bao nhiêu độ.") == "Coi e5 hôm nay bao nhiêu độ."
-    assert (
-        post_normalize_asr_text("Ba trăm năm mươi độ f em đổi ra được xe giúp anh.")
-        == "Ba trăm năm mươi độ f em đổi ra độ c giúp anh."
-    )
-    assert post_normalize_asr_text("Gửi cho phải nan a còng hoặc legel a còng công ty.") == "Gửi cho finance a còng hoặc legal a còng công ty."
+    assert post_normalize_asr_text("Giá xăng e năm hôm nay bao nhiêu.") == "Giá xăng e5 hôm nay bao nhiêu."
+    assert post_normalize_asr_text("Lấy ba mươi mốt thì kênh vtv ba mươi đi.") == "Lấy ba mươi mốt thì kênh vtv30 đi."
 
-    # Negative guards stay intact
-    assert post_normalize_asr_text("Nói tiếng r rà trong lớp.") == "Nói tiếng r rà trong lớp."
-    assert post_normalize_asr_text("Xe e năm chỗ ngồi.") == "Xe e năm chỗ ngồi."
-    assert post_normalize_asr_text("Đổi ra được xe máy mới luôn.") == "Đổi ra được xe máy mới luôn."
+    # Sample-overfit ASR slips and ambiguous homophones must NOT be rewritten
+    for untouched in (
+        "Nói tiếng r rà trong lớp.",
+        "Xe e năm chỗ ngồi.",
+        "Khóa e năm học sinh mới.",
+        "Đổi ra được xe máy mới luôn.",
+        "Mở kênh h mười bảy xem thời sự.",
+        "Mua hai con gà st hai lăm.",
+        "Gửi cho phải nan a còng hoặc legel a còng công ty.",
+    ):
+        assert post_normalize_asr_text(untouched) == untouched
 
 
 def test_repair_sample_entities_a2_and_transcribe_integration(tmp_path):
@@ -359,23 +375,41 @@ def test_repair_sample_entities_a2_and_transcribe_integration(tmp_path):
             {"role": "user", "audio": "h2.wav"},
             {
                 "role": "assistant",
-                "text": "Anh cũng có thể thử món trong danh sách.",
+                "text": "Anh cũng có thể thử món trong danh sách, hoặc họp với Hugo Lem về SaoTel.",
                 "tool_results": [{"name": "Bánh mì sandwich"}],
             },
         ],
     }
     assert (
         repair_sample_entities("Đặt cảnh báo brigbard holding và briboard holdings.", item, up_to_turn=None)
-        == "Đặt cảnh báo brightpath holdings và brightpath holdings."
+        == "Đặt cảnh báo BrightPath Holdings và BrightPath Holdings."
     )
     assert (
         repair_sample_entities("Họp ở pencel design với tokyo gaden xong học webina.", item, up_to_turn=None)
-        == "Họp ở pinnacle design với tokyo garden xong học webinar."
+        == "Họp ở Pinnacle Design với Tokyo Garden xong học Webinar."
     )
     assert (
-        repair_sample_entities("Danel lee mua bánh mì sandwi anh Thành.", item, up_to_turn=None)
-        == "daniel lee mua bánh mì sandwich anh Thành."
+        repair_sample_entities("Danel lee mua bánh mì sandwi cùng Hubo lem ở sao tel anh Thành.", item, up_to_turn=None)
+        == "Daniel Lee mua bánh mì sandwich cùng Hugo Lem ở SaoTel anh Thành."
     )
+
+    # Open-vocabulary English words must NEVER be falsely corrupted into context words
+    guard_item = {
+        "context": {},
+        "history": [
+            {
+                "role": "assistant",
+                "text": "Đặt lịch với Alex Tanner ở Grill House và Daniel Lee.",
+            }
+        ],
+    }
+    for clean_utterance in (
+        "Đặt món grilled snakehead tại nhà hàng.",
+        "Gọi cho Alex Turner và David Lee.",
+        "Nhắn cho Mr Lee giúp anh.",
+    ):
+        assert repair_sample_entities(clean_utterance, guard_item, up_to_turn=None) == clean_utterance
+
     # Turn scoping prevents future assistant leakage
     assert (
         repair_sample_entities("Đặt cảnh báo brigbard holding.", item, up_to_turn=0)
@@ -399,13 +433,13 @@ def test_repair_sample_entities_a2_and_transcribe_integration(tmp_path):
         post_normalize=True,
         vocab_chars=None,
         transcribe=lambda path, **kw: post_normalize_asr_text(
-            "Đặt vé tàu s cộng năm tới tokyo gaden gửi phải nan a còng."
+            "Đặt vé tàu s e năm tới tokyo gaden gửi mail."
         ),
     )
     out = transcribe_with_item(stub_asr, tmp_path / "u.wav", item)
-    assert out == "Đặt vé tàu se5 tới tokyo garden gửi finance a còng."
+    assert out == "Đặt vé tàu se5 tới Tokyo Garden gửi mail."
     hist_asr = history_asr_for_item(stub_asr, item, tmp_path)
     # h0 precedes assistant turn 1 ("Tokyo Garden"), so A2 must not leak turn 1 entities into h0;
-    # h2 follows turn 1, so A2 repairs "tokyo gaden" -> "tokyo garden".
-    assert hist_asr.transcribe(tmp_path / "h0.wav") == "Đặt vé tàu se5 tới tokyo gaden gửi finance a còng."
+    # h2 follows turn 1, so A2 repairs "tokyo gaden" -> "Tokyo Garden".
+    assert hist_asr.transcribe(tmp_path / "h0.wav") == "Đặt vé tàu se5 tới tokyo gaden gửi mail."
     assert hist_asr.transcribe(tmp_path / "h2.wav") == out

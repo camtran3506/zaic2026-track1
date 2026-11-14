@@ -28,6 +28,7 @@ from lifemate.asr_targets import (  # noqa: E402
     build_asr_target,
     load_vocab_chars,
     needs_target_normalization,
+    normalized_word_error_rate,
 )
 
 
@@ -122,6 +123,8 @@ def prepare_asr_dataset(
     asr_threads: int = 4,
     asr_batch_size: int = 16,
     max_history_wer: float | None = None,
+    verify_main: bool = False,
+    max_main_wer: float | None = None,
     final: bool = False,
 ) -> dict:
     if not input_jsonl.is_file():
@@ -202,11 +205,12 @@ def prepare_asr_dataset(
 
         all_items = list(buckets["train"].values()) + list(buckets["dev"].values())
         hypotheses = _load_hypotheses(hyp_cache)
+        check_main = bool(verify_main or max_main_wer is not None)
         if generate_hypotheses and model_dir is not None:
-            # Generate base-model hypotheses ONLY for unverified history rows and missed main rows.
+            # Generate base-model hypotheses for unverified rows and optionally main rows when verify_main is set.
             missing_unverified = [
                 row for row in all_items
-                if (not row["human_verified"]) and row["audio"] not in hypotheses
+                if (not row["human_verified"] or check_main) and row["audio"] not in hypotheses
             ]
             hypotheses.update(
                 _auto_hypotheses(
@@ -232,15 +236,27 @@ def prepare_asr_dataset(
         }
         for bucket_name in ("train", "dev"):
             for row in buckets[bucket_name].values():
-                hyp_text = hypotheses.get(row["audio"], "") if not row["human_verified"] else ""
+                need_hyp = (not row["human_verified"]) or (row["source"] == "main" and check_main)
+                hyp_text = hypotheses.get(row["audio"], "") if need_hyp else ""
                 target, meta = build_asr_target(
                     row["text"],
-                    hypothesis=hyp_text,
+                    hypothesis=(hyp_text if not row["human_verified"] else ""),
                     is_history=(row["source"] == "history"),
                     vocab_chars=vocab_chars,
                     sp=sp,
                     max_history_wer=(max_history_wer if bucket_name == "train" else None),
                 )
+                if (
+                    target is not None
+                    and row["source"] == "main"
+                    and bucket_name == "train"
+                    and max_main_wer is not None
+                    and hyp_text
+                ):
+                    main_wer = normalized_word_error_rate(target, hyp_text)
+                    if main_wer > max_main_wer:
+                        target = None
+                        meta = {"reason": "high_main_wer", "wer": round(main_wer, 4), "hypothesis": hyp_text}
                 if target is None:
                     skipped.append({**row, **meta})
                     if row["source"] == "main":
@@ -285,6 +301,8 @@ def prepare_asr_dataset(
             "val_fraction": val_fraction,
             "seed": seed,
             "max_history_wer": max_history_wer,
+            "verify_main": verify_main,
+            "max_main_wer": max_main_wer,
             "train_rows": len(prepared["train"]),
             "dev_rows": len(prepared["dev"]),
             "skipped_rows": len(skipped),
@@ -306,7 +324,7 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--hyp-cache", type=Path, default=None)
     parser.add_argument("--generate-hypotheses", action="store_true",
-                        help="Run base LocalASR ONLY on history turns and leftover unnormalized audio_text rows")
+                        help="Run base LocalASR on unverified rows (plus main rows when --verify-main is set)")
     parser.add_argument("--asr-precision", choices=["auto", "int8", "fp32"], default="auto")
     parser.add_argument("--asr-decoding-method", choices=["modified_beam_search", "greedy_search"],
                         default=DEFAULT_ASR_DECODING_METHOD)
@@ -314,7 +332,11 @@ def main() -> None:
     parser.add_argument("--asr-threads", type=int, default=4)
     parser.add_argument("--asr-batch-size", type=int, default=16)
     parser.add_argument("--max-history-wer", type=float, default=None,
-                        help="Optional WER threshold for dropping noisy unverified history rows (never drops main audio_text)")
+                        help="Optional WER threshold for dropping noisy unverified history rows")
+    parser.add_argument("--verify-main", action="store_true",
+                        help="Also generate/check hypotheses on digit-free main audio_text instead of unconditionally trusting it")
+    parser.add_argument("--max-main-wer", type=float, default=None,
+                        help="Optional WER threshold for filtering noisy main audio_text rows in train")
     parser.add_argument("--final", action="store_true",
                         help="Include dev rows in final training while keeping dev.jsonl as loss monitor")
     args = parser.parse_args()
@@ -333,6 +355,8 @@ def main() -> None:
         asr_threads=args.asr_threads,
         asr_batch_size=args.asr_batch_size,
         max_history_wer=args.max_history_wer,
+        verify_main=args.verify_main,
+        max_main_wer=args.max_main_wer,
         final=args.final,
     )
     print(json.dumps(manifest, indent=2, ensure_ascii=False))

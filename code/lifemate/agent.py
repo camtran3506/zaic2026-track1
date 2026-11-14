@@ -414,8 +414,12 @@ class LifeMateAgent:
                     reject(error, 'batch_precheck', name=name, arguments=args)
                     continue
                 # All access/repetition guards run before executing any child.
+                batch_obs = observation_children(observations)
                 rejection = next((r for c in args['calls'] if
-                    (r := precheck_call(c['name'], c['arguments'], self.catalog, enabled, monitor, local_names))), None)
+                    (r := precheck_call(
+                        c['name'], c['arguments'], self.catalog, enabled, monitor, local_names,
+                        transcript=transcript, context=context, history=history, observations=batch_obs,
+                    ))), None)
                 if rejection:
                     reject(**rejection)
                     continue

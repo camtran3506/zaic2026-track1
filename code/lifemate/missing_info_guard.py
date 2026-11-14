@@ -150,42 +150,94 @@ def _records(collection, context, history, observations, tools):
     return list({json.dumps(r.get('id', r), sort_keys=True): r for r in rows}.values())
 
 
-def _entity_value(target, argument, prop, text, context, history, observations, tools):
-    collection = prop.get('x-ref')
-    projection = 'id'
-    if not collection and argument in {'phone', 'phone_number', 'email'} and target in _CONTACT_TOOLS:
-        collection, projection = 'contacts.contacts', 'email' if argument == 'email' else 'phone'
-    if not isinstance(collection, str) or not text or _UNCERTAIN.search(text):
-        return None
+_ACCOUNT_CUE_RE = r'(?<!\w)(?:bên|từ|ở|của|trong|vào|tk|tài\s+khoản)\s+'
+
+
+def _match_entity_with_status(src_collection, src_projection, argument, prop, text, rows):
     candidates, ids, matches = [], {}, {}
-    for row in _records(collection, context, history, observations, tools):
-        value = row.get(projection, row.get(argument))
+    folded_text = _fold(text)
+    for row in rows:
+        value = row.get(src_projection)
+        if value is None and src_projection == 'phone_number':
+            value = row.get('phone')
+        if value is None:
+            value = row.get(argument)
         if not _valid_value(value, prop):
             continue
-        labels = [row.get(k) for k in ('name', 'title', 'label', 'relation')]
+        labels = [row.get(k) for k in ('name', 'from_name', 'sender', 'title', 'label', 'relation')]
         labels += row.get('aliases', []) if isinstance(row.get('aliases'), list) else []
         labels = [v for v in labels if isinstance(v, str) and _fold(v)]
         identity = json.dumps(value, sort_keys=True)
         candidates.append((identity, labels))
-        explicit_id = (projection == 'id' and isinstance(value, str)
+        explicit_id = (src_projection == 'id' and isinstance(value, str)
                        and re.search(r'(?<!\w)' + re.escape(value) + r'(?!\w)', text))
         if explicit_id:
             ids[identity] = value
         named = [v for v in labels if _mentioned(v, text)]
+        if src_collection == 'banking.accounts':
+            for base_label in labels:
+                stripped = re.sub(r'^tài\s+khoản\s+', '', base_label.strip(), flags=re.I).strip()
+                stripped_fold = _fold(stripped)
+                if stripped and stripped != base_label and stripped_fold:
+                    if re.search(_ACCOUNT_CUE_RE + re.escape(stripped_fold) + r'(?!\w)', folded_text):
+                        if stripped not in named:
+                            named.append(stripped)
         if named:
             matches[identity] = (value, named)
     if len(ids) == 1:
-        return next(iter(ids.values())), {'source': 'explicit_visible_id', 'collection': collection}
+        return 'matched', (next(iter(ids.values())), {'source': 'explicit_visible_id', 'collection': src_collection}), ()
     if ids:
-        return None
+        return 'ambiguous', None, ()
+    if not matches:
+        return 'not_found', None, ()
     if len(matches) != 1:
-        return None
+        return 'ambiguous', None, ()
     identity, (value, labels) = next(iter(matches.items()))
     # "Lộc" remains ambiguous when the visible list also contains "Anh Lộc".
     if not any(not any(other != identity and any(_mentioned(label, v) for v in names)
                        for other, names in candidates) for label in labels):
+        return 'ambiguous', None, ()
+    return 'matched', (value, {'source': 'visible_collection', 'collection': src_collection}), tuple(labels)
+
+
+def _entity_value(target, argument, prop, text, context, history, observations, tools):
+    collection = prop.get('x-ref')
+    projection = 'id'
+    fallbacks = []
+    if not collection and argument in {'phone', 'phone_number', 'email'} and target in _CONTACT_TOOLS:
+        collection, projection = 'contacts.contacts', 'email' if argument == 'email' else 'phone'
+        if argument in {'phone', 'phone_number'}:
+            fallbacks = [('phone.calls', 'phone_number'), ('sms.messages', 'phone_number')]
+        elif argument == 'email':
+            fallbacks = [('email.emails', 'from')]
+    if not isinstance(collection, str) or not text or _UNCERTAIN.search(text):
         return None
-    return value, {'source': 'visible_collection', 'collection': collection}
+    primary_rows = None
+    for idx, (src_collection, src_projection) in enumerate([(collection, projection), *fallbacks]):
+        rows = _records(src_collection, context, history, observations, tools)
+        if idx == 0:
+            primary_rows = rows
+        if not rows:
+            continue
+        status, resolved, matched_labels = _match_entity_with_status(
+            src_collection, src_projection, argument, prop, text, rows
+        )
+        if status == 'matched':
+            if idx > 0 and primary_rows and matched_labels:
+                # Never resolve from fallback if the primary collection already has conflicting partial matches.
+                for prow in primary_rows:
+                    plabels = [prow.get(k) for k in ('name', 'from_name', 'sender', 'title', 'label', 'relation')]
+                    plabels += prow.get('aliases', []) if isinstance(prow.get('aliases'), list) else []
+                    pval = prow.get(projection, prow.get(argument))
+                    if pval != resolved[0] and any(
+                        isinstance(pl, str) and any(_mentioned(ml, pl) for ml in matched_labels)
+                        for pl in plabels
+                    ):
+                        return None
+            return resolved
+        if status == 'ambiguous':
+            return None
+    return None
 
 
 def check_missing_info(arguments, tools, *, transcript='', context=None, history=(), observations=()):

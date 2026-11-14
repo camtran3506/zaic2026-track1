@@ -456,3 +456,89 @@ def test_train_gipformer_cli_uses_cuda_visible_devices_and_soundfile():
         capture_output=True, text=True, check=True,
     )
     assert "--cuda-visible-devices" in proc.stdout
+    assert "--selection-metric" in proc.stdout
+    assert "--eval-wer" in proc.stdout
+
+
+def test_asr_targets_preserves_full_date_years_and_multidigit_decimals():
+    assert target_v3(
+        "Ngày 15/11/2026.",
+        "NGÀY MƯỜI LĂM THÁNG MƯỜI MỘT NĂM HAI NGHÌN KHÔNG TRĂM HAI MƯƠI SÁU",
+    ) == "NGÀY MƯỜI LĂM THÁNG MƯỜI MỘT NĂM HAI NGHÌN KHÔNG TRĂM HAI MƯƠI SÁU"
+    assert target_v3("Số pi là 3,14.", "SỐ PI LÀ BA PHẨY MƯỜI BỐN") == "SỐ PI LÀ BA PHẨY MƯỜI BỐN"
+    assert target_v3("Điểm chuẩn 3,05.", "ĐIỂM CHUẨN BA PHẨY KHÔNG NĂM") == "ĐIỂM CHUẨN BA PHẨY KHÔNG NĂM"
+
+
+def test_prepare_gipformer_sft_opt_in_verify_main_and_train_device_selection(tmp_path, monkeypatch):
+    from scripts.asr_finetune import prepare_gipformer_sft as prep
+    from scripts.asr_finetune.train_gipformer import resolve_training_rows, select_training_device
+
+    root = tmp_path / "data"
+    train_dir = root / "train"
+    (train_dir / "audio").mkdir(parents=True)
+    for name in ("good.wav", "noisy.wav"):
+        sf.write(train_dir / "audio" / name, np.zeros(1600, dtype=np.float32), 16000)
+
+    jsonl = tmp_path / "train_asr.jsonl"
+    rows = [
+        {"id": "s1", "audio": "audio/good.wav", "audio_text": "Bật đèn phòng khách giúp mình."},
+        {"id": "s2", "audio": "audio/noisy.wav", "audio_text": "Đặt báo thức sáu giờ sáng."},
+    ]
+    jsonl.write_text("\n".join(json.dumps(r, ensure_ascii=False) for r in rows) + "\n", encoding="utf-8")
+
+    model_dir = tmp_path / "models/asr"
+    _write_onnx(model_dir, "fp32")
+    (model_dir / "tokens.txt").unlink()
+
+    class StubASR:
+        def __init__(self, *a, **kw): pass
+
+        def transcribe_batch(self, paths, batch_size=16):
+            return [
+                "BẬT ĐÈN PHÒNG KHÁCH GIÚP MÌNH" if p.name == "good.wav" else "CÂU NÀY HOÀN TOÀN SAI"
+                for p in paths
+            ]
+
+    import lifemate.asr as asr_mod
+    monkeypatch.setattr(asr_mod, "LocalASR", StubASR)
+
+    out_dir = tmp_path / "prepared_verified"
+    manifest = prep.prepare_asr_dataset(
+        input_jsonl=jsonl,
+        data_root=root,
+        output_dir=out_dir,
+        model_dir=model_dir,
+        val_fraction=0.0,
+        generate_hypotheses=True,
+        verify_main=True,
+        max_main_wer=0.4,
+        final=True,
+    )
+    assert manifest["verify_main"] is True
+    assert manifest["main_human_verified"] == 1
+    assert manifest["skipped_main"] == 1
+    assert [json.loads(l)["audio"] for l in (out_dir / "train.jsonl").read_text().splitlines()] == ["audio/good.wav"]
+
+    class StubSP:
+        def unk_id(self): return 1
+        def encode(self, text, out_type=int): return [2, 3]
+
+    kept, skipped = resolve_training_rows(
+        rows=[
+            {"audio": "audio/good.wav", "text": "Bật đèn.", "target_text": "BẬT ĐÈN", "source": "main", "human_verified": True},
+            {"audio": "audio/noisy.wav", "text": "Hủy báo thức.", "target_text": "HỦY BÁO THỨC", "source": "main", "human_verified": True},
+        ],
+        sp=StubSP(),
+        vocab_size=100,
+        hypotheses={"audio/good.wav": "BẬT ĐÈN", "audio/noisy.wav": "KHÁC HẲN"},
+        max_main_wer=0.4,
+        is_train=True,
+    )
+    assert skipped == 1 and [r["audio"] for r in kept] == ["audio/good.wav"]
+
+    multi_gpu_torch = SimpleNamespace(
+        device=lambda name: f"device:{name}",
+        cuda=SimpleNamespace(is_available=lambda: True, device_count=lambda: 4),
+    )
+    assert select_training_device("0", multi_gpu_torch) == "device:cuda:0"
+    assert select_training_device("-1", multi_gpu_torch) == "device:cpu"
