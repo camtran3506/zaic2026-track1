@@ -37,12 +37,23 @@ printf '[run_server] ASR_MODEL=%s\n[run_server] LLM_MODEL=%s\n' \
 
 # Keep the two model flags AFTER "$@": argparse uses the last value.
 PYTHON_BIN="${PYTHON_BIN:-$(command -v python || command -v python3)}"
+ASR_BEAM_SIZE="${ASR_BEAM_SIZE:-8}"
+ASR_HOTWORDS="${ASR_HOTWORDS:-auto}"
+ASR_HOTWORDS_SCORE="${ASR_HOTWORDS_SCORE:-1.5}"
+ASR_POST_NORMALIZE_FLAG="--asr-post-normalize"
+if [[ "${ASR_POST_NORMALIZE:-1}" == "0" ]]; then
+  ASR_POST_NORMALIZE_FLAG="--no-asr-post-normalize"
+fi
 exec "${PYTHON_BIN}" -u "${SCRIPT_DIR}/main.py" \
   --data-root "${DATA_ROOT}" \
   --split "${SPLIT}" \
   --output "${OUTPUT}" \
   --transcript-cache "${TRANSCRIPT_CACHE}" \
   --sample-seconds "${SAMPLE_SECONDS}" \
+  --asr-beam-size "${ASR_BEAM_SIZE}" \
+  --asr-hotwords "${ASR_HOTWORDS}" \
+  --asr-hotwords-score "${ASR_HOTWORDS_SCORE}" \
+  "${ASR_POST_NORMALIZE_FLAG}" \
   --device "${DEVICE}" \
   "$@" \
   --asr-model "${ASR_MODEL}" \

@@ -412,6 +412,11 @@ Sau thay đổi này, cần dựng lại SFT ở thư mục output mới với p
 Guard inference có hiệu lực ngay khi chạy code mới; adapter cũ chưa học các mẫu
 recovery mới. Đường dẫn dataset/catalog và cách chọn dual của mẫu gốc giữ nguyên.
 
+### 5.6. Search Fallback ở tầng Guard cho tên riêng bị ASR phiên âm sai (Ưu tiên 2B, Zero-Retraining)
+Cơ chế Search Fallback 2B chạy tự động trong tầng điều phối Python ([`code/lifemate/tool_execution.py`](file:///mnt/mmlab2024nas/trantran/lifemate/code/lifemate/tool_execution.py) và [`code/lifemate/execution_policy.py`](file:///mnt/mmlab2024nas/trantran/lifemate/code/lifemate/execution_policy.py)) và **không làm thay đổi các hằng số policy trong `lifemate_runtime.json` hay schema tool**, nên dùng được ngay với mọi checkpoint LoRA/LLM đã train trước đó mà **không cần train lại**:
+- **Gợi ý Fallback tự động trong `verification` & `LoopMonitor`:** Khi lệnh `read` trả về rỗng (`status="empty"`) hoặc `stocks.get_quote` trả về `done=False`, Python tự đính kèm trường `search_fallback` (chỉ rút danh xưng đầu chuỗi nếu có, trích các cụm mốc địa điểm/sự kiện tiếng Việt từ `transcript` như `"quán ..."`, tra ứng viên gần đúng trong `context`/`history`, và gợi ý `fallback_call` bằng `{}` / `{"query": "*"}` hoặc `stocks.get_portfolio({})`). Khi model lặp lại nguyên call rỗng/lỗi đó, `LoopMonitor` chặn và lặp lại trực tiếp `search_fallback` để model không bị kẹt ở `max_invalid=3`.
+- **Tự động chuyển hướng truy vấn chắc chắn rỗng (`prepare_call_arguments`):** Giữ nguyên hoàn toàn các lệnh lặp trùng khớp tuyệt đối (để `LoopMonitor` xử lý đúng chuẩn) và các truy vấn mới độc lập, nhưng tự động chuyển hướng sang mốc tiếng Việt trong `transcript` hoặc lệnh liệt kê (`{}` / `{"query": "*"}`) đối với các thử lại chắc chắn 100% thất bại: (1) nối dài thêm ngày giờ/từ vào một `query` đã rỗng trước đó, (2) tách nhỏ hoặc thêm `near` vào tập token đã chứng minh rỗng trên `maps.search_place` hay `_shop_match`, và (3) gọi lại `stocks.get_quote` chỉ khác chữ hoa/thường sau khi mã cổ phiếu đã báo lỗi.
+
 ## 6. BƯỚC 4: CHẠY SUY LUẬN (INFERENCE PIPELINE)
 
 Giai đoạn suy luận đọc tập kiểm thử (`public_test` hoặc `private_test`), phiên âm giọng nói qua ASR, gửi văn bản và schema công cụ cho LLM, thực thi môi trường mô phỏng và xuất tệp nộp bài `submission.jsonl`.
@@ -446,7 +451,7 @@ Chỉ chạy `--stage llm` sẽ tiếp tục dùng nguồn ASR ghi trong manifes
 Sau khi bước ASR hoàn tất, kiểm tra nguồn model và cấu hình giải mã của cache:
 
 ```bash
-rg -n '"model_path"|"precision"|"decoding_method"|"max_active_paths"' \
+rg -n '"model_path"|"precision"|"decoding_method"|"max_active_paths"|"hotwords_mode"|"hotwords_score"|"post_normalize"' \
   /mnt/mmlab2024nas/trantran/lifemate/code/result/transcripts_asr_ft.manifest.json
 ```
 
@@ -456,37 +461,40 @@ rg -n '"model_path"|"precision"|"decoding_method"|"max_active_paths"' \
 Script [`code/run_server.sh`](code/run_server.sh) đã cấu hình sẵn tự động:
 
 - Ưu tiên chọn `models/asr_ft` theo điều kiện `tokens.txt` ở trên; nếu chưa có sẽ dùng `models/asr`.
-- Tự động truyền các cờ tối ưu hóa runtime tốt nhất.
+- Tự động bật cấu hình tối ưu hóa ASR (`1A + 1B + 2A`): `ASR_BEAM_SIZE=8`, `ASR_HOTWORDS=auto`, `ASR_HOTWORDS_SCORE=1.5`, `--asr-post-normalize` (`ASR_POST_NORMALIZE=1`, đặt `0` để tắt) và các cờ runtime tốt nhất.
 - Chạy tách bạch 2 tiến trình ASR và LLM.
 
 Launcher cố định đường dẫn model trong script và truyền chúng sau các tham số CLI.
 Biến môi trường `ASR_MODEL`/`LLM_MODEL` hoặc cờ `--asr-model`/`--llm-model` truyền
-vào launcher không ghi đè lựa chọn này. Dùng `main.py` ở mục 6.2 nếu cần chỉ định
-thư mục model khác. Log khởi động ghi `[run_server] ASR_MODEL=...` để kiểm tra.
+vào launcher không ghi đè lựa chọn này; các cờ tối ưu ASR (`--asr-beam-size`,
+`--asr-hotwords`, `--asr-hotwords-score`, `--[no-]asr-post-normalize`) được truyền
+trước `"$@"` nên vẫn có thể ghi đè qua CLI hoặc biến môi trường tương ứng. Dùng `main.py`
+ở mục 6.2 nếu cần chỉ định thư mục model khác. Log khởi động ghi `[run_server] ASR_MODEL=...` để kiểm tra.
 
 Chạy ngầm với `nohup`:
 ```bash
 cd /mnt/mmlab2024nas/trantran/lifemate/code
 
 # Chọn adapter vừa huấn luyện qua --llm-adapter
+# Launcher đã bật sẵn --asr-beam-size 8, --asr-hotwords auto, --asr-hotwords-score 1.5, --asr-post-normalize
 nohup env \
   PYTHON_BIN="/usr/bin/python3.12" \
   DATA_ROOT="/mnt/mmlab2024nas/trantran/lifemate/train+public_test" \
   SPLIT="public_test" \
-  OUTPUT="/mnt/mmlab2024nas/trantran/lifemate/code/result/submission5.jsonl" \
+  OUTPUT="/mnt/mmlab2024nas/trantran/lifemate/code/result/submission_traj.jsonl" \
   TRANSCRIPT_CACHE="/mnt/mmlab2024nas/trantran/lifemate/code/result/transcripts.jsonl" \
   DEVICE="cuda" \
   bash run_server.sh \
-  --llm-adapter /mnt/mmlab2024nas/trantran/lifemate/code/result/run_sft_synth/training/adapter \
+  --llm-adapter /mnt/mmlab2024nas/trantran/lifemate/code/result/run_sft_traj/training/adapter \
   --asr-precision fp32 \
   --asr-decoding-method modified_beam_search \
-  --asr-beam-size 4 \
+  --asr-beam-size 8 \
   --asr-batch-size 16 \
   --thinking-budget 0 \
   --prefix-cache auto \
   --schema-cache auto \
   --sample-schedule schema \
-  > /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/inference_server5.log 2>&1 &
+  > /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/inference_traj.log 2>&1 &
 ```
 
 *Theo dõi tiến độ:*
@@ -511,7 +519,10 @@ nohup /usr/bin/python3.12 main.py \
   --asr-model /mnt/mmlab2024nas/trantran/lifemate/code/models/asr_ft \
   --asr-precision fp32 \
   --asr-decoding-method modified_beam_search \
-  --asr-beam-size 4 \
+  --asr-beam-size 8 \
+  --asr-hotwords auto \
+  --asr-hotwords-score 1.5 \
+  --asr-post-normalize \
   --asr-batch-size 16 \
   --asr-threads 4 \
   --llm-model /mnt/mmlab2024nas/trantran/lifemate/code/models/llm \
@@ -547,7 +558,10 @@ nohup /usr/bin/python3.12 main.py \
   --asr-model /mnt/mmlab2024nas/trantran/lifemate/code/models/asr_ft \
   --asr-precision fp32 \
   --asr-decoding-method modified_beam_search \
-  --asr-beam-size 4 \
+  --asr-beam-size 8 \
+  --asr-hotwords auto \
+  --asr-hotwords-score 1.5 \
+  --asr-post-normalize \
   --asr-batch-size 16 \
   > /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/stage_asr.log 2>&1 &
 ```
@@ -591,7 +605,10 @@ nohup /usr/bin/python3.12 main.py \
   --asr-model /mnt/mmlab2024nas/trantran/lifemate/code/models/asr_ft \
   --asr-precision fp32 \
   --asr-decoding-method modified_beam_search \
-  --asr-beam-size 4 \
+  --asr-beam-size 8 \
+  --asr-hotwords auto \
+  --asr-hotwords-score 1.5 \
+  --asr-post-normalize \
   --llm-model /mnt/mmlab2024nas/trantran/lifemate/code/models/llm \
   --output /mnt/mmlab2024nas/trantran/lifemate/code/result/submission_zeroshot.jsonl \
   --transcript-cache /mnt/mmlab2024nas/trantran/lifemate/code/result/transcripts_asr_ft_zeroshot.jsonl \
@@ -608,7 +625,10 @@ nohup /usr/bin/python3.12 main.py \
 | `--asr-model` | `models/asr_ft` | Đường dẫn thư mục | Mặc định của `finetune.py`/`prepare_sft.py` cho dual và mix, không tự dùng ASR gốc khi thiếu weights. `main.py` cần truyền đường dẫn; launcher ưu tiên `asr_ft` rồi mới dùng `asr`. |
 | `--asr-precision` | `fp32` | `auto`, `fp32`, `int8` | Độ chính xác ONNX. `fp32` cho WER tiếng Việt tốt nhất (~4.1% so với 4.8% của int8). |
 | `--asr-decoding-method` | `modified_beam_search` | `modified_beam_search`, `greedy_search` | Thuật toán giải mã RNNT. Modified beam search vượt trội trên các từ hiếm. |
-| `--asr-beam-size` | `4` | Số nguyên >= 1 | Độ rộng chùm beam search (`max_active_paths`). Mức 4 cân bằng giữa độ chính xác và tốc độ. |
+| `--asr-beam-size` | `8` (inference) / `4` (CLI mặc định) | Số nguyên >= 1 | Độ rộng chùm beam search (`max_active_paths`). Mức `8` được bật sẵn trong `run_server.sh` (hỗ trợ cả contextual hotwords tốt hơn); mức `4` là mặc định trong CLI (`main.py`/`prepare_sft.py`/`finetune.py`). |
+| `--asr-hotwords` | `auto` (`off` mặc định CLI) | `off`, `auto` | Chế độ **1A** contextual BPE hotwords theo từng sample/turn (trích từ `user_profile`, assistant turns/tool results quá khứ không rò rỉ tương lai, và domain lexicon đã kiểm chứng). Tự tổng hợp `bpe.vocab` tạm từ `tokens.txt` khi thư mục model chưa có. |
+| `--asr-hotwords-score` | `1.5` | Số thực | Trọng số boost hotwords BPE khi `--asr-hotwords auto` (tránh >= `2.0` vì dễ ép nhầm hoặc cắt ngắn câu dài). |
+| `--asr-post-normalize` | Bật (`--no-asr-post-normalize` mặc định CLI) | Bật / Tắt | Chế độ **2A** chuẩn hóa hậu ASR có điều kiện ngữ cảnh cho mã/tên riêng quen thuộc (`SE3`, `RON 95`, `VOV1`/`VOV2`/`VOV5`, `Compact K2`, v.v.) trước `normalize_transcript`. Được bật sẵn trong `run_server.sh`. |
 | `--asr-batch-size` | `16` | Số nguyên >= 1 | Kích thước batch gộp file âm thanh để decode song song offline. |
 | `--asr-threads` | `4` | Số nguyên >= 1 | Số luồng CPU sử dụng cho ONNX Runtime của Gipformer. |
 | `--max-history-wer` | `0.5` | `None` hoặc float `0..1` | Ngưỡng WER tối đa để lọc bỏ câu history nhiễu trong `prepare_gipformer_sft.py`. |

@@ -68,7 +68,12 @@ def asr_identity(
     num_threads=4,
     decoding_method=None,
     max_active_paths=None,
+    *,
+    hotwords_mode="off",
+    hotwords_score=None,
+    post_normalize=False,
 ):
+    import math
     from .asr import (
         ASR_BACKEND,
         ASR_REPO_ID,
@@ -77,6 +82,7 @@ def asr_identity(
         asr_files,
         resolve_asr_precision,
     )
+    from .asr_biasing import DEFAULT_ASR_HOTWORDS_SCORE, VALID_HOTWORD_MODES
     if num_threads < 1:
         raise ValueError("ASR num_threads must be positive")
     decoding_method = decoding_method or DEFAULT_ASR_DECODING_METHOD
@@ -85,17 +91,30 @@ def asr_identity(
         raise ValueError("ASR decoding_method must be modified_beam_search or greedy_search")
     if max_active_paths < 1:
         raise ValueError("ASR max_active_paths must be positive")
+    if hotwords_mode not in VALID_HOTWORD_MODES:
+        raise ValueError(f"Unsupported hotwords_mode {hotwords_mode!r}; expected {VALID_HOTWORD_MODES}")
+    resolved_hw_score = DEFAULT_ASR_HOTWORDS_SCORE if hotwords_score is None else float(hotwords_score)
+    if not math.isfinite(resolved_hw_score) or resolved_hw_score <= 0:
+        raise ValueError("ASR hotwords_score must be finite and positive")
     model_path = Path(model_path).expanduser().resolve()
     resolved_precision = resolve_asr_precision(model_path, precision)
     files = asr_files(model_path, resolved_precision)
     stamps = [[str(p.relative_to(model_path)), p.stat().st_size, p.stat().st_mtime_ns]
               for p in files.values()]
-    return {"model_path": str(model_path), "file_stamps": stamps,
-            "repo_id": ASR_REPO_ID, "backend": ASR_BACKEND, "device": "cpu",
-            "precision": resolved_precision, "num_threads": num_threads,
-            "sample_rate": 16000, "feature_dim": 80, "decoding_method": decoding_method,
-            "max_active_paths": (max_active_paths if decoding_method == "modified_beam_search" else 1),
-            "sherpa_onnx_version": version("sherpa-onnx"), "soundfile_version": version("soundfile")}
+    result = {
+        "model_path": str(model_path), "file_stamps": stamps,
+        "repo_id": ASR_REPO_ID, "backend": ASR_BACKEND, "device": "cpu",
+        "precision": resolved_precision, "num_threads": num_threads,
+        "sample_rate": 16000, "feature_dim": 80, "decoding_method": decoding_method,
+        "max_active_paths": (max_active_paths if decoding_method == "modified_beam_search" else 1),
+        "sherpa_onnx_version": version("sherpa-onnx"), "soundfile_version": version("soundfile"),
+    }
+    if hotwords_mode != "off":
+        result["hotwords_mode"] = hotwords_mode
+        result["hotwords_score"] = resolved_hw_score
+    if post_normalize:
+        result["post_normalize"] = True
+    return result
 
 
 def validate_rows(rows, identity, complete=True):
@@ -172,53 +191,88 @@ def prepare_transcripts(items, split_dir, cache_path, identity, asr_settings, as
             asr = asr_factory()
         return asr
 
-    def transcribe(relative):
-        return get_asr().transcribe(audio_path(split_dir, relative))
+    from .asr_biasing import (
+        collect_batch_audio_hotwords,
+        history_asr_for_item,
+        hotwords_enabled,
+        transcribe_with_item,
+    )
+
+    def make_hist_transcriber(item):
+        adapter = None
+
+        def _transcribe_hist(relative):
+            nonlocal adapter
+            if adapter is None:
+                adapter = history_asr_for_item(get_asr(), item, split_dir)
+            return adapter.transcribe(audio_path(split_dir, relative))
+
+        return _transcribe_hist
 
     def pretranscribe_chunk(chunk):
-        needed_paths = []
-        for item in chunk:
-            if not (identity["use_train_transcript"] and _train_transcript(item) is not None):
-                needed_paths.append(audio_path(split_dir, item["audio"]))
-            for _role, text, audio in history_entries(item):
-                if text is None and audio:
-                    needed_paths.append(audio_path(split_dir, audio))
-        unique_paths = list(dict.fromkeys(needed_paths))
-        if not unique_paths:
+        engine = None
+        if any(
+            not (identity["use_train_transcript"] and _train_transcript(item) is not None)
+            or any(text is None and audio for _role, text, audio in history_entries(item))
+            for item in chunk
+        ):
+            engine = get_asr()
+        if engine is None or not hasattr(engine, "transcribe_batch"):
             return
-        engine = get_asr()
-        if hasattr(engine, "transcribe_batch"):
-            try:
+        try:
+            if hotwords_enabled(engine):
+                batch_paths, batch_hws = collect_batch_audio_hotwords(
+                    chunk,
+                    split_dir,
+                    getattr(engine, "vocab_chars", None),
+                    skip_main_fn=lambda it: identity["use_train_transcript"] and _train_transcript(it) is not None,
+                )
+                if batch_paths:
+                    engine.transcribe_batch(batch_paths, batch_size=batch_size, hotwords_list=batch_hws)
+                return
+            needed_paths = []
+            for item in chunk:
+                if not (identity["use_train_transcript"] and _train_transcript(item) is not None):
+                    needed_paths.append(audio_path(split_dir, item["audio"]))
+                for _role, text, audio in history_entries(item):
+                    if text is None and audio:
+                        needed_paths.append(audio_path(split_dir, audio))
+            unique_paths = list(dict.fromkeys(needed_paths))
+            if unique_paths:
                 engine.transcribe_batch(unique_paths, batch_size=batch_size)
-            except Exception:
-                # Fall back to sequential decoding below so exact failing item ID is logged cleanly.
-                pass
+        except Exception:
+            # Fall back to sequential decoding below so exact failing item ID is logged cleanly.
+            pass
 
-    with partial.open("a", encoding="utf-8") as f:
-        start_idx = len(rows)
-        for chunk_start in range(start_idx, len(items), batch_size):
-            chunk = items[chunk_start:chunk_start + batch_size]
-            pretranscribe_chunk(chunk)
-            for offset, item in enumerate(chunk):
-                index = chunk_start + offset
-                start = time.monotonic()
-                try:
-                    transcript = _train_transcript(item) if identity["use_train_transcript"] else None
-                    if transcript is None:
-                        transcript = transcribe(item["audio"])
-                    transcript = normalize_transcript(transcript)
-                    history = resolve_history(item.get("history", []), transcribe)
-                    row = {"id": item["id"], "transcript": transcript, "history": history,
-                           "asr_seconds": round(time.monotonic() - start, 6)}
-                    validate_rows([row], {"sample_ids": [item["id"]]})
-                except Exception as exc:
-                    LOG.exception("ASR failed for %s; partial cache retained; LLM will not start", item["id"])
-                    with cache_path.with_suffix(".errors.jsonl").open("a", encoding="utf-8") as errors:
-                        errors.write(json.dumps({"id": item["id"], "stage": "asr", "error": repr(exc)}, ensure_ascii=False) + "\n")
-                    raise
-                f.write(json.dumps(row, ensure_ascii=False) + "\n")
-                f.flush()
-                LOG.info("ASR %d/%d %s: %.3fs", index + 1, len(items), item["id"], row["asr_seconds"])
+    try:
+        with partial.open("a", encoding="utf-8") as f:
+            start_idx = len(rows)
+            for chunk_start in range(start_idx, len(items), batch_size):
+                chunk = items[chunk_start:chunk_start + batch_size]
+                pretranscribe_chunk(chunk)
+                for offset, item in enumerate(chunk):
+                    index = chunk_start + offset
+                    start = time.monotonic()
+                    try:
+                        transcript = _train_transcript(item) if identity["use_train_transcript"] else None
+                        if transcript is None:
+                            transcript = transcribe_with_item(get_asr(), audio_path(split_dir, item["audio"]), item)
+                        transcript = normalize_transcript(transcript)
+                        history = resolve_history(item.get("history", []), make_hist_transcriber(item))
+                        row = {"id": item["id"], "transcript": transcript, "history": history,
+                               "asr_seconds": round(time.monotonic() - start, 6)}
+                        validate_rows([row], {"sample_ids": [item["id"]]})
+                    except Exception as exc:
+                        LOG.exception("ASR failed for %s; partial cache retained; LLM will not start", item["id"])
+                        with cache_path.with_suffix(".errors.jsonl").open("a", encoding="utf-8") as errors:
+                            errors.write(json.dumps({"id": item["id"], "stage": "asr", "error": repr(exc)}, ensure_ascii=False) + "\n")
+                        raise
+                    f.write(json.dumps(row, ensure_ascii=False) + "\n")
+                    f.flush()
+                    LOG.info("ASR %d/%d %s: %.3fs", index + 1, len(items), item["id"], row["asr_seconds"])
+    finally:
+        if asr is not None and hasattr(asr, "close"):
+            asr.close()
     # Complete marker is written last; LLM refuses incomplete or modified caches.
     partial.replace(cache_path)
     manifest = {**header, "status": "complete", "transcripts_sha256": sha256_file(cache_path)}

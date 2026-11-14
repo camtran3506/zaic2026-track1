@@ -38,7 +38,7 @@ QUY TẮC BẮT BUỘC:
 - Với x-ref, dùng ID từ kết quả read tool thành công trong history hoặc lượt hiện tại;
   nếu chưa có thì gọi read tool tương ứng để tìm ID thực; KHÔNG bịa ID.
 - Dùng `user_context.date_reference` đổi ngày tương đối ra YYYY-MM-DD (không cần gọi calendar_reference) và `user_context.apps` để đối chiếu tên tiếng Việt của app.
-- Tìm kiếm rỗng: rút gọn từ khóa (bỏ danh xưng, giữ tên chính), bỏ trống query hoặc gọi tool danh sách; không đưa ngày giờ vào từ khóa, không lặp call cũ; vẫn rỗng mới gọi sys.ask_missing_info.
+- Tìm kiếm rỗng: rút gọn từ khóa (bỏ danh xưng, giữ tên chính), thử tìm theo mốc tiếng Việt đi kèm (quán, đường, đối diện/gần...), bỏ trống query (hoặc query="*") hay gọi tool danh sách; không nối thêm ngày giờ/near vào từ khóa đã rỗng, không lặp call cũ; vẫn rỗng mới gọi sys.ask_missing_info.
 - Nếu cần kết hợp nhiều hành động, hoàn tất từng hành động theo thứ tự phụ thuộc.
 - Dùng user context (current_time/timezone/location/profile) và lịch sử để giải quyết tham chiếu.
 - local_time.* (departure_time, duration_between) là hàm nội bộ đọc toán hạng đã có; không đổi trạng thái app hay cấp ID x-ref.
@@ -252,10 +252,12 @@ class LifeMateAgent:
             transcript = prepared_transcript["transcript"]
             history = prompt_history(prepared_transcript["history"])
         else:
+            from .asr_biasing import history_asr_for_item, transcribe_with_item
             transcript = _train_transcript(item) if self.cfg.use_train_transcript and split == "train" else None
             if transcript is None:
-                transcript = self.asr.transcribe(audio_path(split_dir, item["audio"]))
-            history = history_text(item.get("history", []), split_dir, self.asr, t0, self.cfg.sample_seconds)
+                transcript = transcribe_with_item(self.asr, audio_path(split_dir, item["audio"]), item)
+            hist_asr = history_asr_for_item(self.asr, item, split_dir)
+            history = history_text(item.get("history", []), split_dir, hist_asr, t0, self.cfg.sample_seconds)
         transcript = normalize_transcript(transcript)
         observed_ids = extract_observed_ids(context, history)
         if session is not None:
@@ -281,7 +283,7 @@ class LifeMateAgent:
         def execute_one(name, args, *, in_batch=False):
             nonlocal executed, local_executed, stop_reason
             if isinstance(name, str) and name in enabled:
-                args = prepare_call_arguments(name, args, enabled[name], context, transcript)
+                args = prepare_call_arguments(name, args, enabled[name], context, transcript, observation_children(observations))
             rejection = precheck_call(name, args, self.catalog, enabled, monitor, local_names,
                                       transcript=transcript, context=context, history=history,
                                       observations=observation_children(observations))
@@ -325,6 +327,8 @@ class LifeMateAgent:
                 env, name, args, enabled[name].get('kind', 'unknown'), monitor, executed,
                 emit=emit, spec=enabled[name],
                 observed_ids=(observed_ids if self.cfg.enforce_observed_xref else None),
+                transcript=transcript, context=context, history=history,
+                enabled=enabled, observations=observation_children(observations),
             )
             if not outcome['executed']:
                 reject(**outcome['feedback'])
@@ -397,7 +401,7 @@ class LifeMateAgent:
                     args = {
                         **args,
                         'calls': [
-                            {**c, 'arguments': prepare_call_arguments(c['name'], c['arguments'], enabled[c['name']], context, transcript)}
+                            {**c, 'arguments': prepare_call_arguments(c['name'], c['arguments'], enabled[c['name']], context, transcript, observation_children(observations))}
                             if isinstance(c, dict) and isinstance(c.get('name'), str) and c['name'] in enabled and isinstance(c.get('arguments'), dict)
                             else c
                             for c in args['calls']

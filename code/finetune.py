@@ -49,6 +49,9 @@ def main():
     p.add_argument("--asr-decoding-method", choices=["modified_beam_search", "greedy_search"],
                    default="modified_beam_search")
     p.add_argument("--asr-beam-size", type=int, default=4)
+    p.add_argument("--asr-hotwords", choices=["off", "auto"], default="off")
+    p.add_argument("--asr-hotwords-score", type=float, default=1.5)
+    p.add_argument("--asr-post-normalize", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--asr-threads", type=int, default=4)
     p.add_argument("--filter-damaged-asr", action="store_true",
                    help="Skip ASR SFT copy if exact-match spoken gold args are missing from ASR transcript")
@@ -121,7 +124,10 @@ def main():
             "--asr-model", args.asr_model, "--device", args.asr_device,
             "--asr-precision", args.asr_precision, "--asr-decoding-method", args.asr_decoding_method,
             "--asr-beam-size", str(args.asr_beam_size), "--asr-threads", str(args.asr_threads),
+            "--asr-hotwords", args.asr_hotwords, "--asr-hotwords-score", str(args.asr_hotwords_score),
         ])
+        if args.asr_post_normalize:
+            prepare.append("--asr-post-normalize")
     if args.filter_damaged_asr:
         prepare.append("--filter-damaged-asr")
     run("prepare_sft.py", prepare)

@@ -97,6 +97,9 @@ def main():
     p.add_argument("--asr-decoding-method", choices=["modified_beam_search", "greedy_search"],
                    default="modified_beam_search")
     p.add_argument("--asr-beam-size", type=int, default=4)
+    p.add_argument("--asr-hotwords", choices=["off", "auto"], default="off")
+    p.add_argument("--asr-hotwords-score", type=float, default=1.5)
+    p.add_argument("--asr-post-normalize", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--asr-threads", type=int, default=4)
     p.add_argument("--asr-batch-size", type=int, default=16,
                    help="Batch size for offline ASR stream decoding during SFT data prep")
@@ -173,11 +176,8 @@ def main():
             if args.asr_precision == "auto" and Path(args.asr_model).expanduser().is_dir()
             else args.asr_precision
         )
-        extra = {}
-        if args.asr_decoding_method != DEFAULT_ASR_DECODING_METHOD:
-            extra["decoding_method"] = args.asr_decoding_method
-        if args.asr_beam_size != DEFAULT_ASR_MAX_ACTIVE_PATHS:
-            extra["max_active_paths"] = args.asr_beam_size
+        from lifemate.asr import asr_extra_options
+        extra = asr_extra_options(args)
         asr_settings = asr_identity(args.asr_model, precision, args.asr_threads, **extra)
         print(f'SFT ASR model: {args.asr_model} (precision={precision})', flush=True)
         asr = LocalASR(args.asr_model, precision=precision, num_threads=args.asr_threads, **extra)

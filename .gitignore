@@ -7,4 +7,5 @@ code/__pycache__
 code/.pytest_cache
 code/lifemate/__pycache__
 code/scripts/__pycache__
+code/scripts/asr_finetune/__pycache__
 code/tests/__pycache__

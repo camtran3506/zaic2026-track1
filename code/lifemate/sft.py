@@ -169,7 +169,8 @@ def _current_train_transcript(item, split_dir, asr, transcript_source):
             raise ValueError(f"{item['id']}: ASR transcript required; pass --asr-model to transcribe train audio")
         if not isinstance(item.get("audio"), str):
             raise ValueError(f"{item['id']}: selected ASR source requires an audio path")
-        transcript = asr.transcribe(audio_path(split_dir, item["audio"]))
+        from .asr_biasing import transcribe_with_item
+        transcript = transcribe_with_item(asr, audio_path(split_dir, item["audio"]), item)
         transcript_source = "asr"
     else:
         transcript_source = "audio_text"
@@ -191,7 +192,9 @@ def prepare_train_transcript(item, split_dir, asr=None, *, transcript_source=Non
     class MissingASR:
         def transcribe(self, path):
             raise ValueError("History audio needs --asr-model or a train history transcript")
-    history = history_text(item.get("history", []), split_dir, asr or MissingASR(), started, float("inf"))
+    from .asr_biasing import history_asr_for_item
+    hist_asr = history_asr_for_item(asr, item, split_dir) if asr is not None else MissingASR()
+    history = history_text(item.get("history", []), split_dir, hist_asr, started, float("inf"))
     return {"id": item["id"], "transcript": transcript, "history": history,
             "transcript_source": transcript_source}
 
@@ -219,6 +222,18 @@ def prepare_validation_transcripts(item, split_dir, asr, prepared_transcript):
 def pretranscribe_sft_partition(records, split_dir, asr, partition, sources, batch_size=16):
     """Pre-transcribe uncached partition audios using batched decode streams before sample replay."""
     if asr is None or not hasattr(asr, "transcribe_batch"):
+        return
+    from .asr_biasing import collect_batch_audio_hotwords, hotwords_enabled
+    if hotwords_enabled(asr):
+        active = [r for r in records if not is_synthetic_sample(r)]
+        batch_paths, batch_hws = collect_batch_audio_hotwords(
+            active,
+            split_dir,
+            getattr(asr, "vocab_chars", None),
+            skip_main_fn=lambda r: not ((partition != "train") or (sources.get(r["id"]) == "asr")),
+        )
+        if batch_paths:
+            asr.transcribe_batch(batch_paths, batch_size=batch_size, hotwords_list=batch_hws)
         return
     needed_audios = []
     for record in records:
@@ -349,8 +364,12 @@ def replay_sample(item, catalog, env, split_dir, asr=None, prepared_transcript=N
         examples.append(example({"action": "call", "name": name, "arguments": args}, len(examples)))
         kind = enabled[name].get("kind", "unknown")
         if _recorded_results is None:
-            outcome = attempt_env_call(env, name, args, kind, monitor, step,
-                                       spec=enabled[name], observed_ids=observed_ids)
+            outcome = attempt_env_call(
+                env, name, args, kind, monitor, step,
+                spec=enabled[name], observed_ids=observed_ids,
+                transcript=transcript, context=context, history=history,
+                enabled=enabled, observations=observations,
+            )
         else:
             from .local_checks import inspect_call
             inspection = inspect_call(name, args, enabled)

@@ -65,6 +65,12 @@ def parse_args() -> argparse.Namespace:
                    choices=["modified_beam_search", "greedy_search"])
     p.add_argument("--asr-beam-size", type=int, default=4,
                    help="Beam width (max_active_paths) for modified_beam_search")
+    p.add_argument("--asr-hotwords", default="off", choices=["off", "auto"],
+                   help="Contextual BPE hotword biasing mode during modified_beam_search")
+    p.add_argument("--asr-hotwords-score", type=float, default=1.5,
+                   help="BPE hotword boosting score (only used when --asr-hotwords is enabled)")
+    p.add_argument("--asr-post-normalize", action=argparse.BooleanOptionalAction, default=False,
+                   help="Enable deterministic post-ASR alphanumeric code and fixed-phrase normalization")
     p.add_argument("--asr-batch-size", type=int, default=16,
                    help="Number of samples per batched offline ASR decode chunk")
     p.add_argument("--asr-threads", type=int, default=4, help="GIPformer CPU threads; independent of LLM device")
@@ -156,11 +162,8 @@ def run_asr_stage(args, items, split_dir, identity):
         if args.asr_precision == "auto" and Path(args.asr_model).expanduser().is_dir()
         else args.asr_precision
     )
-    extra = {}
-    if args.asr_decoding_method != DEFAULT_ASR_DECODING_METHOD:
-        extra["decoding_method"] = args.asr_decoding_method
-    if args.asr_beam_size != DEFAULT_ASR_MAX_ACTIVE_PATHS:
-        extra["max_active_paths"] = args.asr_beam_size
+    from lifemate.asr import asr_extra_options
+    extra = asr_extra_options(args)
     settings = asr_identity(args.asr_model, precision, args.asr_threads, **extra)
     def factory():
         return LocalASR(args.asr_model, precision=precision, num_threads=args.asr_threads, **extra)
@@ -261,6 +264,8 @@ def main() -> None:
         raise ValueError("--asr-threads must be positive")
     if args.asr_beam_size < 1:
         raise ValueError("--asr-beam-size must be positive")
+    if not math.isfinite(args.asr_hotwords_score) or args.asr_hotwords_score <= 0:
+        raise ValueError("--asr-hotwords-score must be finite and positive")
     if args.asr_batch_size < 1:
         raise ValueError("--asr-batch-size must be positive")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")

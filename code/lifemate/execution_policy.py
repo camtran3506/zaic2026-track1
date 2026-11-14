@@ -123,14 +123,28 @@ class LoopMonitor:
         record = self._records.get(key)
         if record is not None:
             self._records.move_to_end(key)
-            return {"block": True, "reason": record["reason"], "scope": "current_state",
-                    "name": name, "arguments": deepcopy(arguments), "state_epoch": self.state_epoch,
-                    "cached_result": deepcopy(record["result"]),
-                    "source_call_index": record["call_index"],
-                    "previous_error": deepcopy(record["verification"]),
-                    "instruction": "Call giống hệt đã có kết quả trong phiên hiện tại và chưa có write có thể đổi trạng thái. "
-                                   "Dùng cached_result từ source_call_index; không có env call mới. "
-                                   "Không tự đổi entity, hỏi lại hoặc done chỉ vì kết quả rỗng/chưa hoàn tất."}
+            feedback = {
+                "block": True,
+                "reason": record["reason"],
+                "scope": "current_state",
+                "name": name,
+                "arguments": deepcopy(arguments),
+                "state_epoch": self.state_epoch,
+                "cached_result": deepcopy(record["result"]),
+                "source_call_index": record["call_index"],
+                "previous_error": deepcopy(record["verification"]),
+                "instruction": (
+                    "Call giống hệt đã có kết quả trong phiên hiện tại và chưa có write có thể đổi trạng thái. "
+                    "Dùng cached_result từ source_call_index; không có env call mới. "
+                    "Không tự đổi entity, hỏi lại hoặc done chỉ vì kết quả rỗng/chưa hoàn tất."
+                ),
+            }
+            fallback = record["verification"].get("search_fallback")
+            if isinstance(fallback, dict):
+                feedback["search_fallback"] = deepcopy(fallback)
+                if record["reason"] in ("repeated_empty_read", "repeated_failed_read") and fallback.get("instruction"):
+                    feedback["instruction"] = f"{feedback['instruction']} {fallback['instruction']}"
+            return feedback
         if self.empty_read_limit and kind == "read" and self._empty_read_counts.get(name, 0) >= self.empty_read_limit:
             count = self._empty_read_counts[name]
             return {"block": True, "reason": "read_empty_retry_cap", "scope": "current_state",
@@ -195,6 +209,17 @@ class LoopMonitor:
             while len(self._records) > self.max_entries:
                 self._records.popitem(last=False)
         return outcome
+
+    def attach_search_fallback(self, name, arguments, fallback):
+        """Attach search fallback guidance to a recorded read outcome for repeat prompts."""
+        if not isinstance(fallback, dict):
+            return
+        key = self._key(name, arguments)
+        record = self._records.get(key)
+        if record is not None:
+            record["verification"]["search_fallback"] = deepcopy(fallback)
+            if fallback.get("instruction"):
+                record["verification"]["instruction"] = fallback["instruction"]
 
     def automatic_feedback(self, kind, verification, call_index):
         """Same factual post-call feedback for SFT and inference, no model tool."""
