@@ -16,7 +16,10 @@ from lifemate.asr import LocalASR, asr_extra_options  # noqa: E402
 from lifemate.asr_biasing import (  # noqa: E402
     ensure_bpe_vocab,
     extract_sample_hotwords,
+    history_asr_for_item,
     post_normalize_asr_text,
+    repair_sample_entities,
+    transcribe_with_item,
 )
 from lifemate.transcripts import asr_identity, dataset_identity, load_transcripts, prepare_transcripts  # noqa: E402
 
@@ -284,3 +287,125 @@ def test_local_asr_hotwords_cache_and_prepare_transcripts_end_to_end(tmp_path, m
     assert "ANH NAM" in recorded_streams[0]
     assert "S E NĂM" in recorded_streams[0]
     assert "S E NĂM" not in recorded_streams[1]
+
+
+def test_extract_sample_hotwords_branch_b1_channels_hyphen_camel_and_no_subphrase_dups():
+    sample = {
+        "context": {"user_profile": {"name": "Chị Mai"}},
+        "history": [
+            {"role": "user", "audio": "h0.wav"},
+            {
+                "role": "assistant",
+                "text": (
+                    "Đặt tàu S-18 trên RemitStore hoặc ghé ViTech và Skyline Rooftop Bar. "
+                    "Mùa này đi Đà Lạt rất mát."
+                ),
+                "tool_results": [{"ok": True, "channels": ["VTV6", "HTV7"]}],
+            },
+            {"role": "user", "audio": "h2.wav"},
+            {
+                "role": "assistant",
+                "text": "Tương lai sẽ xem thêm ở ZenCafe.",
+                "tool_results": [{"brand": "BrightPath Holdings"}],
+            },
+        ],
+    }
+    vocab = set("ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789ÀÁÂÃÈÉÊÌÍÒÓÔÕÙÚĂĐĨŨƠƯẠẢẤẦẨẪẬẮẰẲẴẶẸẺẼẾỀỂỄỆỈỊỌỎỐỒỔỖỘỚỜỞỠỢỤỦỨỪỬỮỰỲỴỶỸ ")
+    hw2 = extract_sample_hotwords(sample, up_to_turn=2, vocab_chars=vocab)
+    phrases = hw2.split(" / ")
+    assert "S MỘT TÁM" in phrases or any("S" in p and "TÁM" in p for p in phrases)
+    assert "S-18" not in hw2
+    assert "V T V SÁU" in phrases or "VTVSÁU" in hw2.replace(" ", "")
+    assert "REMITSTORE" in phrases
+    assert "VITECH" in phrases
+    assert "SKYLINE ROOFTOP BAR" in phrases
+    # Single sub-words contained in multi-word hotword must not be duplicated into secondary slots
+    assert "SKYLINE" not in phrases
+    assert "ZENCAFE" not in hw2
+
+
+def test_post_normalize_asr_text_branch_a1_rules_and_guards():
+    assert (
+        post_normalize_asr_text("Kiểm tra chuyến rv bảy hai không đi Đà Nẵng giúp anh.")
+        == "Kiểm tra chuyến rv720 đi Đà Nẵng giúp anh."
+    )
+    assert post_normalize_asr_text("Đặt vé tàu s cộng năm và tàu s c bảy nhé.") == "Đặt vé tàu se5 và tàu se7 nhé."
+    assert post_normalize_asr_text("Bắt tiếng r một với tiếng r mười sáu rồi sang kênh sct ba chín.") == "Bắt tuyến r1 với tuyến r16 rồi sang kênh sctv9."
+    assert post_normalize_asr_text("Mở kênh h mười bảy xem thời sự.") == "Mở kênh htv7 xem thời sự."
+    assert post_normalize_asr_text("Mua năm ký gạo st hai lăm nha.") == "Mua năm ký gạo st25 nha."
+    assert post_normalize_asr_text("Coi e năm hôm nay bao nhiêu độ.") == "Coi e5 hôm nay bao nhiêu độ."
+    assert (
+        post_normalize_asr_text("Ba trăm năm mươi độ f em đổi ra được xe giúp anh.")
+        == "Ba trăm năm mươi độ f em đổi ra độ c giúp anh."
+    )
+    assert post_normalize_asr_text("Gửi cho phải nan a còng hoặc legel a còng công ty.") == "Gửi cho finance a còng hoặc legal a còng công ty."
+
+    # Negative guards stay intact
+    assert post_normalize_asr_text("Nói tiếng r rà trong lớp.") == "Nói tiếng r rà trong lớp."
+    assert post_normalize_asr_text("Xe e năm chỗ ngồi.") == "Xe e năm chỗ ngồi."
+    assert post_normalize_asr_text("Đổi ra được xe máy mới luôn.") == "Đổi ra được xe máy mới luôn."
+
+
+def test_repair_sample_entities_a2_and_transcribe_integration(tmp_path):
+    item = {
+        "context": {"user_profile": {"name": "Daniel Lee"}},
+        "history": [
+            {"role": "user", "audio": "h0.wav"},
+            {
+                "role": "assistant",
+                "text": "Hôm nay có lịch tại Pinnacle Design và Tokyo Garden, cùng 'Webinar Marketing' lúc chín giờ.",
+                "tool_results": [{"company": "CTCP BrightPath Holdings"}],
+            },
+            {"role": "user", "audio": "h2.wav"},
+            {
+                "role": "assistant",
+                "text": "Anh cũng có thể thử món trong danh sách.",
+                "tool_results": [{"name": "Bánh mì sandwich"}],
+            },
+        ],
+    }
+    assert (
+        repair_sample_entities("Đặt cảnh báo brigbard holding và briboard holdings.", item, up_to_turn=None)
+        == "Đặt cảnh báo brightpath holdings và brightpath holdings."
+    )
+    assert (
+        repair_sample_entities("Họp ở pencel design với tokyo gaden xong học webina.", item, up_to_turn=None)
+        == "Họp ở pinnacle design với tokyo garden xong học webinar."
+    )
+    assert (
+        repair_sample_entities("Danel lee mua bánh mì sandwi anh Thành.", item, up_to_turn=None)
+        == "daniel lee mua bánh mì sandwich anh Thành."
+    )
+    # Turn scoping prevents future assistant leakage
+    assert (
+        repair_sample_entities("Đặt cảnh báo brigbard holding.", item, up_to_turn=0)
+        == "Đặt cảnh báo brigbard holding."
+    )
+    # Ambiguous distractor must not rewrite
+    ambiguous_item = {
+        "context": {},
+        "history": [
+            {"role": "assistant", "text": "Liên hệ Ryan Ford hoặc Ryan Fordham trước nhé."},
+        ],
+    }
+    assert repair_sample_entities("Gọi cho Ryan Ford đi.", ambiguous_item) == "Gọi cho Ryan Ford đi."
+
+    # Integration through transcribe_with_item & history_asr_for_item (turn-scoped A2)
+    for name in ("h0.wav", "h2.wav", "u.wav"):
+        (tmp_path / name).write_bytes(b"")
+    stub_asr = SimpleNamespace(
+        supports_hotwords=False,
+        hotwords_mode="off",
+        post_normalize=True,
+        vocab_chars=None,
+        transcribe=lambda path, **kw: post_normalize_asr_text(
+            "Đặt vé tàu s cộng năm tới tokyo gaden gửi phải nan a còng."
+        ),
+    )
+    out = transcribe_with_item(stub_asr, tmp_path / "u.wav", item)
+    assert out == "Đặt vé tàu se5 tới tokyo garden gửi finance a còng."
+    hist_asr = history_asr_for_item(stub_asr, item, tmp_path)
+    # h0 precedes assistant turn 1 ("Tokyo Garden"), so A2 must not leak turn 1 entities into h0;
+    # h2 follows turn 1, so A2 repairs "tokyo gaden" -> "tokyo garden".
+    assert hist_asr.transcribe(tmp_path / "h0.wav") == "Đặt vé tàu se5 tới tokyo gaden gửi finance a còng."
+    assert hist_asr.transcribe(tmp_path / "h2.wav") == out
