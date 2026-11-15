@@ -147,7 +147,7 @@ class LocalLLM:
     cache = tmp_path / 'transcripts.jsonl'
     env = {**os.environ, 'LIFEMATE_TEST_EVENTS': str(events), 'CUDA_VISIBLE_DEVICES': '',
            'PYTHONDONTWRITEBYTECODE': '1', 'OMP_NUM_THREADS': '1'}
-    command = [sys.executable, app / 'main.py', '--data-root', split.parent, '--asr-model', model,
+    command = [sys.executable, app / 'main.py', '--stage', 'full', '--data-root', split.parent, '--asr-model', model,
         '--llm-model', tmp_path / 'llm-fixture', '--transcript-cache', cache,
         '--device', 'cpu', '--output', output]
     result = subprocess.run(command, env=env, capture_output=True, text=True, timeout=120)
@@ -190,7 +190,7 @@ def test_repo_cli_defaults_to_single_gpu_and_unlimited_time(monkeypatch):
     args = main.parse_args()
     assert args.llm_device_map == 'single'
     assert args.sample_seconds == float('inf')
-    assert args.stage == 'full'
+    assert args.stage == 'online'
 
 
 def test_llm_stage_rejects_whisper_cache_before_loading_llm(dataset, tmp_path, monkeypatch):

@@ -3,24 +3,31 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
-# Dataset root: thư mục chứa train/ và public_test/
-DATA_ROOT="${DATA_ROOT:-/mnt/mmlab2024nas/trantran/lifemate/train+public_test}"
+# Dataset root: thư mục chứa train/ và public_test/ (relative ../data theo chuẩn BTC)
+DATA_ROOT="${DATA_ROOT:-${SCRIPT_DIR}/../data}"
 
 # Tên split, KHÔNG phải đường dẫn
 SPLIT="${SPLIT:-public_test}"
 
 # Model directories are configured HERE. Inherited ASR_MODEL/LLM_MODEL variables
 # and model-path CLI options must not select another checkpoint for this launcher.
-# scripts/download_models.py stages the original ASR repo into models/asr.
-# If an adapted checkpoint is staged in models/asr_ft, prefer it while preserving models/asr.
+# training_code/download_models.py stages the original ASR repo into saved_models/asr.
+# If an adapted checkpoint is staged in saved_models/asr_ft, prefer it while preserving saved_models/asr.
 # ASR must be a local GIPformer ONNX transducer (encoder/decoder/joiner + tokens.txt).
-ASR_MODEL="${SCRIPT_DIR}/models/asr"
-if [ "${ASR_MODEL}" = "${SCRIPT_DIR}/models/asr" ] && [ -s "${SCRIPT_DIR}/models/asr_ft/tokens.txt" ]; then
-  ASR_MODEL="${SCRIPT_DIR}/models/asr_ft"
+ASR_MODEL="${SCRIPT_DIR}/saved_models/asr"
+if [ "${ASR_MODEL}" = "${SCRIPT_DIR}/saved_models/asr" ] && [ -s "${SCRIPT_DIR}/saved_models/asr_ft/tokens.txt" ]; then
+  ASR_MODEL="${SCRIPT_DIR}/saved_models/asr_ft"
 fi
 
-# LLM - Qwen3.5-4B
-LLM_MODEL="${SCRIPT_DIR}/models/llm"
+# LLM - Qwen3.5-4B (prefer merged fine-tuned saved_models/llm_ft when present)
+LLM_MODEL="${SCRIPT_DIR}/saved_models/llm"
+if [ "${LLM_MODEL}" = "${SCRIPT_DIR}/saved_models/llm" ] && [ -f "${SCRIPT_DIR}/saved_models/llm_ft/config.json" ]; then
+  LLM_MODEL="${SCRIPT_DIR}/saved_models/llm_ft"
+fi
+
+# Execution mode: online (single-process resident ASR+LLM sample-by-sample) by default;
+# set STAGE=full or pass --stage full to use legacy 2-process staged mode.
+STAGE="${STAGE:-online}"
 
 # Output
 OUTPUT="${OUTPUT:-${SCRIPT_DIR}/result/submission.jsonl}"
@@ -45,6 +52,7 @@ if [[ "${ASR_POST_NORMALIZE:-1}" == "0" ]]; then
   ASR_POST_NORMALIZE_FLAG="--no-asr-post-normalize"
 fi
 exec "${PYTHON_BIN}" -u "${SCRIPT_DIR}/main.py" \
+  --stage "${STAGE}" \
   --data-root "${DATA_ROOT}" \
   --split "${SPLIT}" \
   --output "${OUTPUT}" \

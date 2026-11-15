@@ -6,6 +6,11 @@ import math
 from pathlib import Path
 import sys
 
+CODE_DIR = Path(__file__).resolve().parents[1]
+REPO_ROOT = CODE_DIR.parent
+if str(CODE_DIR) not in sys.path:
+    sys.path.insert(0, str(CODE_DIR))
+
 from main import resolve_data_layout
 from lifemate.agent import _train_transcript
 from lifemate.catalog import load_catalog
@@ -63,8 +68,8 @@ def split_sft_records(records, catalog, args, groups):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     add_cuda_device_argument(p)
-    p.add_argument("--data-root", type=Path, required=True)
-    p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument("--data-root", type=Path, default=REPO_ROOT / "data")
+    p.add_argument("--output-dir", type=Path, default=CODE_DIR / "result" / "sft_data")
     p.add_argument("--validation-fraction", type=float, default=0.0,
                    help="Optional standalone diagnostic split; default uses all samples for training")
     p.add_argument("--seed", type=int, default=42)
@@ -92,7 +97,7 @@ def main():
     p.add_argument("--step-wise-sft", action=argparse.BooleanOptionalAction, default=True,
                    help="Write step-wise SFT rows instead of full-trajectory packing (default: enabled)")
     p.add_argument("--asr-model", type=Path, default=DEFAULT_SFT_ASR_MODEL,
-                   help="ASR ONNX weights for dual/mix transcripts; default: code/models/asr_ft (no base-ASR fallback)")
+                   help="ASR ONNX weights for dual/mix transcripts; default: saved_models/asr_ft (no base-ASR fallback)")
     p.add_argument("--device", choices=["cpu"], default="cpu", help="ASR is CPU-only")
     p.add_argument("--asr-precision", choices=["auto", "int8", "fp32"], default="auto")
     p.add_argument("--asr-decoding-method", choices=["modified_beam_search", "greedy_search"],

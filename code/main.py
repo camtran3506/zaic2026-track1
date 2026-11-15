@@ -7,19 +7,21 @@ import json
 import logging
 import math
 import os
-import random
 import subprocess
 import sys
-import tempfile
 import time
 from pathlib import Path
 
+from lifemate.predictor import (
+    LifeMatePredictor,
+    PredictorConfig,
+    configure_offline_env,
+    resolve_split_layout,
+    seed_everything,
+)
+
 # Must be set before loading any model. No network at inference.
-os.environ.setdefault("HF_HUB_OFFLINE", "1")
-os.environ.setdefault("TRANSFORMERS_OFFLINE", "1")
-os.environ.setdefault("HF_DATASETS_OFFLINE", "1")
-os.environ.setdefault("TOKENIZERS_PARALLELISM", "false")
-os.environ.setdefault("CUBLAS_WORKSPACE_CONFIG", ":4096:8")
+configure_offline_env()
 
 from lifemate.catalog import load_catalog
 from lifemate.agent import AgentConfig, LifeMateAgent
@@ -33,13 +35,13 @@ LOG = logging.getLogger("lifemate")
 
 
 def parse_args() -> argparse.Namespace:
-    p = argparse.ArgumentParser(description="Offline LifeMate ASR -> LLM -> ToolEnv baseline")
+    p = argparse.ArgumentParser(description="Offline LifeMate ASR -> LLM -> ToolEnv inference")
     add_cuda_device_argument(p)
     p.add_argument("--data-root", type=Path, required=True,
                    help="Folder holding <split>/ OR the split folder itself (e.g. /data in Docker)")
-    p.add_argument("--split", choices=["train", "public_test", "private_test"], default="public_test")
-    p.add_argument("--stage", choices=["full", "asr", "llm"], default="full",
-                   help="full runs ASR then LLM in separate processes; llm only reads a complete transcript cache")
+    p.add_argument("--split", choices=["auto", "train", "public_test", "private_test"], default="public_test")
+    p.add_argument("--stage", choices=["online", "full", "asr", "llm"], default="online",
+                   help="online keeps ASR+LLM resident in one process and runs sample-by-sample; full/asr/llm run legacy staged cache")
     p.add_argument("--transcript-cache", type=Path, help="JSONL of all current/history transcripts, plus manifest")
     p.add_argument("--refresh-transcripts", action="store_true", help="Replace completed ASR cache; resume matching partial work")
     p.add_argument("--asr-model", type=Path, help="Local GIPformer ONNX directory; not required for --stage llm")
@@ -55,8 +57,8 @@ def parse_args() -> argparse.Namespace:
                    help='Cross-sample system/tools GPU snapshots; auto admits repeated prefixes, shared admits immediately; requires prefix-cache auto')
     p.add_argument('--schema-cache-mb', type=cache_budget_mb, default=DEFAULT_SCHEMA_CACHE_MB,
                    help='Maximum retained schema snapshot storage in MiB (default 256)')
-    p.add_argument('--sample-schedule', choices=['schema', 'original'], default='schema',
-                   help='Group samples by installed_apps signature so identical schemas run adjacently; outputs preserve original line order')
+    p.add_argument('--sample-schedule', choices=['schema', 'original'], default='original',
+                   help='Execution order for staged --stage llm (online mode always preserves original sample-by-sample order)')
     p.add_argument("--output", type=Path, default=Path("result/submission.jsonl"))
     p.add_argument("--log-path", type=Path, default=None, help="Optional diagnostic JSONL, never submitted")
     p.add_argument("--device", choices=["cuda", "cpu"], default="cuda")
@@ -92,36 +94,13 @@ def parse_args() -> argparse.Namespace:
     return p.parse_args()
 
 
-def seed_everything(seed: int) -> None:
-    random.seed(seed)
-    import numpy as np
-    np.random.seed(seed)
-    import torch
-    torch.manual_seed(seed)
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(seed)
-    torch.backends.cudnn.deterministic = True
-    torch.backends.cudnn.benchmark = False
-    torch.use_deterministic_algorithms(True, warn_only=True)
-
-
 def resolve_data_layout(data_root: Path, split: str):
     """Return (split_dir, ToolEnv-root, temp owner). Symlink solves /data being split itself.
 
     Only creates a directory link; never opens/reads/copies/parses environment files.
     """
-    location = data_root.expanduser().resolve()
-    if (location / split / f"{split}.jsonl").is_file():
-        return location / split, location, None
-    if (location / f"{split}.jsonl").is_file():
-        holder = tempfile.TemporaryDirectory(prefix="lifemate_split_root_")
-        alias = Path(holder.name) / split
-        alias.symlink_to(location, target_is_directory=True)
-        return location, Path(holder.name), holder
-    raise FileNotFoundError(
-        f"Cannot locate {split}.jsonl under {location} or {location / split}. "
-        "Point --data-root either to the split or to its parent."
-    )
+    _, split_dir, env_root, holder = resolve_split_layout(data_root, split)
+    return split_dir, env_root, holder
 
 
 def run_child_stage(args, stage):
@@ -254,6 +233,68 @@ def run_llm_stage(args, items, transcript_rows, split_dir, env_root):
     LOG.info("Finished %d samples in %.1fs. Submission: %s", count, time.monotonic()-overall_start, args.output)
 
 
+def predictor_config_from_args(args: argparse.Namespace) -> PredictorConfig:
+    """Build PredictorConfig from parsed CLI arguments."""
+    return PredictorConfig(
+        asr_model=args.asr_model,
+        llm_model=args.llm_model,
+        llm_adapter=args.llm_adapter,
+        device=args.device,
+        llm_dtype=args.llm_dtype,
+        llm_device_map=args.llm_device_map,
+        max_input_tokens=args.max_input_tokens,
+        max_new_tokens=args.max_new_tokens,
+        thinking_budget=getattr(args, "thinking_budget", DEFAULT_THINKING_BUDGET),
+        thinking_reserve_seconds=getattr(args, "thinking_reserve_seconds", 2.0),
+        prefix_cache=args.prefix_cache,
+        prompt_cache=args.prompt_cache,
+        schema_cache=args.schema_cache,
+        schema_cache_mb=args.schema_cache_mb,
+        asr_precision=args.asr_precision,
+        asr_decoding_method=args.asr_decoding_method,
+        asr_beam_size=args.asr_beam_size,
+        asr_hotwords=args.asr_hotwords,
+        asr_hotwords_score=args.asr_hotwords_score,
+        asr_post_normalize=args.asr_post_normalize,
+        asr_threads=args.asr_threads,
+        max_calls=args.max_calls,
+        max_invalid=args.max_invalid,
+        sample_seconds=args.sample_seconds,
+        use_train_transcript=args.use_train_transcript,
+        seed=args.seed,
+        fail_fast=args.fail_fast,
+    )
+
+
+def run_online_stage(args: argparse.Namespace) -> dict:
+    """Load ASR + LLM in one process and run sample-by-sample end-to-end inference."""
+    cfg = predictor_config_from_args(args)
+    with LifeMatePredictor(cfg) as predictor:
+        LOG.info(
+            "Loaded ASR+LLM in %.3fs (asr=%.3fs, llm=%.3fs)",
+            predictor.load_seconds,
+            predictor.asr_load_seconds,
+            predictor.llm_load_seconds,
+        )
+        stats = predictor.predict_dataset(
+            args.data_root,
+            args.output,
+            split=args.split,
+            limit=args.limit,
+            log_path=args.log_path,
+        )
+    LOG.info(
+        "Finished %d samples in %.2fs (mean=%.2fs, p95=%.2fs, max=%.2fs). Submission: %s",
+        stats["num_samples"],
+        stats["total_predict_seconds"],
+        stats["mean_ms"] / 1000.0,
+        stats["p95_ms"] / 1000.0,
+        stats["max_ms"] / 1000.0,
+        args.output,
+    )
+    return stats
+
+
 def main() -> None:
     args = parse_args()
     validate_inference_budget(args.max_input_tokens, args.max_new_tokens)
@@ -269,7 +310,7 @@ def main() -> None:
     if args.asr_batch_size < 1:
         raise ValueError("--asr-batch-size must be positive")
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-    if args.use_train_transcript and args.split != "train":
+    if args.use_train_transcript and args.split not in ("train", "auto"):
         raise ValueError("--use-train-transcript is forbidden for test splits")
     if args.limit < 0 or math.isnan(args.sample_seconds) or args.sample_seconds <= 0:
         raise ValueError("Use nonnegative --limit and positive --sample-seconds (inf = unlimited)")
@@ -277,10 +318,10 @@ def main() -> None:
         raise ValueError("--thinking-budget must be non-negative")
     if math.isnan(args.thinking_reserve_seconds) or args.thinking_reserve_seconds < 0:
         raise ValueError("--thinking-reserve-seconds must be finite and non-negative")
-    if args.stage in ("full", "asr") and args.asr_model is None:
-        raise ValueError("--asr-model is required for the ASR stage")
-    if args.stage in ("full", "llm") and args.llm_model is None:
-        raise ValueError("--llm-model is required for the LLM stage")
+    if args.stage in ("online", "full", "asr") and args.asr_model is None:
+        raise ValueError("--asr-model is required for the ASR/online stage")
+    if args.stage in ("online", "full", "llm") and args.llm_model is None:
+        raise ValueError("--llm-model is required for the LLM/online stage")
     LOG.info("Starting stage=%s pid=%d", args.stage, os.getpid())
     for name in ("asr_model", "llm_model", "llm_adapter"):
         path = getattr(args, name)
@@ -288,6 +329,9 @@ def main() -> None:
             path = path.expanduser().resolve()
             setattr(args, name, path)
             LOG.info("%s=%s", name.upper(), path)
+    if args.stage == "online":
+        run_online_stage(args)
+        return
     if args.transcript_cache is None:
         args.transcript_cache = args.output.with_suffix(".transcripts.jsonl")
     if args.log_path is None:
@@ -302,7 +346,8 @@ def main() -> None:
         run_child_stage(args, "llm")
         return
     from lifemate.transcripts import dataset_identity, load_transcripts, read_jsonl
-    split_dir, env_root, holder = resolve_data_layout(args.data_root, args.split)
+    resolved_split, split_dir, env_root, holder = resolve_split_layout(args.data_root, args.split)
+    args.split = resolved_split
     try:
         protected = {(split_dir / f"{args.split}.jsonl").resolve(),
                      (split_dir / f"{args.split}_tools_catalog.json").resolve()}

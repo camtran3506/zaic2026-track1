@@ -6,6 +6,11 @@ import logging
 import math
 import os
 from pathlib import Path
+import sys
+
+CODE_DIR = Path(__file__).resolve().parents[1]
+if str(CODE_DIR) not in sys.path:
+    sys.path.insert(0, str(CODE_DIR))
 
 from lifemate.sft import AssistantCollator, SupervisedDataset, file_sha256, validate_prompt_policy
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device, model_device_map
@@ -120,9 +125,10 @@ def make_weighted_trainer_class(base_trainer, backend):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     add_cuda_device_argument(p)
-    p.add_argument("--base-model", type=Path, required=True, help="Local model directory (stage HF weights first)")
-    p.add_argument("--sft-dir", type=Path, required=True)
-    p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument("--base-model", type=Path, default=CODE_DIR / "saved_models" / "llm",
+                   help="Local model directory (stage HF weights first; default: saved_models/llm)")
+    p.add_argument("--sft-dir", type=Path, default=CODE_DIR / "result" / "finetune_run" / "sft")
+    p.add_argument("--output-dir", type=Path, default=CODE_DIR / "result" / "finetune_run" / "training")
     p.add_argument("--backend", choices=["unsloth", "transformers"], default="unsloth")
     p.add_argument("--quantization", choices=["4bit", "none"], default="none")
     p.add_argument("--max-length", type=int, default=MAX_CONTEXT_TOKENS)

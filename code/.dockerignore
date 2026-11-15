@@ -1,11 +1,16 @@
 .git
 __pycache__/
+**/__pycache__/
 *.pyc
+*.log
 .pytest_cache/
 result/
 *.jsonl
 *.wav
 **/*_environment/
+models/
+saved_models/.research/
+saved_models/*/.cache/
 train/
 public_test/
 private_test/

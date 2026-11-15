@@ -1,0 +1,37 @@
+--extra-index-url https://download.pytorch.org/whl/cu128
+# Pinned .venv3 runtime (Python 3.12, CUDA 12.8)
+torch==2.11.0+cu128
+torchaudio==2.11.0+cu128
+triton==3.6.0
+
+# LLM & LoRA runtime (Qwen3.5-4B + PEFT)
+transformers==5.4.0
+peft==0.19.1
+accelerate==1.15.0
+bitsandbytes==0.49.2
+huggingface_hub==1.33.0
+safetensors==0.8.0
+tokenizers==0.22.2
+sentencepiece==0.2.2
+protobuf==7.36.2
+einops==0.8.2
+ninja==1.13.2
+packaging==24.2
+fla-core==0.6.0
+
+# ASR (GIPformer 1.5 ONNX) & audio processing
+sherpa_onnx==1.13.8
+sherpa-onnx-core==1.13.8
+onnxruntime==1.31.1
+onnx==1.23.2
+soundfile==0.14.0
+soxr==1.1.0
+scipy==1.18.1
+numpy==2.5.4
+
+# Utilities & BTC JupyterLab requirement
+PyYAML==6.0.3
+tqdm==4.70.1
+regex==2026.9.29
+psutil==7.2.2
+jupyterlab==4.4.10

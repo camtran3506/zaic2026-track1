@@ -1,4 +1,4 @@
-"""Export a fine-tuned Gipformer PyTorch checkpoint to FP32 ONNX under code/models/asr_ft."""
+"""Export a fine-tuned Gipformer PyTorch checkpoint to FP32 ONNX under code/saved_models/asr_ft."""
 from __future__ import annotations
 
 import argparse
@@ -16,8 +16,8 @@ if str(CODE_DIR) not in sys.path:
 
 from lifemate.agent import audio_path  # noqa: E402
 from lifemate.asr import LocalASR  # noqa: E402
-from scripts.asr_finetune.prepare_gipformer_sft import _resolve_asr_audio_dir  # noqa: E402
-from scripts.asr_finetune.gipformer_pt import (  # noqa: E402
+from training_code.asr_finetune.prepare_gipformer_sft import _resolve_asr_audio_dir  # noqa: E402
+from training_code.asr_finetune.gipformer_pt import (  # noqa: E402
     DEFAULT_FINETUNED_ASR_DIR,
     DEFAULT_ICEFALL_ROOT,
     ORIGINAL_ASR_DIR,
@@ -32,21 +32,21 @@ def export_finetuned_onnx(
     original_dir: Path = ORIGINAL_ASR_DIR,
     output_dir: Path = DEFAULT_FINETUNED_ASR_DIR,
     icefall_root: Path = DEFAULT_ICEFALL_ROOT,
-    data_root: Path = REPO_ROOT / "train+public_test",
+    data_root: Path = REPO_ROOT / "data",
 ) -> dict:
     import torch
 
     original_dir = Path(original_dir).expanduser().resolve()
     output_dir = Path(output_dir).expanduser().resolve()
     if output_dir == original_dir:
-        raise ValueError("Refusing to overwrite original base ASR folder; export to a distinct directory such as models/asr_ft")
+        raise ValueError("Refusing to overwrite original base ASR folder; export to a distinct directory such as saved_models/asr_ft")
     if output_dir.exists() and any(output_dir.iterdir()):
         raise FileExistsError(f"Choose an empty export directory: {output_dir}")
 
     original, _ = strict_model(original_dir, icefall_root)
     saved = torch.load(best, map_location="cpu", weights_only=True)
     if saved.get("source_sha256") != sha256(original_dir / "model.pt"):
-        raise ValueError("Adapted checkpoint source_sha256 differs from base models/asr/model.pt")
+        raise ValueError("Adapted checkpoint source_sha256 differs from base saved_models/asr/model.pt")
     if set(saved["model"]) != set(original.state_dict()):
         raise ValueError("Adapted checkpoint keys differ from strictly loaded Zipformer model")
     original.load_state_dict(saved["model"], strict=True)
@@ -99,7 +99,7 @@ def export_finetuned_onnx(
 
     # Smoke-test exported FP32 ONNX using modified_beam_search on CPU.
     split_dir = _resolve_asr_audio_dir(data_root)
-    jsonl_path = (split_dir / "train.jsonl") if (split_dir / "train.jsonl").is_file() else (REPO_ROOT / "train_asr.jsonl")
+    jsonl_path = (split_dir / "train.jsonl") if (split_dir / "train.jsonl").is_file() else (REPO_ROOT / "data" / "train_asr.jsonl")
     sample = json.loads(jsonl_path.open(encoding="utf-8").readline())
     recognizer = LocalASR(output_dir, precision="fp32", decoding_method="modified_beam_search")
     transcript = recognizer.transcribe(audio_path(split_dir, sample["audio"]))
@@ -129,9 +129,9 @@ def main() -> None:
     parser.add_argument("--best", type=Path, default=CODE_DIR / "result" / "asr_sft" / "best.pt")
     parser.add_argument("--original-dir", type=Path, default=ORIGINAL_ASR_DIR)
     parser.add_argument("--output-dir", type=Path, default=DEFAULT_FINETUNED_ASR_DIR,
-                        help="Destination for fine-tuned FP32 ONNX (default: code/models/asr_ft)")
+                        help="Destination for fine-tuned FP32 ONNX (default: code/saved_models/asr_ft)")
     parser.add_argument("--icefall-root", type=Path, default=DEFAULT_ICEFALL_ROOT)
-    parser.add_argument("--data-root", type=Path, default=REPO_ROOT / "train+public_test")
+    parser.add_argument("--data-root", type=Path, default=REPO_ROOT / "data")
     args = parser.parse_args()
     manifest = export_finetuned_onnx(
         best=args.best,

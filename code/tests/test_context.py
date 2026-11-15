@@ -43,7 +43,7 @@ def test_reallocated_output_budget_is_preserved(tmp_path):
 
 
 def test_training_cannot_exceed_challenge_context():
-    result = subprocess.run([sys.executable, APP / 'train_lora.py',
+    result = subprocess.run([sys.executable, APP / 'training_code' / 'train_lora.py',
         '--base-model', 'model', '--sft-dir', 'sft', '--output-dir', 'run',
         '--max-length', '16385'], capture_output=True, text=True)
     assert result.returncode != 0

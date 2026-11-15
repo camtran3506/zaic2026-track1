@@ -8,6 +8,12 @@ from pathlib import Path
 import subprocess
 import sys
 
+TRAINING_DIR = Path(__file__).resolve().parent
+CODE_DIR = TRAINING_DIR.parent
+REPO_ROOT = CODE_DIR.parent
+if str(CODE_DIR) not in sys.path:
+    sys.path.insert(0, str(CODE_DIR))
+
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
 from lifemate.asr import DEFAULT_SFT_ASR_MODEL
 from lifemate.sft import DEFAULT_ASR_TRANSCRIPT_RATIO, asr_transcript_ratio
@@ -20,12 +26,13 @@ from lifemate.context import MAX_CONTEXT_TOKENS, validate_training_length
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     add_cuda_device_argument(p)
-    p.add_argument("--data-root", type=Path, required=True)
-    p.add_argument("--base-model", required=True, help="Local directory or Hugging Face model ID")
+    p.add_argument("--data-root", type=Path, default=REPO_ROOT / "data")
+    p.add_argument("--base-model", default=str(CODE_DIR / "saved_models" / "llm"),
+                   help="Local directory or Hugging Face model ID (default: ../saved_models/llm)")
     p.add_argument("--revision", default="main", help="HF commit or revision; resolved SHA is logged")
-    p.add_argument("--output-dir", type=Path, required=True)
+    p.add_argument("--output-dir", type=Path, default=CODE_DIR / "result" / "finetune_run")
     p.add_argument("--asr-model", type=Path, default=DEFAULT_SFT_ASR_MODEL,
-                   help="ASR ONNX weights for dual/mix transcripts; default: code/models/asr_ft (no base-ASR fallback)")
+                   help="ASR ONNX weights for dual/mix transcripts; default: saved_models/asr_ft (no base-ASR fallback)")
     p.add_argument("--asr-transcript-ratio", type=asr_transcript_ratio, default=DEFAULT_ASR_TRANSCRIPT_RATIO,
                    help="Fraction of sample IDs using ASR transcripts in mix mode (0 disables ASR)")
     p.add_argument("--transcript-mode", choices=["dual", "mix"], default="dual",
@@ -85,13 +92,14 @@ def main():
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise FileExistsError("Choose an empty run directory. To resume training use train_lora.py directly.")
     args.output_dir.mkdir(parents=True, exist_ok=True)
-    app = Path(__file__).resolve().parent
     env = os.environ.copy()
+    existing_pp = env.get("PYTHONPATH", "")
+    env["PYTHONPATH"] = f"{CODE_DIR}{os.pathsep}{existing_pp}" if existing_pp else str(CODE_DIR)
     env.update(PYTHONUNBUFFERED="1", PYTHONDONTWRITEBYTECODE="1", TOKENIZERS_PARALLELISM="false")
     def run(script, options):
-        command = [sys.executable, str(app / script), *map(str, options)]
+        command = [sys.executable, str(TRAINING_DIR / script), *map(str, options)]
         with (args.output_dir / (Path(script).stem + ".log")).open("w", encoding="utf-8") as log:
-            with subprocess.Popen(command, env=env, cwd=app, stdout=subprocess.PIPE,
+            with subprocess.Popen(command, env=env, stdout=subprocess.PIPE,
                                   stderr=subprocess.STDOUT, text=True, errors="replace") as child:
                 for line in child.stdout:
                     print(line, end="", flush=True)

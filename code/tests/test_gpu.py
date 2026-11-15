@@ -31,9 +31,9 @@ def test_one_gpu_selection(monkeypatch, inherited, explicit, expected):
 
 @pytest.mark.parametrize('script,required', [
     ('main.py', ['--data-root', 'data']),
-    ('finetune.py', ['--data-root', 'data', '--base-model', 'model', '--output-dir', 'run']),
-    ('train_lora.py', ['--base-model', 'model', '--sft-dir', 'sft', '--output-dir', 'run']),
-    ('prepare_sft.py', ['--data-root', 'data', '--output-dir', 'run']),
+    ('training_code/finetune.py', ['--data-root', 'data', '--base-model', 'model', '--output-dir', 'run']),
+    ('training_code/train_lora.py', ['--base-model', 'model', '--sft-dir', 'sft', '--output-dir', 'run']),
+    ('training_code/prepare_sft.py', ['--data-root', 'data', '--output-dir', 'run']),
 ])
 def test_cli_rejects_multiple_gpus_before_loading_models(script, required):
     result = subprocess.run([sys.executable, APP / script, *required,
@@ -56,7 +56,7 @@ def guarded(name, *args, **kwargs):
 builtins.__import__ = guarded
 sys.argv = ['train_lora.py', '--base-model', 'model', '--sft-dir', 'sft',
             '--output-dir', 'run', '--cuda-visible-devices', '2']
-runpy.run_path('train_lora.py', run_name='__main__')
+runpy.run_path('training_code/train_lora.py', run_name='__main__')
 '''
     result = subprocess.run([sys.executable, '-c', probe], cwd=APP, capture_output=True, text=True)
     assert result.returncode == 0, result.stderr
@@ -111,7 +111,7 @@ def test_child_processes_inherit_single_gpu(monkeypatch, tmp_path, pipeline):
     monkeypatch.setenv('CUDA_VISIBLE_DEVICES', '2,1,0')
     if pipeline == 'inference':
         monkeypatch.setattr(main, 'subprocess', fake_subprocess)
-        monkeypatch.setattr(sys, 'argv', ['main.py', '--data-root', 'data',
+        monkeypatch.setattr(sys, 'argv', ['main.py', '--stage', 'full', '--data-root', 'data',
             '--asr-model', 'asr', '--llm-model', 'llm', '--output', str(tmp_path / 'out.jsonl')])
         main.main()
         assert [cmd[cmd.index('--stage') + 1] for cmd, _ in observed] == ['asr', 'llm']

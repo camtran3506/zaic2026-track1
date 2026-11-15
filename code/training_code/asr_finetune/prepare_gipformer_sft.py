@@ -1,4 +1,4 @@
-"""Prepare Gipformer fine-tuning dataset from train_asr.jsonl.
+"""Prepare Gipformer fine-tuning dataset from data/train_asr.jsonl.
 
 Selective normalization & anti-noise policy:
 - Main current-turn `audio_text` had numbers converted to text accurately by human annotators.
@@ -315,9 +315,9 @@ def prepare_asr_dataset(
 
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("--input-jsonl", type=Path, default=REPO_ROOT / "train_asr.jsonl")
-    parser.add_argument("--data-root", type=Path, default=REPO_ROOT / "train+public_test")
-    parser.add_argument("--model-dir", type=Path, default=CODE_DIR / "models" / "asr",
+    parser.add_argument("--input-jsonl", type=Path, default=REPO_ROOT / "data" / "train_asr.jsonl")
+    parser.add_argument("--data-root", type=Path, default=REPO_ROOT / "data")
+    parser.add_argument("--model-dir", type=Path, default=CODE_DIR / "saved_models" / "asr",
                         help="Base ASR checkpoint (provides tokens.txt, bpe.model, and optional base ONNX hypotheses)")
     parser.add_argument("--output-dir", type=Path, default=CODE_DIR / "result" / "asr_sft_data")
     parser.add_argument("--val-fraction", type=float, default=0.1)

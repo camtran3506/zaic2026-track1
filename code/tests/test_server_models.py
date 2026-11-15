@@ -48,18 +48,18 @@ def test_launcher_uses_configured_folders_despite_stale_environment_and_cli(serv
                              "--llm-adapter", "/trained adapter"], cwd=tmp_path,
                             env=env, capture_output=True, text=True, check=True)
     args = json.loads(result.stdout)
-    assert args["asr"] == str(app / "models/asr")
-    assert args["llm"] == str(app / "models/llm")
+    assert args["asr"] == str(app / "saved_models/asr")
+    assert args["llm"] == str(app / "saved_models/llm")
     assert args["adapter"] == "/trained adapter"
     assert args["gpu"] == "2"
-    assert f"[run_server] ASR_MODEL={app / 'models/asr'}" in result.stderr
+    assert f"[run_server] ASR_MODEL={app / 'saved_models/asr'}" in result.stderr
 
 
 def test_editing_launcher_folder_is_respected(server):
     app, script, env = server
-    text = script.read_text().replace('ASR_MODEL="${SCRIPT_DIR}/models/asr"',
+    text = script.read_text().replace('ASR_MODEL="${SCRIPT_DIR}/saved_models/asr"',
                                       'ASR_MODEL="${SCRIPT_DIR}/weights/new asr"')
-    text = text.replace('LLM_MODEL="${SCRIPT_DIR}/models/llm"',
+    text = text.replace('LLM_MODEL="${SCRIPT_DIR}/saved_models/llm"',
                         'LLM_MODEL="${SCRIPT_DIR}/weights/my base"')
     script.write_text(text)
     result = subprocess.run(["bash", script], env=env, capture_output=True, text=True, check=True)
@@ -71,11 +71,11 @@ def test_editing_launcher_folder_is_respected(server):
 def test_download_default_matches_launcher_and_only_asr_preserves_llm(server, monkeypatch):
     import huggingface_hub
     app, _, _ = server
-    scripts = app / "scripts"
+    scripts = app / "training_code"
     scripts.mkdir()
     script = scripts / "download_models.py"
-    shutil.copy2(APP / "scripts/download_models.py", script)
-    llm = app / "models/llm"
+    shutil.copy2(APP / "training_code/download_models.py", script)
+    llm = app / "saved_models/llm"
     llm.mkdir(parents=True)
     weights = llm / "model.safetensors"
     weights.write_bytes(b"existing base used to train adapter")
@@ -98,7 +98,7 @@ def test_download_default_matches_launcher_and_only_asr_preserves_llm(server, mo
     assert calls[0]["repo_id"] == "g-group-ai-lab/gipformer1.5-68M-rnnt"
     for required in ("encoder.int8.onnx", "encoder.onnx", "bpe.model", "model.pt", "tokens.txt"):
         assert required in calls[0]["allow_patterns"]
-    assert calls[0]["local_dir"] == str(app / "models/asr")
+    assert calls[0]["local_dir"] == str(app / "saved_models/asr")
     assert weights.read_bytes() == b"existing base used to train adapter"
 
 
@@ -123,7 +123,7 @@ class LocalLLM:
         assert json.loads(user)['request_transcript'] == 'Bật đèn.'
         return '{"action":"done"}'
 ''')
-    asr = app / "models/asr"
+    asr = app / "saved_models/asr"
     asr.mkdir(parents=True)
     for name in ("encoder.int8.onnx", "decoder.int8.onnx", "joiner.int8.onnx", "tokens.txt"):
         (asr / name).write_bytes(b"fixture checkpoint")
@@ -145,7 +145,7 @@ class LocalLLM:
     env = {**os.environ, "ASR_MODEL": "/old/phowhisper-small-ct2", "LLM_MODEL": "/old/llm",
            "CUDA_VISIBLE_DEVICES": "", "MODEL_PATH_EVENTS": str(events), "OMP_NUM_THREADS": "1",
            "PATH": str(Path(sys.executable).parent) + os.pathsep + os.environ["PATH"]}
-    command = ["bash", app / "run_server.sh", "--device", "cpu",
+    command = ["bash", app / "run_server.sh", "--stage", "full", "--device", "cpu",
         "--data-root", split.parent, "--output", output, "--transcript-cache", cache,
         "--llm-adapter", adapter, "--asr-model", "/old/cli-asr", "--llm-model", "/old/cli-llm"]
     result = subprocess.run(command,
@@ -153,7 +153,7 @@ class LocalLLM:
     assert result.returncode == 0, result.stdout + result.stderr
     recorded = [json.loads(line) for line in events.read_text().splitlines()]
     assert [e["kind"] for e in recorded] == ["asr", "llm"]
-    assert [e["path"] for e in recorded] == [str(asr), str(app / "models/llm")]
+    assert [e["path"] for e in recorded] == [str(asr), str(app / "saved_models/llm")]
     assert recorded[0]["pid"] != recorded[1]["pid"]
     assert recorded[1]["adapter"] == str(adapter)
     assert json.loads(output.read_text())["state_hash"] == "fixture-state"

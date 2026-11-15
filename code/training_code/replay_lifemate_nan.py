@@ -91,7 +91,7 @@ def use_reference_linear_attention():
 
 def main(argv=None):
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument('--app-dir', type=Path, default=Path.cwd(), help='Repository code/ folder')
+    p.add_argument('--app-dir', type=Path, default=Path(__file__).resolve().parents[1], help='Repository code/ folder')
     p.add_argument('--config', type=Path, required=True)
     p.add_argument('--failure', type=Path, required=True)
     p.add_argument('--batches', type=Path, help='Default: batches.safetensors next to failure.json')

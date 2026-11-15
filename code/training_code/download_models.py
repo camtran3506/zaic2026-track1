@@ -13,17 +13,17 @@ MODELS = {
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--models-dir", type=Path,
-                   default=Path(__file__).resolve().parents[1] / "models",
-                   help="Download root (default: code/models, independent of working directory)")
+                   default=Path(__file__).resolve().parents[1] / "saved_models",
+                   help="Download root (default: code/saved_models, independent of working directory)")
     p.add_argument("--only", choices=["llm", "asr", "both"], default="both")
     p.add_argument("--llm-revision", default=None, help="Pin a git commit before final submission")
     p.add_argument("--asr-revision", default=None, help="Pin a git commit before final submission")
     p.add_argument("--asr-precision", choices=["int8", "fp32", "both", "all"], default="all",
-                   help="GIPformer assets to stage into models/asr (all includes fp32/int8 ONNX + bpe.model + model.pt)")
+                   help="GIPformer assets to stage into saved_models/asr (all includes fp32/int8 ONNX + bpe.model + model.pt)")
     p.add_argument("--asr-ft-repo", default=None,
-                   help="Optional Hugging Face repo containing fine-tuned ONNX checkpoint to stage into models/asr_ft")
+                   help="Optional Hugging Face repo containing fine-tuned ONNX checkpoint to stage into saved_models/asr_ft")
     p.add_argument("--asr-ft-subdir", default="asr-gipformer",
-                   help="Subfolder inside --asr-ft-repo containing ONNX files when staging models/asr_ft")
+                   help="Subfolder inside --asr-ft-repo containing ONNX files when staging saved_models/asr_ft")
     args = p.parse_args()
     for part, repo in MODELS.items():
         if args.only not in ("both", part):

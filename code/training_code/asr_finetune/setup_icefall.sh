@@ -3,7 +3,7 @@ set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 CODE_DIR="$(cd "${SCRIPT_DIR}/../.." && pwd)"
-ICEFALL_DIR="${LIFEMATE_ICEFALL_ROOT:-${CODE_DIR}/models/.research/icefall}"
+ICEFALL_DIR="${LIFEMATE_ICEFALL_ROOT:-${CODE_DIR}/saved_models/.research/icefall}"
 
 mkdir -p "$(dirname "${ICEFALL_DIR}")"
 if [ ! -d "${ICEFALL_DIR}/.git" ] && [ ! -f "${ICEFALL_DIR}/icefall/__init__.py" ]; then

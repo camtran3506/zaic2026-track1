@@ -1,4 +1,4 @@
-"""Strictly reconstruct the original Gipformer icefall PyTorch model from models/asr/model.pt."""
+"""Strictly reconstruct the original Gipformer icefall PyTorch model from saved_models/asr/model.pt."""
 from __future__ import annotations
 
 import argparse
@@ -11,9 +11,9 @@ import sys
 
 CODE_DIR = Path(__file__).resolve().parents[2]
 REPO_ROOT = CODE_DIR.parent
-ORIGINAL_ASR_DIR = CODE_DIR / "models" / "asr"
-DEFAULT_FINETUNED_ASR_DIR = CODE_DIR / "models" / "asr_ft"
-DEFAULT_ICEFALL_ROOT = Path(os.environ.get("LIFEMATE_ICEFALL_ROOT", str(CODE_DIR / "models" / ".research" / "icefall")))
+ORIGINAL_ASR_DIR = CODE_DIR / "saved_models" / "asr"
+DEFAULT_FINETUNED_ASR_DIR = CODE_DIR / "saved_models" / "asr_ft"
+DEFAULT_ICEFALL_ROOT = Path(os.environ.get("LIFEMATE_ICEFALL_ROOT", str(CODE_DIR / "saved_models" / ".research" / "icefall")))
 
 
 def sha256(path: Path) -> str:
@@ -31,7 +31,7 @@ def inspect_checkpoint(model_dir: Path) -> dict:
     path = model_dir / "model.pt"
     if not path.is_file():
         raise FileNotFoundError(
-            f"Missing PyTorch checkpoint {path}; run scripts/download_models.py --only asr --asr-precision all"
+            f"Missing PyTorch checkpoint {path}; run training_code/download_models.py --only asr --asr-precision all"
         )
     raw = torch.load(path, map_location="cpu", weights_only=True)
     if not isinstance(raw, dict) or set(raw) != {"model"} or not isinstance(raw["model"], dict):
@@ -67,7 +67,7 @@ def strict_model(model_dir: Path, icefall_root: Path):
     ]
     if not all(path.is_file() for path in required):
         raise FileNotFoundError(
-            f"icefall source missing; expected {required}. Run scripts/asr_finetune/setup_icefall.sh or pass --icefall-root"
+            f"icefall source missing; expected {required}. Run training_code/asr_finetune/setup_icefall.sh or pass --icefall-root"
         )
     for name in ("k2", "kaldifeat", "lhotse", "sentencepiece", "torchaudio"):
         if importlib.util.find_spec(name) is None:

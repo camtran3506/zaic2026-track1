@@ -6,6 +6,11 @@ import sys
 from pathlib import Path
 from unittest.mock import patch
 
+CODE_DIR = Path(__file__).resolve().parents[1]
+REPO_ROOT = CODE_DIR.parent
+if str(CODE_DIR) not in sys.path:
+    sys.path.insert(0, str(CODE_DIR))
+
 from transformers import AutoTokenizer
 
 import lifemate.agent as agent
@@ -61,14 +66,14 @@ def statistics(rows, key, budget):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train-jsonl", type=Path, required=True)
-    parser.add_argument("--catalog", type=Path, required=True)
-    parser.add_argument("--model", type=Path, required=True)
+    parser.add_argument("--train-jsonl", type=Path, default=REPO_ROOT / "data" / "train" / "train.jsonl")
+    parser.add_argument("--catalog", type=Path, default=REPO_ROOT / "data" / "train" / "train_tools_catalog.json")
+    parser.add_argument("--model", type=Path, default=CODE_DIR / "saved_models" / "llm")
     parser.add_argument("--transcripts", type=Path)
     parser.add_argument("--budget", type=int, default=16000)
     parser.add_argument("--max-tool-details", type=int, default=35)
     parser.add_argument(
-        "--output-dir", type=Path, default=Path("result/token_audit")
+        "--output-dir", type=Path, default=CODE_DIR / "result" / "token_audit"
     )
     args = parser.parse_args()
 

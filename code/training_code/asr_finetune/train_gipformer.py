@@ -1,8 +1,8 @@
-"""Fine-tune Gipformer 1.5 (68M Zipformer-RNNT) on train_asr.jsonl prepared targets.
+"""Fine-tune Gipformer 1.5 (68M Zipformer-RNNT) on data/train_asr.jsonl prepared targets.
 
-Training reads base weights from code/models/asr/model.pt (never overwriting it)
+Training reads base weights from code/saved_models/asr/model.pt (never overwriting it)
 and saves adapted checkpoints to --output-dir (default: code/result/asr_sft) for
-export_gipformer.py -> code/models/asr_ft.
+export_gipformer.py -> code/saved_models/asr_ft.
 """
 from __future__ import annotations
 
@@ -23,8 +23,8 @@ from lifemate.agent import audio_path  # noqa: E402
 from lifemate.asr import read_audio  # noqa: E402
 from lifemate.asr_targets import build_asr_target, encode_bpe_ids, load_vocab_chars, normalized_word_error_rate  # noqa: E402
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device  # noqa: E402
-from scripts.asr_finetune.prepare_gipformer_sft import _resolve_asr_audio_dir  # noqa: E402
-from scripts.asr_finetune.gipformer_pt import (  # noqa: E402
+from training_code.asr_finetune.prepare_gipformer_sft import _resolve_asr_audio_dir  # noqa: E402
+from training_code.asr_finetune.gipformer_pt import (  # noqa: E402
     DEFAULT_ICEFALL_ROOT,
     ORIGINAL_ASR_DIR,
     sha256,
@@ -107,7 +107,7 @@ def main() -> None:
     add_cuda_device_argument(parser)
     parser.add_argument("--data-dir", type=Path, default=CODE_DIR / "result" / "asr_sft_data",
                         help="Directory prepared by prepare_gipformer_sft.py (train.jsonl / dev.jsonl)")
-    parser.add_argument("--data-root", type=Path, default=REPO_ROOT / "train+public_test")
+    parser.add_argument("--data-root", type=Path, default=REPO_ROOT / "data")
     parser.add_argument("--model-dir", type=Path, default=ORIGINAL_ASR_DIR,
                         help="Base Gipformer checkpoint folder containing model.pt, bpe.model, tokens.txt")
     parser.add_argument("--icefall-root", type=Path, default=DEFAULT_ICEFALL_ROOT)

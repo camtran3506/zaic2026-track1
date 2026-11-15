@@ -129,24 +129,24 @@ print(json.dumps({{'asr': str(args.asr_model)}}))
 """)
     shim.chmod(0o755)
     env = {**os.environ, "PATH": str(tmp_path) + os.pathsep + os.environ["PATH"], "ASR_MODEL": "/stale/asr"}
-    (app / "models/asr").mkdir(parents=True)
-    (app / "models/asr/tokens.txt").write_text("a 1\n")
+    (app / "saved_models/asr").mkdir(parents=True)
+    (app / "saved_models/asr/tokens.txt").write_text("a 1\n")
 
     out_base = json.loads(subprocess.check_output(["bash", script], env=env, text=True))
-    assert out_base["asr"] == str(app / "models/asr")
+    assert out_base["asr"] == str(app / "saved_models/asr")
 
-    (app / "models/asr_ft").mkdir(parents=True)
-    (app / "models/asr_ft/tokens.txt").write_text("a 1\n")
+    (app / "saved_models/asr_ft").mkdir(parents=True)
+    (app / "saved_models/asr_ft/tokens.txt").write_text("a 1\n")
     out_ft = json.loads(subprocess.check_output(["bash", script], env=env, text=True))
-    assert out_ft["asr"] == str(app / "models/asr_ft")
+    assert out_ft["asr"] == str(app / "saved_models/asr_ft")
 
 
 def test_download_models_can_stage_both_asr_and_asr_ft(tmp_path, monkeypatch):
     import huggingface_hub
     app = tmp_path / "app"
-    (app / "scripts").mkdir(parents=True)
-    script = app / "scripts/download_models.py"
-    shutil.copy2(APP / "scripts/download_models.py", script)
+    (app / "training_code").mkdir(parents=True)
+    script = app / "training_code/download_models.py"
+    shutil.copy2(APP / "training_code/download_models.py", script)
 
     def fake_snapshot(**kwargs):
         dest = Path(kwargs["local_dir"])
@@ -163,11 +163,11 @@ def test_download_models_can_stage_both_asr_and_asr_ft(tmp_path, monkeypatch):
 
     monkeypatch.setattr(huggingface_hub, "snapshot_download", fake_snapshot)
     monkeypatch.setattr(sys, "argv", [
-        str(script), "--only", "asr", "--models-dir", str(app / "models"), "--asr-ft-repo", "example/release",
+        str(script), "--only", "asr", "--models-dir", str(app / "saved_models"), "--asr-ft-repo", "example/release",
     ])
     runpy.run_path(str(script), run_name="__main__")
-    assert (app / "models/asr/model.pt").is_file() and (app / "models/asr/encoder.onnx").is_file()
-    assert (app / "models/asr_ft/encoder.onnx").read_bytes() == b"finetuned"
+    assert (app / "saved_models/asr/model.pt").is_file() and (app / "saved_models/asr/encoder.onnx").is_file()
+    assert (app / "saved_models/asr_ft/encoder.onnx").read_bytes() == b"finetuned"
 
 
 def test_selective_asr_targets_and_alphanumeric_patterns():
@@ -208,7 +208,7 @@ def test_selective_asr_targets_and_alphanumeric_patterns():
 
 
 def test_prepare_gipformer_sft_selective_policy_and_auto_hypotheses(tmp_path, monkeypatch):
-    from scripts.asr_finetune import prepare_gipformer_sft as prep
+    from training_code.asr_finetune import prepare_gipformer_sft as prep
 
     root = tmp_path / "data"
     train_dir = root / "train"
@@ -241,7 +241,7 @@ def test_prepare_gipformer_sft_selective_policy_and_auto_hypotheses(tmp_path, mo
     model_dir = tmp_path / "models/asr"
     _write_onnx(model_dir, "fp32")
     # Reuse repo tokens.txt if present for real vocab check.
-    repo_tokens = APP / "models/asr/tokens.txt"
+    repo_tokens = APP / "saved_models/asr/tokens.txt"
     if repo_tokens.is_file():
         shutil.copy2(repo_tokens, model_dir / "tokens.txt")
 
@@ -294,8 +294,8 @@ def test_prepare_gipformer_sft_selective_policy_and_auto_hypotheses(tmp_path, mo
 
 
 def test_real_train_asr_jsonl_selective_coverage():
-    real_jsonl = REPO_ROOT / "train_asr.jsonl"
-    real_tokens = APP / "models/asr/tokens.txt"
+    real_jsonl = REPO_ROOT / "data" / "train_asr.jsonl"
+    real_tokens = APP / "saved_models/asr/tokens.txt"
     if not real_jsonl.is_file() or not real_tokens.is_file():
         pytest.skip("Workspace train_asr.jsonl or tokens.txt not present")
     vocab = load_vocab_chars(real_tokens)
@@ -404,16 +404,16 @@ def test_filter_damaged_asr_in_prepare_sft(tmp_path, monkeypatch):
 
 
 def test_export_gipformer_refuses_to_overwrite_original_dir(tmp_path):
-    from scripts.asr_finetune.export_gipformer import export_finetuned_onnx
+    from training_code.asr_finetune.export_gipformer import export_finetuned_onnx
 
-    orig = tmp_path / "models/asr"
+    orig = tmp_path / "saved_models/asr"
     orig.mkdir(parents=True)
     with pytest.raises(ValueError, match="Refusing to overwrite original base ASR folder"):
         export_finetuned_onnx(best=tmp_path / "best.pt", original_dir=orig, output_dir=orig)
 
 
 def test_train_gipformer_resolve_training_rows_selective_bpe_check():
-    from scripts.asr_finetune.train_gipformer import resolve_training_rows
+    from training_code.asr_finetune.train_gipformer import resolve_training_rows
 
     class StubSP:
         def unk_id(self):
@@ -445,14 +445,14 @@ def test_train_gipformer_resolve_training_rows_selective_bpe_check():
 def test_train_gipformer_cli_uses_cuda_visible_devices_and_soundfile():
     import inspect
     import subprocess
-    from scripts.asr_finetune import train_gipformer
+    from training_code.asr_finetune import train_gipformer
 
     src = inspect.getsource(train_gipformer.main)
     assert "torchaudio.load" not in src
     assert "read_audio(" in src
 
     proc = subprocess.run(
-        [sys.executable, str(APP / "scripts/asr_finetune/train_gipformer.py"), "--help"],
+        [sys.executable, str(APP / "training_code/asr_finetune/train_gipformer.py"), "--help"],
         capture_output=True, text=True, check=True,
     )
     assert "--cuda-visible-devices" in proc.stdout
@@ -470,8 +470,8 @@ def test_asr_targets_preserves_full_date_years_and_multidigit_decimals():
 
 
 def test_prepare_gipformer_sft_opt_in_verify_main_and_train_device_selection(tmp_path, monkeypatch):
-    from scripts.asr_finetune import prepare_gipformer_sft as prep
-    from scripts.asr_finetune.train_gipformer import resolve_training_rows, select_training_device
+    from training_code.asr_finetune import prepare_gipformer_sft as prep
+    from training_code.asr_finetune.train_gipformer import resolve_training_rows, select_training_device
 
     root = tmp_path / "data"
     train_dir = root / "train"

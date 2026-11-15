@@ -28,7 +28,7 @@ Kết quả lưu trong `/kaggle/working/lifemate_runs/<RUN_NAME>/`: `transcripts
 code('from pathlib import Path\n' + (ROOT / 'code/lifemate/context.py').read_text() + '\n' + '''import os, sys, json, subprocess, datetime, shutil, zipfile, hashlib
 
 # ===== CẤU HÌNH — thông thường chỉ cần chỉnh DATA_ROOT =====
-DATA_ROOT = None  # None: tự tìm trong /kaggle/input; hoặc "/kaggle/input/<dataset>/train+public_test"
+DATA_ROOT = None  # None: tự tìm trong /kaggle/input; hoặc "/kaggle/input/<dataset>/data"
 SPLIT = "public_test"  # train / public_test / private_test
 LIMIT = 0             # 0 = toàn bộ split; đặt 5 để smoke test
 REQUIRE_GPU = True    # False nếu muốn chạy CPU
@@ -230,8 +230,9 @@ for rel in ['lifemate/__init__.py', 'lifemate/catalog.py', 'lifemate/models.py',
             'lifemate/local_assist.py', 'lifemate/assist_training.py',
             'lifemate/itn.py', 'lifemate/local_helpers.py', 'lifemate/local_knowledge.py', 'lifemate/local_checks.py',
             'lifemate/execution_policy.py', 'lifemate/tool_execution.py', 'lifemate/specialist_training.py',
-            'main.py', 'score_train.py', 'lifemate/sft.py', 'lifemate/data_generalization.py', 'prepare_sft.py', 'train_lora.py',
-            'merge_lora.py', 'finetune.py', 'tests/test_baseline.py', 'tests/test_sft.py',
+            'main.py', 'lifemate/sft.py', 'lifemate/data_generalization.py', 'training_code/__init__.py',
+            'training_code/score_train.py', 'training_code/prepare_sft.py', 'training_code/train_lora.py',
+            'training_code/merge_lora.py', 'training_code/finetune.py', 'tests/test_baseline.py', 'tests/test_sft.py',
             'tests/test_finetune_integration.py', 'tests/test_audio.py', 'tests/test_catalog.py',
             'tests/test_staged_pipeline.py', 'tests/test_decoding.py', 'tests/test_stopping_filters.py', 'tests/test_scoring.py', 'tests/test_evaluation.py', 'tests/test_batching.py', 'tests/test_data_generalization.py', 'tests/test_rollout_cache_lifecycle.py',
             'tests/test_transcript_normalization.py', 'tests/test_text.py', 'tests/test_runtime_parity.py', 'tests/test_runtime_config.py',
@@ -391,7 +392,7 @@ if TRAIN_LLM:
     FT_RUN = Path("/kaggle/working/lifemate_finetunes") / datetime.datetime.now(datetime.timezone.utc).strftime("%Y%m%dT%H%M%S_%fZ")
     FT_ENV = BASE_ENV.copy()
     FT_ENV.update(HF_HUB_OFFLINE="1", TRANSFORMERS_OFFLINE="1", HF_DATASETS_OFFLINE="1")
-    train_command = [sys.executable, "-u", APP / "finetune.py",
+    train_command = [sys.executable, "-u", APP / "training_code/finetune.py",
         "--data-root", training_data, "--base-model", LLM_PATH, "--output-dir", FT_RUN,
         "--backend", TRAIN_BACKEND,
         "--asr-transcript-ratio", str(TRAIN_ASR_TRANSCRIPT_RATIO),

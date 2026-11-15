@@ -16,7 +16,7 @@ from .asr_biasing import (
 
 ASR_REPO_ID = "g-group-ai-lab/gipformer1.5-68M-rnnt"
 ASR_BACKEND = "sherpa-onnx"
-DEFAULT_SFT_ASR_MODEL = Path(__file__).resolve().parents[1] / 'models' / 'asr_ft'
+DEFAULT_SFT_ASR_MODEL = Path(__file__).resolve().parents[1] / 'saved_models' / 'asr_ft'
 DEFAULT_ASR_DECODING_METHOD = "modified_beam_search"
 DEFAULT_ASR_MAX_ACTIVE_PATHS = 4
 

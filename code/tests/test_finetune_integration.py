@@ -126,7 +126,7 @@ class OfflineRecognizer:
     env = {**os.environ, 'CUDA_VISIBLE_DEVICES': '', 'OMP_NUM_THREADS': '1',
            'PYTHONDONTWRITEBYTECODE': '1', 'HF_HUB_OFFLINE': '1', 'TRANSFORMERS_OFFLINE': '1',
            'PYTHONPATH': str(stubs) + os.pathsep + os.environ.get('PYTHONPATH', '')}
-    result = subprocess.run([sys.executable, app / 'finetune.py', '--data-root', data.parent,
+    result = subprocess.run([sys.executable, app / 'training_code/finetune.py', '--data-root', data.parent,
         '--base-model', base, '--output-dir', run, '--backend', 'transformers',
         '--asr-transcript-ratio', '0',
         '--max-steps', '2', '--gradient-accumulation', '1', '--save-strategy', 'steps', '--save-steps', '1',
@@ -228,7 +228,7 @@ class OfflineRecognizer:
     assert isinstance(llm.generate('system', 'user'), str)
     assert (run / 'train_lora.log').is_file()
     assert (run / 'training/checkpoint-2/trainer_state.json').is_file()
-    resume = subprocess.run([sys.executable, app / 'train_lora.py', '--base-model', base,
+    resume = subprocess.run([sys.executable, app / 'training_code/train_lora.py', '--base-model', base,
         '--sft-dir', run / 'sft', '--output-dir', run / 'training', '--backend', 'transformers',
         '--max-steps', '3', '--gradient-accumulation', '1', '--save-strategy', 'steps', '--save-steps', '1',
         '--learning-rate', '0.01',

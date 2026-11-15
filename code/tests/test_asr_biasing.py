@@ -193,7 +193,7 @@ def test_ensure_bpe_vocab_behaviour(tmp_path):
     _make_stub_asr_dir(direct, with_bpe_vocab=True)
     assert ensure_bpe_vocab(direct, tmp_path / "out") == direct / "bpe.vocab"
 
-    real_bpe = ROOT / "models" / "asr_ft" / "bpe.model"
+    real_bpe = ROOT / "saved_models" / "asr_ft" / "bpe.model"
     if real_bpe.is_file():
         real_copy_dir = tmp_path / "from_model"
         real_copy_dir.mkdir()

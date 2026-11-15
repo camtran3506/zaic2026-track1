@@ -9,6 +9,12 @@ from __future__ import annotations
 import argparse
 import json
 from pathlib import Path
+import sys
+
+CODE_DIR = Path(__file__).resolve().parents[1]
+REPO_ROOT = CODE_DIR.parent
+if str(CODE_DIR) not in sys.path:
+    sys.path.insert(0, str(CODE_DIR))
 
 from lifemate.catalog import load_catalog
 from lifemate.scoring import token_f1, calls_match, max_matches, call_f1
@@ -16,9 +22,9 @@ from lifemate.scoring import token_f1, calls_match, max_matches, call_f1
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--train-jsonl", type=Path, required=True)
-    parser.add_argument("--catalog", type=Path, required=True)
-    parser.add_argument("--submission", type=Path, required=True)
+    parser.add_argument("--train-jsonl", type=Path, default=REPO_ROOT / "data" / "train" / "train.jsonl")
+    parser.add_argument("--catalog", type=Path, default=REPO_ROOT / "data" / "train" / "train_tools_catalog.json")
+    parser.add_argument("--submission", type=Path, default=CODE_DIR / "result" / "submission.jsonl")
     args = parser.parse_args()
     catalog = load_catalog(args.catalog)
     predictions = {}

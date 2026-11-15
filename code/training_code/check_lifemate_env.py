@@ -9,7 +9,7 @@ import sys
 import textwrap
 
 p = argparse.ArgumentParser(description=__doc__)
-p.add_argument('--app-dir', type=Path, default=Path.cwd(), help='Directory containing main.py and finetune.py')
+p.add_argument('--app-dir', type=Path, default=Path(__file__).resolve().parents[1], help='Directory containing predict.py and main.py')
 p.add_argument('--split-dir', type=Path, action='append', default=[], help='Directory containing the split-specific zaic_tools; repeat for train/public_test')
 p.add_argument('--probe-toolenv', action='store_true', help='Construct one independent diagnostic session per split; validate only, never env.call')
 p.add_argument('--only-toolenv', action='store_true', help='Skip model/package checks and check only ToolEnv')
@@ -96,7 +96,7 @@ if not a.only_toolenv:
     from peft import LoraConfig, get_peft_model, prepare_model_for_kbit_training
     from lifemate.sft import AssistantCollator, SupervisedDataset
     from lifemate.evaluation import StateToolEvaluator
-    import train_lora, merge_lora
+    from training_code import train_lora, merge_lora
     ''')
     check('Optional FLA kernels import', r'''
     from fla.ops.gated_delta_rule import chunk_gated_delta_rule, fused_recurrent_gated_delta_rule
@@ -105,7 +105,9 @@ if not a.only_toolenv:
     from causal_conv1d import causal_conv1d_fn, causal_conv1d_update
     ''', optional=True)
     check('Optional bitsandbytes import', 'import bitsandbytes', optional=True)
-    for name in ['main.py', 'prepare_sft.py', 'train_lora.py', 'finetune.py', 'merge_lora.py']:
+    for name in ['main.py', 'predict.py', 'benchmark_timing.py',
+                 'training_code/prepare_sft.py', 'training_code/train_lora.py',
+                 'training_code/finetune.py', 'training_code/merge_lora.py']:
         if not (root / name).is_file():
             failed.append(name)
             print(f'[FAIL] Missing entrypoint {name}', flush=True)
