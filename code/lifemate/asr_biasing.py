@@ -696,17 +696,19 @@ class _ContextAwareHistoryASR:
     """Lightweight ASR adapter preserving single-arg history_text callers with non-leaky hotwords."""
 
     def __init__(self, asr: Any, item: dict[str, Any], split_dir: Path):
+        from .agent import audio_path
+        from .history import history_turn_text
+
         self._asr = asr
         self._item = item
         self._vocab = getattr(asr, "vocab_chars", None)
         self._turn_queues: dict[str, deque[int]] = {}
-        root = Path(split_dir).resolve()
         for idx, turn in enumerate(item.get("history") or []):
-            if not isinstance(turn, dict) or turn.get("text") is not None:
+            if not isinstance(turn, dict) or history_turn_text(turn) is not None:
                 continue
             rel = turn.get("audio") or turn.get("audio_path")
             if isinstance(rel, str) and rel.strip():
-                key = str((root / rel).resolve())
+                key = str(audio_path(split_dir, rel))
                 self._turn_queues.setdefault(key, deque()).append(idx)
 
     def transcribe(self, path: Path) -> str:
@@ -731,15 +733,17 @@ def collect_batch_audio_hotwords(
     skip_main_fn=None,
 ) -> tuple[list[Path], list[str]]:
     """Collect deduplicated (resolved_audio_path, hotwords) pairs across items and history turns."""
-    from .data import audio_path
+    from .agent import audio_path
+    from .history import history_turn_text
 
     paths: list[Path] = []
     hotwords_list: list[str] = []
     seen: set[tuple[str, str]] = set()
     for item in items:
         if skip_main_fn is None or not skip_main_fn(item):
-            if item.get("audio"):
-                p = audio_path(split_dir, item["audio"])
+            rel_main = item.get("audio")
+            if isinstance(rel_main, str) and rel_main.strip():
+                p = audio_path(split_dir, rel_main)
                 hw = extract_sample_hotwords(item, vocab_chars=vocab_chars)
                 key = (str(p.resolve()), hw)
                 if key not in seen:
@@ -747,7 +751,7 @@ def collect_batch_audio_hotwords(
                     paths.append(p)
                     hotwords_list.append(hw)
         for idx, turn in enumerate(item.get("history") or []):
-            if not isinstance(turn, dict) or turn.get("text") is not None:
+            if not isinstance(turn, dict) or history_turn_text(turn) is not None:
                 continue
             rel = turn.get("audio") or turn.get("audio_path")
             if isinstance(rel, str) and rel.strip():

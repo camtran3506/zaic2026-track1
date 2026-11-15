@@ -14,6 +14,7 @@ if str(ROOT) not in sys.path:
 
 from lifemate.asr import LocalASR, asr_extra_options  # noqa: E402
 from lifemate.asr_biasing import (  # noqa: E402
+    collect_batch_audio_hotwords,
     ensure_bpe_vocab,
     extract_sample_hotwords,
     history_asr_for_item,
@@ -443,3 +444,156 @@ def test_repair_sample_entities_a2_and_transcribe_integration(tmp_path):
     # h2 follows turn 1, so A2 repairs "tokyo gaden" -> "Tokyo Garden".
     assert hist_asr.transcribe(tmp_path / "h0.wav") == "Đặt vé tàu se5 tới tokyo gaden gửi mail."
     assert hist_asr.transcribe(tmp_path / "h2.wav") == out
+
+
+def test_collect_batch_audio_hotwords_and_prepare_sft_with_latest_asr_and_cache(tmp_path, monkeypatch):
+    import finetune
+    import lifemate.models
+    import prepare_sft
+    from test_baseline import FakeEnv
+
+    split_dir = tmp_path / "train"
+    split_dir.mkdir()
+    for name in ("h0.wav", "h_skip.wav", "h_empty.wav", "main.wav"):
+        sf.write(split_dir / name, np.zeros(800, dtype=np.float32), 16000)
+
+    items = [{
+        "id": "train_0",
+        "audio": "main.wav",
+        "audio_text": "Đặt tàu SE5 tại Tokyo Garden ngày mai.",
+        "context": {
+            "current_time": "2026-10-18T09:00:00+07:00",
+            "timezone": "Asia/Ho_Chi_Minh",
+            "installed_apps": {"trains": {"tools": ["trains.search"]}},
+            "user_profile": {"name": "Anh Nam"},
+        },
+        "history": [
+            {"role": "user", "audio": "h0.wav"},
+            {"role": "user", "audio": "h_skip.wav", "audio_text": "Đã có transcript sạch."},
+            {"role": "user", "audio": "h_empty.wav", "text": ""},
+            {"role": "assistant", "text": "Gợi ý Tokyo Garden hoặc tàu SE5."},
+        ],
+        "label": {"tool_calls": [{"name": "trains.search", "arguments": {"query": "SE5"}}]},
+    }]
+    paths, hws = collect_batch_audio_hotwords(items, split_dir, vocab_chars=None)
+    assert [p.name for p in paths] == ["main.wav", "h0.wav", "h_empty.wav"]
+    assert "SE5" in hws[0] or "S E NĂM" in hws[0]
+    assert "TOKYO GARDEN" not in hws[1]
+
+    asr_dir = tmp_path / "asr"
+    _make_stub_asr_dir(asr_dir, with_bpe_vocab=True)
+    catalog = {
+        "trains.search": {
+            "name": "trains.search",
+            "kind": "read",
+            "parameters": {"type": "object", "properties": {"query": {"type": "string"}}, "required": ["query"]},
+        }
+    }
+    (split_dir / "train_tools_catalog.json").write_text(json.dumps({"apps": [{"tools": list(catalog.values())}]}))
+    (split_dir / "train.jsonl").write_text(json.dumps(items[0], ensure_ascii=False) + "\n", encoding="utf-8")
+
+    class FakeStream:
+        def __init__(self, hotwords=""):
+            self.result = SimpleNamespace(
+                text="ĐẶT TÀU S E NĂM TẠI TOKYO GADEN NGÀY MAI" if hotwords else "KHÔNG CÓ HOTWORDS"
+            )
+
+        def accept_waveform(self, sr, samples):
+            pass
+
+    class FakeRecognizer:
+        @classmethod
+        def from_transducer(cls, **kwargs):
+            return cls()
+
+        def create_stream(self, hotwords=""):
+            return FakeStream(hotwords)
+
+        def decode_streams(self, streams):
+            pass
+
+    class Env(FakeEnv):
+        def __init__(self, *a, **kw):
+            super().__init__()
+
+        def validate(self, name, args):
+            return {"ok": True}
+
+        def get_state_hash(self):
+            return "state"
+
+    monkeypatch.setitem(sys.modules, "sherpa_onnx", SimpleNamespace(OfflineRecognizer=FakeRecognizer))
+    monkeypatch.setitem(sys.modules, "zaic_tools", SimpleNamespace(ToolEnv=Env))
+    monkeypatch.setenv("CUDA_VISIBLE_DEVICES", "0")
+
+    # 1) Direct live SFT preparation with latest ASR flags (B1 + A1 + A2, beam 8, batch 4)
+    out_live = tmp_path / "sft_live"
+    monkeypatch.setattr(sys, "argv", [
+        "prepare_sft.py", "--data-root", str(split_dir), "--output-dir", str(out_live),
+        "--asr-model", str(asr_dir), "--asr-beam-size", "8",
+        "--asr-hotwords", "auto", "--asr-hotwords-score", "1.5", "--asr-post-normalize",
+        "--asr-batch-size", "4", "--no-inject-recovery",
+    ])
+    prepare_sft.main()
+    live_manifest = json.loads((out_live / "manifest.json").read_text(encoding="utf-8"))
+    assert live_manifest["asr"]["hotwords_mode"] == "auto"
+    assert live_manifest["asr"]["max_active_paths"] == 8
+    assert live_manifest["asr"]["post_normalize"] is True
+    assert live_manifest["sft_format"]["include_date_helpers"] is False
+    live_rows = [json.loads(line) for line in (out_live / "train.jsonl").read_text(encoding="utf-8").splitlines()]
+    asr_rows = [r for r in live_rows if r["transcript_source"] == "asr"]
+    assert asr_rows
+    prompt_obj = json.loads(asr_rows[0]["messages"][1]["content"])
+    assert prompt_obj["request_transcript"] == "Đặt tàu se5 tại tokyo garden ngày mai."
+    days = prompt_obj["user_context"]["date_reference"]["days"]
+    assert "tuần này" in days[1] and "hôm nay" in days[1]
+    assert "tuần sau" in days[2] and "mai" in days[2]
+
+    # 2) Precomputed transcript cache consumption in prepare_sft.py skips LocalASR initialization
+    cache_path = tmp_path / "train_transcripts.jsonl"
+    identity = dataset_identity(items, split_dir, "train", False)
+    settings = asr_identity(asr_dir, "fp32", 2, max_active_paths=8, hotwords_mode="auto", hotwords_score=1.5, post_normalize=True)
+    prepare_transcripts(
+        items, split_dir, cache_path, identity, settings,
+        lambda: LocalASR(asr_dir, precision="fp32", num_threads=2, max_active_paths=8, hotwords_mode="auto", hotwords_score=1.5, post_normalize=True),
+        batch_size=4,
+    )
+    monkeypatch.setattr(lifemate.models, "LocalASR", lambda *a, **kw: (_ for _ in ()).throw(AssertionError("LocalASR must not load when --transcript-cache is supplied")))
+    out_cached = tmp_path / "sft_cached"
+    monkeypatch.setattr(sys, "argv", [
+        "prepare_sft.py", "--data-root", str(split_dir), "--output-dir", str(out_cached),
+        "--transcript-cache", str(cache_path), "--no-inject-recovery",
+    ])
+    prepare_sft.main()
+    cached_manifest = json.loads((out_cached / "manifest.json").read_text(encoding="utf-8"))
+    assert cached_manifest["asr"]["hotwords_mode"] == "auto"
+    assert cached_manifest["asr"]["post_normalize"] is True
+    assert cached_manifest["sft_format"]["transcript_cache"] == str(cache_path.resolve())
+    cached_rows = [json.loads(line) for line in (out_cached / "train.jsonl").read_text(encoding="utf-8").splitlines()]
+    assert len(cached_rows) == len(live_rows)
+
+    # 3) finetune.py defaults to latest ASR configuration and forwards --transcript-cache / --asr-batch-size
+    forwarded = []
+
+    class Child:
+        stdout = ()
+        def __init__(self, cmd, **kw): forwarded.append(cmd)
+        def __enter__(self): return self
+        def __exit__(self, *a): return False
+        def wait(self): return 0
+
+    base_llm = tmp_path / "base_llm"
+    base_llm.mkdir()
+    monkeypatch.setattr(finetune.subprocess, "Popen", Child)
+    monkeypatch.setattr(sys, "argv", [
+        "finetune.py", "--data-root", str(split_dir), "--base-model", str(base_llm),
+        "--output-dir", str(tmp_path / "ft_run"), "--transcript-cache", str(cache_path), "--asr-batch-size", "8",
+    ])
+    finetune.main()
+    prep_cmd = forwarded[0]
+    assert prep_cmd[prep_cmd.index("--asr-beam-size") + 1] == "8"
+    assert prep_cmd[prep_cmd.index("--asr-hotwords") + 1] == "auto"
+    assert "--asr-post-normalize" in prep_cmd
+    assert prep_cmd[prep_cmd.index("--asr-batch-size") + 1] == "8"
+    assert prep_cmd[prep_cmd.index("--transcript-cache") + 1] == str(cache_path)
+    assert "--include-date-helpers" not in prep_cmd

@@ -2,6 +2,7 @@
 """Convert all TRAIN gold calls to observed next-action dialogues."""
 import argparse
 import json
+import math
 from pathlib import Path
 import sys
 
@@ -103,6 +104,8 @@ def main():
     p.add_argument("--asr-threads", type=int, default=4)
     p.add_argument("--asr-batch-size", type=int, default=16,
                    help="Batch size for offline ASR stream decoding during SFT data prep")
+    p.add_argument("--transcript-cache", type=Path, default=None,
+                   help="Completed ASR transcript cache JSONL (with manifest) to reuse instead of running live ASR")
     p.add_argument("--filter-damaged-asr", action="store_true",
                    help="Drop contradictory TRAIN ASR copies when spoken exact-match gold arguments are lost in ASR")
     add_arguments(p)
@@ -112,6 +115,12 @@ def main():
     configure_cuda_device(args)
     validate_options(args)
     validate_training_length(args.max_length)
+    if args.asr_threads < 1:
+        p.error("--asr-threads must be positive")
+    if args.asr_beam_size < 1:
+        p.error("--asr-beam-size must be positive")
+    if not math.isfinite(args.asr_hotwords_score) or args.asr_hotwords_score <= 0:
+        p.error("--asr-hotwords-score must be finite and positive")
     if args.asr_batch_size < 1:
         p.error("--asr-batch-size must be positive")
     if not 0.0 <= args.guard_recovery_ratio <= 1.0:
@@ -144,6 +153,22 @@ def main():
     asr_counts = {"train": train_asr, "validation": val_asr, "app_heldout": total_asr-train_asr-val_asr}
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise FileExistsError("Use an empty output directory; prepared data is never overwritten")
+    asr = None
+    asr_settings = None
+    cached_transcripts = {}
+    if args.transcript_cache is not None:
+        from lifemate.asr import ASR_BACKEND, ASR_REPO_ID
+        from lifemate.transcripts import dataset_identity, load_transcripts
+        if not originals:
+            raise ValueError("--transcript-cache requires non-synthetic train samples")
+        cache_identity = dataset_identity(originals, split_dir, "train", False)
+        cached_rows, cached_manifest = load_transcripts(args.transcript_cache, cache_identity)
+        cached_asr = cached_manifest.get("asr", {})
+        if cached_asr.get("backend") != ASR_BACKEND or cached_asr.get("repo_id") != ASR_REPO_ID:
+            raise ValueError("Transcript ASR cache is not GIPformer 1.5; rebuild ASR cache")
+        asr_settings = cached_asr
+        cached_transcripts = {row["id"]: row for row in cached_rows}
+        print(f"SFT ASR cache: {args.transcript_cache} ({len(cached_transcripts)} samples)", flush=True)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     ToolEnv = None
     if originals:
@@ -157,18 +182,12 @@ def main():
     augmenter = AppAugmenter(catalog, train, holdout['apps'], groups, seed=args.seed,
         rename_variants=args.rename_variants, distractor_probability=args.distractor_probability,
         tokenizer=tokenizer, max_length=args.max_length)
-    asr = None
-    asr_settings = None
     needs_asr = bool(originals) and (
         args.asr_transcript_ratio > 0 or bool(validation) or bool(partitions['app_heldout'])
         or any(text is None and audio for r in originals
                for _role, text, audio in history_entries(r.get('history', []))))
-    if needs_asr:
-        from lifemate.asr import (
-            DEFAULT_ASR_DECODING_METHOD,
-            DEFAULT_ASR_MAX_ACTIVE_PATHS,
-            resolve_asr_precision,
-        )
+    if needs_asr and not cached_transcripts:
+        from lifemate.asr import asr_extra_options, resolve_asr_precision
         from lifemate.models import LocalASR
         from lifemate.transcripts import asr_identity
         precision = (
@@ -176,7 +195,6 @@ def main():
             if args.asr_precision == "auto" and Path(args.asr_model).expanduser().is_dir()
             else args.asr_precision
         )
-        from lifemate.asr import asr_extra_options
         extra = asr_extra_options(args)
         asr_settings = asr_identity(args.asr_model, precision, args.asr_threads, **extra)
         print(f'SFT ASR model: {args.asr_model} (precision={precision})', flush=True)
@@ -226,6 +244,8 @@ def main():
         'short_reasoning': args.short_reasoning,
         'reasoning_stepwise_ratio': args.reasoning_stepwise_ratio,
     }
+    if args.transcript_cache is not None:
+        metadata['sft_format']['transcript_cache'] = str(args.transcript_cache.expanduser().resolve())
     rollout_rows = {"validation": [], "app_heldout": []}
     for partition, rows in partitions.items():
         if not rows:
@@ -276,7 +296,10 @@ def main():
                 for src in variant_sources:
                     env = None if synthetic else ToolEnv("train", record["id"], root=str(env_root))
                     try:
-                        prepared = prepare_train_transcript(record, split_dir, asr, transcript_source=src)
+                        cached = None if synthetic else cached_transcripts.get(record["id"])
+                        prepared = prepare_train_transcript(
+                            record, split_dir, asr, transcript_source=src, cached_transcript=cached
+                        )
                         if dual_train and not synthetic:
                             prepared['prompt_transcript_source'] = prepared['transcript_source']
                         if (partition == "train" and args.filter_damaged_asr and src == "asr"
@@ -284,7 +307,9 @@ def main():
                             asr_damaged_filtered += 1
                             continue
                         if partition != "train" and not variant_runs:
-                            asr_prepared, clean_prepared = prepare_validation_transcripts(record, split_dir, asr, prepared)
+                            asr_prepared, clean_prepared = prepare_validation_transcripts(
+                                record, split_dir, asr, prepared, cached_transcript=cached
+                            )
                         if synthetic:
                             examples = replay_synthetic_sample(
                                 record, catalog, split_dir, prepared_transcript=prepared, tokenizer=tokenizer,
@@ -444,6 +469,8 @@ def main():
         'max_length': args.max_length, 'groups': {k: sorted(v) for k, v in groups.items()}, **augmenter.stats}
     (args.output_dir / "manifest.json").write_text(json.dumps(metadata, ensure_ascii=False, indent=2), encoding="utf-8")
     print("Prepared TRAIN-only SFT data:", args.output_dir)
+    if asr is not None and hasattr(asr, "close"):
+        asr.close()
     if holder is not None:
         holder.cleanup()
 

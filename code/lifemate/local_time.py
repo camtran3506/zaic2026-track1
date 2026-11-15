@@ -18,12 +18,23 @@ def date_reference(current_time: str, timezone_name: str | None = None) -> dict:
     if timezone_name:
         current = current.astimezone(_context_zone({"timezone": timezone_name}, current.tzinfo))
     today = current.date()
+    monday = today - timedelta(days=today.weekday())
+    rel_tags = {-1: "hôm qua", 0: "hôm nay", 1: "mai", 2: "ngày kia"}
+    # Keep week tags bounded to tuần trước / tuần này / tuần sau so trailing days
+    # beyond next_week never duplicate a "(tuần sau)" weekday label.
+    week_tags = {-1: "tuần trước", 0: "tuần này", 1: "tuần sau"}
 
     def label(day) -> str:
-        tag = {-1: " (hôm qua)", 0: " (hôm nay)", 1: " (mai)", 2: " (ngày kia)"}.get((day - today).days, "")
-        return f"{day.isoformat()} {_TITLE_WEEKDAYS[day.weekday()]}{tag}"
+        parts = []
+        rel = rel_tags.get((day - today).days)
+        if rel:
+            parts.append(rel)
+        week = week_tags.get((day - monday).days // 7)
+        if week:
+            parts.append(week)
+        suffix = f" ({', '.join(parts)})" if parts else ""
+        return f"{day.isoformat()} {_TITLE_WEEKDAYS[day.weekday()]}{suffix}"
 
-    monday = today - timedelta(days=today.weekday())
     return {
         "days": [label(today + timedelta(days=k)) for k in range(-1, 14)],
         "this_week": f"{monday.isoformat()} .. {(monday + timedelta(days=6)).isoformat()}",

@@ -13,7 +13,7 @@ from .agent import (SYSTEM_PROMPT, AgentConfig, _train_transcript, audio_path, b
                     full_json, history_text)
 from .catalog import allowed_tools
 from .function_calling import native_chat, native_observation_messages
-from .history import extract_observed_ids, history_entries
+from .history import extract_observed_ids, history_entries, prompt_history
 from .llm import chat_token_ids
 from .local_time import LOCAL_TIME_POLICY
 from .local_helpers import LOCAL_HELPER_POLICY, execute_helper
@@ -179,14 +179,34 @@ def _current_train_transcript(item, split_dir, asr, transcript_source):
     return normalize_transcript(transcript), transcript_source
 
 
-def prepare_train_transcript(item, split_dir, asr=None, *, transcript_source=None):
+def prepare_train_transcript(item, split_dir, asr=None, *, transcript_source=None, cached_transcript=None):
     """Resolve one selected source for all SFT steps, without silent fallback."""
     if is_synthetic_sample(item):
         if not isinstance(item.get("audio_text"), str) or not item["audio_text"].strip():
             raise ValueError(f"{item['id']}: synthetic samples require nonempty audio_text")
         # Synthetic audio fields can contain placeholders. Never decode them,
         # including audio-only history; history must supply its own text.
-        asr, transcript_source = None, "audio_text"
+        asr, transcript_source, cached_transcript = None, "audio_text", None
+    if cached_transcript is not None:
+        if cached_transcript.get("id") != item["id"]:
+            raise ValueError(f"Cached transcript ID {cached_transcript.get('id')!r} does not match {item['id']!r}")
+        if transcript_source not in (None, "audio_text", "asr"):
+            raise ValueError(f"Unknown transcript source: {transcript_source}")
+        raw = None if transcript_source == "asr" else _train_transcript(item)
+        if transcript_source == "audio_text" and raw is None:
+            raise ValueError(f"{item['id']}: selected audio_text source is missing")
+        if raw is None:
+            transcript = cached_transcript["transcript"]
+            transcript_source = "asr"
+        else:
+            transcript = raw
+            transcript_source = "audio_text"
+        return {
+            "id": item["id"],
+            "transcript": normalize_transcript(transcript),
+            "history": prompt_history(cached_transcript["history"]),
+            "transcript_source": transcript_source,
+        }
     started = time.monotonic()
     transcript, transcript_source = _current_train_transcript(item, split_dir, asr, transcript_source)
     class MissingASR:
@@ -199,17 +219,22 @@ def prepare_train_transcript(item, split_dir, asr=None, *, transcript_source=Non
             "transcript_source": transcript_source}
 
 
-def prepare_validation_transcripts(item, split_dir, asr, prepared_transcript):
+def prepare_validation_transcripts(item, split_dir, asr, prepared_transcript, *, cached_transcript=None):
     """Use ASR for selection and preserve an optional clean view of the same IDs.
 
     History is resolved once by the SFT preparation. Only the current request
     differs between views, so paired rollouts isolate its recognition errors.
     """
-    if asr is None:
+    if asr is None and cached_transcript is None:
         raise ValueError("ASR validation requires --asr-model, including clean-only SFT ablations")
     asr_prepared = deepcopy(prepared_transcript)
     if asr_prepared["transcript_source"] != "asr":
-        transcript, source = _current_train_transcript(item, split_dir, asr, "asr")
+        if cached_transcript is not None:
+            if cached_transcript.get("id") != item["id"]:
+                raise ValueError(f"Cached transcript ID {cached_transcript.get('id')!r} does not match {item['id']!r}")
+            transcript, source = normalize_transcript(cached_transcript["transcript"]), "asr"
+        else:
+            transcript, source = _current_train_transcript(item, split_dir, asr, "asr")
         asr_prepared.update(transcript=transcript, transcript_source=source)
     clean = _train_transcript(item)
     clean_prepared = None

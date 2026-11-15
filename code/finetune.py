@@ -2,6 +2,7 @@
 """One command: resolve HF weights -> replay TRAIN -> LoRA/QLoRA -> optional merge."""
 import argparse
 import json
+import math
 import os
 from pathlib import Path
 import subprocess
@@ -48,11 +49,14 @@ def main():
     p.add_argument("--asr-precision", choices=["auto", "int8", "fp32"], default="auto")
     p.add_argument("--asr-decoding-method", choices=["modified_beam_search", "greedy_search"],
                    default="modified_beam_search")
-    p.add_argument("--asr-beam-size", type=int, default=4)
-    p.add_argument("--asr-hotwords", choices=["off", "auto"], default="off")
+    p.add_argument("--asr-beam-size", type=int, default=8)
+    p.add_argument("--asr-hotwords", choices=["off", "auto"], default="auto")
     p.add_argument("--asr-hotwords-score", type=float, default=1.5)
-    p.add_argument("--asr-post-normalize", action=argparse.BooleanOptionalAction, default=False)
+    p.add_argument("--asr-post-normalize", action=argparse.BooleanOptionalAction, default=True)
     p.add_argument("--asr-threads", type=int, default=4)
+    p.add_argument("--asr-batch-size", type=int, default=16)
+    p.add_argument("--transcript-cache", type=Path, default=None,
+                   help="Completed ASR transcript cache JSONL (with manifest) to reuse instead of running live ASR")
     p.add_argument("--filter-damaged-asr", action="store_true",
                    help="Skip ASR SFT copy if exact-match spoken gold args are missing from ASR transcript")
     p.add_argument("--validation-fraction", type=float, choices=[0.0], default=0.0,
@@ -70,6 +74,14 @@ def main():
     validate_training_length(args.max_length)
     if args.heldout_apps != "none" or args.heldout_groups:
         p.error("Training uses all samples; --heldout-apps must be none and --heldout-groups must be empty")
+    if args.asr_threads < 1:
+        p.error("--asr-threads must be positive")
+    if args.asr_beam_size < 1:
+        p.error("--asr-beam-size must be positive")
+    if not math.isfinite(args.asr_hotwords_score) or args.asr_hotwords_score <= 0:
+        p.error("--asr-hotwords-score must be finite and positive")
+    if args.asr_batch_size < 1:
+        p.error("--asr-batch-size must be positive")
     if args.output_dir.exists() and any(args.output_dir.iterdir()):
         raise FileExistsError("Choose an empty run directory. To resume training use train_lora.py directly.")
     args.output_dir.mkdir(parents=True, exist_ok=True)
@@ -119,15 +131,17 @@ def main():
         '--heldout-groups', args.heldout_groups])
     if args.app_groups_file:
         prepare.extend(['--app-groups-file', args.app_groups_file])
+    if args.transcript_cache is not None:
+        prepare.extend(["--transcript-cache", args.transcript_cache])
     if args.asr_model:
         prepare.extend([
             "--asr-model", args.asr_model, "--device", args.asr_device,
             "--asr-precision", args.asr_precision, "--asr-decoding-method", args.asr_decoding_method,
             "--asr-beam-size", str(args.asr_beam_size), "--asr-threads", str(args.asr_threads),
+            "--asr-batch-size", str(args.asr_batch_size),
             "--asr-hotwords", args.asr_hotwords, "--asr-hotwords-score", str(args.asr_hotwords_score),
+            "--asr-post-normalize" if args.asr_post_normalize else "--no-asr-post-normalize",
         ])
-        if args.asr_post_normalize:
-            prepare.append("--asr-post-normalize")
     if args.filter_damaged_asr:
         prepare.append("--filter-damaged-asr")
     run("prepare_sft.py", prepare)
