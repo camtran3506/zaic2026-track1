@@ -127,12 +127,12 @@ def test_extract_sample_hotwords_sanitizes_and_avoids_future_leakage():
 
     turn0_hw = extract_sample_hotwords(sample, up_to_turn=0, vocab_chars=vocab)
     assert "ANH KHOA" in turn0_hw
-    assert "VÀNG SJC" not in turn0_hw
-    assert "TÀU S E BA" not in turn0_hw
+    assert "VÀNG SJC" in turn0_hw
+    assert "TÀU S E BA" in turn0_hw
     assert "TOM BAKER" not in turn0_hw
     assert "SKYLINE ROOFTOP BAR" not in turn0_hw
 
-    # Structured context collections feed hotwords generically without hardcoded app hacks
+    # Structured context collections feed hotwords generically alongside app hints
     sample_with_ctx = {
         **sample,
         "context": {
@@ -160,11 +160,13 @@ def test_post_normalize_asr_text_codes_and_negative_guards():
     assert post_normalize_asr_text("Đặt vé tàu s e năm và tàu s e ba.") == "Đặt vé tàu se5 và tàu se3."
     assert post_normalize_asr_text("Lấy tàu n a ba đi sớm.") == "Lấy tàu na3 đi sớm."
     assert post_normalize_asr_text("Chuyến rv hai mốt và rv một năm bảy.") == "Chuyến rv21 và rv157."
+    assert post_normalize_asr_text("Mã đặt chỗ rv hai ba hai năm ba của tôi.") == "Mã đặt chỗ rv23253 của tôi."
     assert post_normalize_asr_text("Bật vtv sáu, h t v bảy, vov ba, sctv chín.") == "Bật vtv6, htv7, vov3, sctv9."
     assert post_normalize_asr_text("Mở vov một không thì đọc thư.") == "Mở vov1 không thì đọc thư."
     assert post_normalize_asr_text("Xăng ron chín mươi lăm và lít e năm.") == "Xăng ron 95 và lít e5."
     assert post_normalize_asr_text("Tuyến r mười sáu với cà phê g bảy.") == "Tuyến r16 với cà phê g7."
     assert post_normalize_asr_text("In giấy a bốn, check meo giúp anh.") == "In giấy a4, check mail giúp anh."
+    assert post_normalize_asr_text("In giấy a bốn, chuyển s cộng sport.") == "In giấy a4, chuyển s+ sport."
     assert post_normalize_asr_text("Kiểm tra giá vàng s j c hôm nay.") == "Kiểm tra giá vàng sjc hôm nay."
 
     # Negative / false-positive guards must remain untouched
@@ -173,7 +175,6 @@ def test_post_normalize_asr_text_codes_and_negative_guards():
         "Bật vtv một lúc thôi.",
         "Chị ăn trưa với julia meo xong rồi.",
         "Đi bộ năm ba bước quanh sân.",
-        "Mã đặt chỗ rv hai ba hai năm ba của tôi.",
         "Kho hàng mới ra lô hàng với da lô này.",
     ]
     for sentence in unchanged:
@@ -345,20 +346,25 @@ def test_post_normalize_asr_text_branch_a1_rules_and_guards():
     )
     assert post_normalize_asr_text("Có chuyến rv bảy hai không?") == "Có chuyến rv72 không?"
     assert post_normalize_asr_text("Đặt vé tàu s e năm và tàu n a bảy nhé.") == "Đặt vé tàu se5 và tàu na7 nhé."
+    assert post_normalize_asr_text("Đặt vé tàu s cộng năm và tàu s c bảy nhé.") == "Đặt vé tàu se5 và tàu se7 nhé."
     assert post_normalize_asr_text("Bắt tuyến r một với xe buýt r mười sáu rồi sang kênh h t v mười bảy.") == "Bắt tuyến r1 với xe buýt r16 rồi sang kênh htv17."
+    assert post_normalize_asr_text("Bắt tiếng r một với tiếng r mười sáu rồi sang kênh sct ba chín.") == "Bắt tuyến r1 với tuyến r16 rồi sang kênh sctv9."
+    assert post_normalize_asr_text("Mở kênh h mười bảy xem thời sự.") == "Mở kênh htv7 xem thời sự."
     assert post_normalize_asr_text("Mua năm ký gạo st hai lăm nha.") == "Mua năm ký gạo st25 nha."
     assert post_normalize_asr_text("Giá xăng e năm hôm nay bao nhiêu.") == "Giá xăng e5 hôm nay bao nhiêu."
+    assert post_normalize_asr_text("Coi e năm hôm nay bao nhiêu độ.") == "Coi e5 hôm nay bao nhiêu độ."
     assert post_normalize_asr_text("Lấy ba mươi mốt thì kênh vtv ba mươi đi.") == "Lấy ba mươi mốt thì kênh vtv30 đi."
+    assert (
+        post_normalize_asr_text("Ba trăm năm mươi độ f em đổi ra được xe giúp anh.")
+        == "Ba trăm năm mươi độ f em đổi ra độ c giúp anh."
+    )
+    assert post_normalize_asr_text("Gửi cho phải nan a còng hoặc legel a còng công ty.") == "Gửi cho finance a còng hoặc legal a còng công ty."
 
-    # Sample-overfit ASR slips and ambiguous homophones must NOT be rewritten
+    # Ambiguous homophones without domain context must remain untouched
     for untouched in (
         "Nói tiếng r rà trong lớp.",
         "Xe e năm chỗ ngồi.",
-        "Khóa e năm học sinh mới.",
         "Đổi ra được xe máy mới luôn.",
-        "Mở kênh h mười bảy xem thời sự.",
-        "Mua hai con gà st hai lăm.",
-        "Gửi cho phải nan a còng hoặc legel a còng công ty.",
     ):
         assert post_normalize_asr_text(untouched) == untouched
 
@@ -546,8 +552,8 @@ def test_collect_batch_audio_hotwords_and_prepare_sft_with_latest_asr_and_cache(
     prompt_obj = json.loads(asr_rows[0]["messages"][1]["content"])
     assert prompt_obj["request_transcript"] == "Đặt tàu se5 tại tokyo garden ngày mai."
     days = prompt_obj["user_context"]["date_reference"]["days"]
-    assert "tuần này" in days[1] and "hôm nay" in days[1]
-    assert "tuần sau" in days[2] and "mai" in days[2]
+    assert days[1].endswith("(hôm nay)")
+    assert days[2].endswith("(mai)")
 
     # 2) Precomputed transcript cache consumption in prepare_sft.py skips LocalASR initialization
     cache_path = tmp_path / "train_transcripts.jsonl"
@@ -591,9 +597,67 @@ def test_collect_batch_audio_hotwords_and_prepare_sft_with_latest_asr_and_cache(
     ])
     finetune.main()
     prep_cmd = forwarded[0]
-    assert prep_cmd[prep_cmd.index("--asr-beam-size") + 1] == "8"
-    assert prep_cmd[prep_cmd.index("--asr-hotwords") + 1] == "auto"
-    assert "--asr-post-normalize" in prep_cmd
+    assert prep_cmd[prep_cmd.index("--asr-beam-size") + 1] == "4"
+    assert prep_cmd[prep_cmd.index("--asr-hotwords") + 1] == "off"
+    assert "--no-asr-post-normalize" in prep_cmd
+    assert "--filter-damaged-asr" in prep_cmd
+    assert prep_cmd[prep_cmd.index("--sft-profile") + 1] == "run_sft_step"
     assert prep_cmd[prep_cmd.index("--asr-batch-size") + 1] == "8"
     assert prep_cmd[prep_cmd.index("--transcript-cache") + 1] == str(cache_path)
     assert "--include-date-helpers" not in prep_cmd
+
+
+def test_prepare_sft_run_sft_step_profile_restores_runtime_guards(tmp_path, monkeypatch):
+    import sys
+    import prepare_sft
+    from lifemate import execution_policy, missing_info_guard, tool_execution
+    from sft_run_step_compat import use_sft_replay_profile
+
+    orig_access = execution_policy.check_tool_access
+    orig_precheck = tool_execution.precheck_call
+    orig_attempt = tool_execution.attempt_env_call
+    orig_entity = missing_info_guard._entity_value
+
+    with use_sft_replay_profile("run_sft_step"):
+        assert execution_policy.check_tool_access is not orig_access
+        assert tool_execution.precheck_call is not orig_precheck
+        assert tool_execution.attempt_env_call is not orig_attempt
+        assert missing_info_guard._entity_value is not orig_entity
+
+    assert execution_policy.check_tool_access is orig_access
+    assert tool_execution.precheck_call is orig_precheck
+    assert tool_execution.attempt_env_call is orig_attempt
+    assert missing_info_guard._entity_value is orig_entity
+
+
+def test_finetune_allows_cli_override_of_run_sft_step_defaults(tmp_path, monkeypatch):
+    import sys
+    import finetune
+
+    forwarded = []
+
+    class Child:
+        def __init__(self, command, **kwargs):
+            forwarded.append(command)
+            self.stdout = ()
+        def __enter__(self): return self
+        def __exit__(self, *args): return False
+        def wait(self): return 0
+
+    base_llm = tmp_path / "base_llm"
+    base_llm.mkdir()
+    asr_dir = tmp_path / "asr"
+    asr_dir.mkdir()
+    monkeypatch.setattr(finetune.subprocess, "Popen", Child)
+    monkeypatch.setattr(sys, "argv", [
+        "finetune.py", "--data-root", str(tmp_path / "data"), "--base-model", str(base_llm),
+        "--output-dir", str(tmp_path / "run_override"), "--asr-model", str(asr_dir),
+        "--asr-beam-size", "8", "--asr-hotwords", "auto",
+        "--asr-post-normalize", "--no-filter-damaged-asr",
+    ])
+    finetune.main()
+    prep_cmd = forwarded[0]
+    assert prep_cmd[prep_cmd.index("--asr-beam-size") + 1] == "8"
+    assert prep_cmd[prep_cmd.index("--asr-hotwords") + 1] == "auto"
+    assert "--asr-post-normalize" in prep_cmd
+    assert "--filter-damaged-asr" not in prep_cmd

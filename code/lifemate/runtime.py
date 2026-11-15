@@ -24,6 +24,16 @@ DEFAULT_SEED = 42
 RUNTIME_MANIFEST = "lifemate_runtime.json"
 
 
+def resolve_default_base_llm(code_dir: Path | None = None) -> Path:
+    """Return staged saved_models/llm when present, else unmerged models/llm if available."""
+    root = Path(code_dir).resolve() if code_dir is not None else Path(__file__).resolve().parents[1]
+    saved = root / "saved_models" / "llm"
+    staged = root / "models" / "llm"
+    if (saved / "config.json").is_file() or not (staged / "config.json").is_file():
+        return saved
+    return staged
+
+
 def _digest(value):
     return hashlib.sha256(json.dumps(value, ensure_ascii=False, sort_keys=True).encode()).hexdigest()
 

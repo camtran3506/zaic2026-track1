@@ -17,6 +17,7 @@ import lifemate.agent as agent
 from lifemate.catalog import allowed_tools, load_catalog
 from lifemate.history import prompt_history
 from lifemate.llm import configure_tokenizer, render_prompt
+from lifemate.runtime import resolve_default_base_llm
 from lifemate.sft import prepare_train_transcript
 
 
@@ -68,7 +69,7 @@ def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--train-jsonl", type=Path, default=REPO_ROOT / "data" / "train" / "train.jsonl")
     parser.add_argument("--catalog", type=Path, default=REPO_ROOT / "data" / "train" / "train_tools_catalog.json")
-    parser.add_argument("--model", type=Path, default=CODE_DIR / "saved_models" / "llm")
+    parser.add_argument("--model", type=Path, default=resolve_default_base_llm(CODE_DIR))
     parser.add_argument("--transcripts", type=Path)
     parser.add_argument("--budget", type=int, default=16000)
     parser.add_argument("--max-tool-details", type=int, default=35)

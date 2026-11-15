@@ -10,12 +10,12 @@ if str(CODE_DIR) not in sys.path:
 
 from lifemate.llm import model_loader, configure_tokenizer
 from lifemate.runtime import (DEFAULT_LLM_DTYPE, load_runtime_manifest, make_runtime_manifest,
-                              save_runtime_manifest, select_tokenizer_path)
+                              resolve_default_base_llm, save_runtime_manifest, select_tokenizer_path)
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
-    p.add_argument("--base-model", type=Path, default=CODE_DIR / "saved_models" / "llm")
+    p.add_argument("--base-model", type=Path, default=resolve_default_base_llm(CODE_DIR))
     p.add_argument("--adapter", type=Path, default=CODE_DIR / "result" / "finetune_run" / "training" / "adapter")
     p.add_argument("--output-dir", type=Path, default=CODE_DIR / "saved_models" / "llm_ft")
     p.add_argument("--dtype", choices=["float32", "float16", "bfloat16"], default=DEFAULT_LLM_DTYPE)

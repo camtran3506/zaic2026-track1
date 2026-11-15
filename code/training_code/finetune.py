@@ -11,8 +11,11 @@ import sys
 TRAINING_DIR = Path(__file__).resolve().parent
 CODE_DIR = TRAINING_DIR.parent
 REPO_ROOT = CODE_DIR.parent
-if str(CODE_DIR) not in sys.path:
-    sys.path.insert(0, str(CODE_DIR))
+for _path in (CODE_DIR, TRAINING_DIR):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
+
+from sft_run_step_compat import DEFAULT_SFT_PROFILE, SFT_PROFILES
 
 from lifemate.gpu import add_cuda_device_argument, configure_cuda_device
 from lifemate.asr import DEFAULT_SFT_ASR_MODEL
@@ -21,14 +24,15 @@ from lifemate.reasoning import DEFAULT_REASONING_STEPWISE_RATIO, DEFAULT_SHORT_R
 from lifemate.recovery import DEFAULT_GUARD_RECOVERY_RATIO
 from lifemate.data_generalization import add_arguments, validate_options
 from lifemate.context import MAX_CONTEXT_TOKENS, validate_training_length
+from lifemate.runtime import resolve_default_base_llm
 
 
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     add_cuda_device_argument(p)
     p.add_argument("--data-root", type=Path, default=REPO_ROOT / "data")
-    p.add_argument("--base-model", default=str(CODE_DIR / "saved_models" / "llm"),
-                   help="Local directory or Hugging Face model ID (default: ../saved_models/llm)")
+    p.add_argument("--base-model", default=str(resolve_default_base_llm(CODE_DIR)),
+                   help="Local directory or Hugging Face model ID (default: saved_models/llm or models/llm)")
     p.add_argument("--revision", default="main", help="HF commit or revision; resolved SHA is logged")
     p.add_argument("--output-dir", type=Path, default=CODE_DIR / "result" / "finetune_run")
     p.add_argument("--asr-model", type=Path, default=DEFAULT_SFT_ASR_MODEL,
@@ -56,16 +60,18 @@ def main():
     p.add_argument("--asr-precision", choices=["auto", "int8", "fp32"], default="auto")
     p.add_argument("--asr-decoding-method", choices=["modified_beam_search", "greedy_search"],
                    default="modified_beam_search")
-    p.add_argument("--asr-beam-size", type=int, default=8)
-    p.add_argument("--asr-hotwords", choices=["off", "auto"], default="auto")
+    p.add_argument("--asr-beam-size", type=int, default=4)
+    p.add_argument("--asr-hotwords", choices=["off", "auto"], default="off")
     p.add_argument("--asr-hotwords-score", type=float, default=1.5)
-    p.add_argument("--asr-post-normalize", action=argparse.BooleanOptionalAction, default=True)
+    p.add_argument("--asr-post-normalize", action=argparse.BooleanOptionalAction, default=False)
     p.add_argument("--asr-threads", type=int, default=4)
     p.add_argument("--asr-batch-size", type=int, default=16)
     p.add_argument("--transcript-cache", type=Path, default=None,
                    help="Completed ASR transcript cache JSONL (with manifest) to reuse instead of running live ASR")
-    p.add_argument("--filter-damaged-asr", action="store_true",
+    p.add_argument("--filter-damaged-asr", action=argparse.BooleanOptionalAction, default=True,
                    help="Skip ASR SFT copy if exact-match spoken gold args are missing from ASR transcript")
+    p.add_argument("--sft-profile", choices=list(SFT_PROFILES), default=DEFAULT_SFT_PROFILE,
+                   help="SFT guard/replay profile: run_sft_step matches Nov-13 79fdce3 weights; current uses HEAD lifemate guards")
     p.add_argument("--validation-fraction", type=float, choices=[0.0], default=0.0,
                    help="Training uses the complete train set, without validation")
     p.add_argument("--missing-tool-policy", choices=["error", "skip"], default="error")
@@ -152,6 +158,7 @@ def main():
         ])
     if args.filter_damaged_asr:
         prepare.append("--filter-damaged-asr")
+    prepare.extend(["--sft-profile", args.sft_profile])
     run("prepare_sft.py", prepare)
     run("train_lora.py", [*training_options, "--base-model", base, "--sft-dir", args.output_dir / "sft",
                           "--output-dir", args.output_dir / "training", "--seed", args.seed, '--max-length', args.max_length])

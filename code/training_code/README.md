@@ -36,6 +36,8 @@ HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 python3 training_code/download_models.py
 ```
 
 ### Step 2: Fine-Tune Gipformer 1.5 ASR & Export FP32 ONNX (`saved_models/asr_ft/`)
+Both `prepare_gipformer_sft.py` and `train_gipformer.py` default to the exact settings that produced the shipped `saved_models/asr_ft/` model (`4,496` train / `540` dev rows, `epochs=3`, `learning_rate=3e-5`, `accum=4`, `eval_every=1000`, `patience=5`, `selection_metric=loss`; optional `d76a2c8` flags such as `--verify-main`, `--max-main-wer`, `--eval-wer`, `--selection-metric wer` remain off unless explicitly passed):
+
 ```bash
 # 2a. Clone icefall architecture helpers into saved_models/.research/icefall
 bash training_code/asr_finetune/setup_icefall.sh
@@ -46,12 +48,8 @@ python3 training_code/asr_finetune/prepare_gipformer_sft.py \
   --data-root ../data \
   --model-dir saved_models/asr \
   --output-dir result/asr_sft_data \
-  --asr-precision fp32 \
-  --asr-decoding-method modified_beam_search \
-  --asr-beam-size 4 \
-  --max-history-wer 0.4 \
-  --seed 42 \
-  --final
+  --val-fraction 0.1 \
+  --seed 42
 
 # 2c. Train Gipformer PyTorch checkpoint
 python3 training_code/asr_finetune/train_gipformer.py \
@@ -60,14 +58,14 @@ python3 training_code/asr_finetune/train_gipformer.py \
   --data-dir result/asr_sft_data \
   --model-dir saved_models/asr \
   --output-dir result/asr_sft \
-  --epochs 5 \
-  --learning-rate 5e-5 \
-  --accum 2 \
+  --epochs 3 \
+  --learning-rate 3e-5 \
+  --accum 4 \
+  --max-dev-audio 300 \
   --augment-scope all \
-  --max-history-wer 0.4 \
-  --eval-wer \
-  --selection-metric wer \
-  --final
+  --selection-metric loss \
+  --eval-every 1000 \
+  --patience 5
 
 # 2d. Export best checkpoint to FP32 ONNX (never overwriting base saved_models/asr/)
 python3 training_code/asr_finetune/export_gipformer.py \
@@ -77,27 +75,32 @@ python3 training_code/asr_finetune/export_gipformer.py \
   --data-root ../data
 ```
 
-### Step 3: Train Qwen3.5-4B Tool-Calling LoRA
+### Step 3: Train Qwen3.5-4B Tool-Calling LoRA (`run_sft_step`)
+`finetune.py` defaults to the **`run_sft_step`** hyperparameters, ASR settings (`--step-wise-sft`, `--no-short-reasoning`, `--asr-beam-size 4`, `--asr-hotwords off`, `--no-asr-post-normalize`, `--asr-threads 4`, `--filter-damaged-asr`), and replay profile (`--sft-profile run_sft_step`), and automatically uses `saved_models/llm` if staged via Step 1 or falls back to `models/llm` when unmerged base weights are stored there. *(Both static inference prompts `SYSTEM_PROMPT`/`date_reference` and the default `--sft-profile run_sft_step` compatibility hooks in `sft_run_step_compat.py` match the Nov-13 `79fdce3` `run_sft_step` SFT dataset byte-for-byte (`10,724` rows, `sha256: a32459e8a200626f846a519b17fffa33427905838fcd220a076f54b182ab0996`), while keeping Hybrid ASR and runtime guards active for inference. Pass `--sft-profile current` if you want SFT replay to use the newer runtime guard behavior instead.)*
+
 ```bash
 python3 training_code/finetune.py \
   --cuda-visible-devices 0 \
   --data-root ../data \
   --base-model saved_models/llm \
-  --output-dir result/run_sft_trajj \
+  --output-dir result/run_sft_step \
   --asr-model saved_models/asr_ft \
   --transcript-mode dual \
   --asr-transcript-ratio 0.5 \
-  --asr-precision auto \
+  --asr-precision fp32 \
   --asr-decoding-method modified_beam_search \
-  --asr-beam-size 8 \
-  --asr-hotwords auto \
+  --asr-beam-size 4 \
+  --asr-hotwords off \
   --asr-hotwords-score 1.5 \
-  --asr-post-normalize \
+  --no-asr-post-normalize \
+  --asr-threads 4 \
   --asr-batch-size 16 \
   --filter-damaged-asr \
+  --sft-profile run_sft_step \
   --fuzzy-weight 0.3 \
+  --reasoning-weight 0.25 \
   --guard-recovery-ratio 0.18 \
-  --no-step-wise-sft \
+  --step-wise-sft \
   --no-short-reasoning \
   --epochs 3 \
   --batch-size 1 \
@@ -111,10 +114,11 @@ python3 training_code/finetune.py \
 ```
 
 ### Step 4: Merge LoRA Adapter into Standalone Inference Weights (`saved_models/llm_ft/`)
+*(Uses `saved_models/llm` by default, or automatically falls back to `models/llm` if omitted; pass `--base-model models/llm` explicitly when merging directly from `models/llm`.)*
 ```bash
 python3 training_code/merge_lora.py \
   --base-model saved_models/llm \
-  --adapter result/run_sft_trajj/training/adapter \
+  --adapter result/run_sft_step/training/adapter \
   --output-dir saved_models/llm_ft
 ```
 
@@ -125,6 +129,7 @@ python3 training_code/merge_lora.py \
 ## 4. Utility Scripts in `training_code/`
 - `finetune.py`: End-to-end orchestrator (`prepare_sft.py` -> `train_lora.py` -> optional `merge_lora.py`).
 - `prepare_sft.py`: Replays `train` samples through `ToolEnv` to build SFT JSONL + manifest.
+- `sft_run_step_compat.py`: Replay-scoped compatibility hooks (`--sft-profile run_sft_step`, default) so `prepare_sft.py` reproduces `result/run_sft_step/sft/train.jsonl` byte-for-byte without modifying runtime inference guards.
 - `train_lora.py`: Assistant-only weighted cross-entropy Unsloth / Transformers LoRA trainer.
 - `merge_lora.py`: Offline BF16 LoRA merge exporting `lifemate_runtime.json`.
 - `audit_initial_tokens.py`: Measures prompt token distributions against the 16,000-token budget.

@@ -248,3 +248,17 @@ def test_runtime_rejects_different_text_normalization(artifact, policy):
     (adapter / RUNTIME_MANIFEST).write_text(json.dumps(manifest))
     with pytest.raises(ValueError, match='Text normalization differs'):
         load_runtime_manifest(base, tok, adapter)
+
+
+def test_resolve_default_base_llm_prefers_saved_models_then_models(tmp_path):
+    from lifemate.runtime import resolve_default_base_llm
+
+    assert resolve_default_base_llm(tmp_path) == tmp_path / 'saved_models' / 'llm'
+    staged = tmp_path / 'models' / 'llm'
+    staged.mkdir(parents=True)
+    (staged / 'config.json').write_text('{"model_type":"qwen3_5"}')
+    assert resolve_default_base_llm(tmp_path) == staged
+    saved = tmp_path / 'saved_models' / 'llm'
+    saved.mkdir(parents=True)
+    (saved / 'config.json').write_text('{"model_type":"qwen3_5"}')
+    assert resolve_default_base_llm(tmp_path) == saved

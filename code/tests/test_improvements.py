@@ -112,7 +112,11 @@ def test_full_trajectory_fuzzy_weight_and_train_false_mask(bpe_tokenizer):
 
 
 def test_real_qwen35_tokenizer_full_trajectory_and_fuzzy_weights():
-    tok_dir = Path(__file__).resolve().parents[1] / "saved_models" / "llm"
+    from lifemate.runtime import resolve_default_base_llm
+    code_dir = Path(__file__).resolve().parents[1]
+    tok_dir = resolve_default_base_llm(code_dir)
+    if not tok_dir.is_dir():
+        tok_dir = code_dir / "saved_models" / "llm_ft"
     if not tok_dir.is_dir():
         pytest.skip("Local Qwen3.5 tokenizer weights absent")
     from transformers import AutoTokenizer

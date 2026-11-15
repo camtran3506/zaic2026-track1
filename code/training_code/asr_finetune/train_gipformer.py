@@ -113,7 +113,7 @@ def main() -> None:
     parser.add_argument("--icefall-root", type=Path, default=DEFAULT_ICEFALL_ROOT)
     parser.add_argument("--output-dir", type=Path, default=CODE_DIR / "result" / "asr_sft")
     parser.add_argument("--epochs", type=int, default=3)
-    parser.add_argument("--learning-rate", type=float, default=2e-5)
+    parser.add_argument("--learning-rate", type=float, default=3e-5)
     parser.add_argument("--accum", type=int, default=4)
     parser.add_argument("--max-train-audio", type=int, default=100000)
     parser.add_argument("--max-dev-audio", type=int, default=300)
@@ -130,8 +130,8 @@ def main() -> None:
                         help="Decode dev split with greedy RNNT search to log dev_wer alongside dev_loss")
     parser.add_argument("--selection-metric", choices=["loss", "wer"], default="loss",
                         help="Metric used for checkpoint selection (best.pt) and early stopping")
-    parser.add_argument("--eval-every", type=int, default=500)
-    parser.add_argument("--patience", type=int, default=3)
+    parser.add_argument("--eval-every", type=int, default=1000)
+    parser.add_argument("--patience", type=int, default=5)
     parser.add_argument("--final", action="store_true",
                         help="Keep last checkpoint as best.pt cleanly even when training on all audio")
     parser.add_argument("--smoke-only", action="store_true",

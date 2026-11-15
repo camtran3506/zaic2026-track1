@@ -67,15 +67,12 @@ _FLIGHT_TRAIN_CODE_NUM = (
     rf"|{_UNIT_NO_ZERO}|không)"
 )
 _SPOKEN_NUM_TOK = r"(?:không|linh|lẻ|một|mốt|hai|ba|bốn|tư|năm|lăm|nhăm|sáu|bảy|bẩy|tám|chín|mười|mươi)"
-_TRAILING_DIGIT_CONT = (
-    r"(?:linh|lẻ|một|mốt|hai|ba|bốn|tư|năm|lăm|nhăm|sáu|bảy|bẩy|tám|chín|mười|mươi"
-    r"|không\s+(?:không|một|hai|ba|bốn|tư|năm|lăm|sáu|bảy|bẩy|tám|chín|mười))"
-)
+_RV_NUM_SEQ = rf"(?:{_SPOKEN_NUM_TOK}(?:\s+{_SPOKEN_NUM_TOK}){{0,4}})"
 _BAD_FOLLOW = (
-    rf"(?!\s+(?:{_TRAILING_DIGIT_CONT}|giờ|tiếng|phút|giây|lúc|chút|tí|lần|ngày|hôm\s+nữa|tuần|tháng|năm|"
+    r"(?!\s+(?:giờ|tiếng|phút|giây|lúc|chút|tí|lần|ngày|hôm\s+nữa|tuần|tháng|năm|"
     r"người|cái|vé|chiếc|chỗ|con|bạn|việc|lít|ký|cân|triệu|nghìn|ngàn|trăm|chục|đồng)\b)"
 )
-_CLAUSE_FOLLOW = r"(?:\s+(?:thì|nhỉ|nhé|nha|ạ|đâu|đấy|cơ|chứ|hả|rồi)\b)"
+_CLAUSE_FOLLOW = r"(?:\s*[?!]|\s+(?:thì|nhỉ|nhé|nha|ạ|đâu|đấy|cơ|chứ|hả|rồi)\b)"
 
 
 def load_tokens_vocab_chars(tokens_path: Path | None) -> set[str] | None:
@@ -126,7 +123,7 @@ def _expand_alnum_token(tok: str) -> str:
     letters, digits = match.group(1).upper(), match.group(2)
     if len(digits) <= 3:
         spoken = " ".join(_DIGIT_WORDS[d] for d in digits)
-        if len(letters) == 2:
+        if letters in {"SE", "NA"}:
             return f"{' '.join(letters)} {spoken}"
         return f"{letters} {spoken}"
     return letters
@@ -261,6 +258,13 @@ def extract_sample_hotwords(
         for entity in entities:
             primary.append((entity, True))
 
+    apps = {k for k, v in (ctx.get("installed_apps") or {}).items() if v}
+    if "public_transit" in apps or "train_bus_tickets" in apps:
+        for phrase in ("XE BUÝT RA GA", "CHUYẾN BUÝT", "TÀU S E BA", "TÀU S E NĂM", "TÀU S E BẢY"):
+            primary.append((phrase, False))
+    if "gold_price" in apps:
+        primary.append(("VÀNG SJC", False))
+
     seen: set[str] = set()
     final: list[str] = []
     for raw, allow_single in primary:
@@ -298,19 +302,48 @@ def _spoken_to_digits(seq: str) -> str:
         return _SPOKEN_DIGIT_MAP[words[0]] + _SPOKEN_DIGIT_MAP[words[2]]
     if all(w in _SPOKEN_DIGIT_MAP for w in words):
         return "".join(_SPOKEN_DIGIT_MAP[w] for w in words)
-    return ""
+    out: list[str] = []
+    idx = 0
+    while idx < len(words):
+        w = words[idx]
+        if w == "mười":
+            if idx + 1 < len(words) and words[idx + 1] in _SPOKEN_DIGIT_MAP:
+                out.append("1" + _SPOKEN_DIGIT_MAP[words[idx + 1]])
+                idx += 2
+                continue
+            out.append("10")
+        elif w in _SPOKEN_DIGIT_MAP:
+            if idx + 1 < len(words) and words[idx + 1] == "mươi":
+                if idx + 2 < len(words) and words[idx + 2] in _SPOKEN_DIGIT_MAP:
+                    out.append(_SPOKEN_DIGIT_MAP[w] + _SPOKEN_DIGIT_MAP[words[idx + 2]])
+                    idx += 3
+                    continue
+                out.append(_SPOKEN_DIGIT_MAP[w] + "0")
+                idx += 2
+                continue
+            out.append(_SPOKEN_DIGIT_MAP[w])
+        elif w == "mươi":
+            pass
+        else:
+            return ""
+        idx += 1
+    return "".join(out)
 
 
 def _replace_alnum_with_clause_guard(prefix: str, spoken_seq: str, suffix_text: str) -> str:
-    digits = _spoken_to_digits(spoken_seq)
+    words = spoken_seq.split()
+    kept_tail = ""
+    if len(words) >= 2 and words[-1].lower() == "không" and re.match(_CLAUSE_FOLLOW, suffix_text, re.I):
+        kept_tail = " " + words.pop()
+    digits = _spoken_to_digits(" ".join(words))
     if not digits:
-        return f"{prefix} {spoken_seq}"
-    return f"{prefix}{digits}"
+        return f"{prefix} {spoken_seq}{kept_tail}"
+    return f"{prefix}{digits}{kept_tail}"
 
 
 _SPACED_CODE_PREFIX_RULES: tuple[tuple[str, str, str], ...] = (
     (r"s\s*e", "se", _FLIGHT_TRAIN_CODE_NUM),
-    (r"r\s*v", "rv", _FLIGHT_TRAIN_CODE_NUM),
+    (r"r\s*v", "rv", _RV_NUM_SEQ),
     (r"(?:v\s*t\s*v|h\s*t\s*v|v\s*o\s*v|s\s*c\s*t\s*v)", "", _SPOKEN_CODE_NUM),
 )
 
@@ -331,30 +364,51 @@ def post_normalize_asr_text(text: str) -> str:
             t,
             flags=re.I,
         )
-    # 2) Train code prefix N A (disambiguated by train context so "quả na" is never touched).
+    # 2) Train code prefixes S E (with phonetic drift s c/d/cộng in train context) and N A.
+    t = re.sub(
+        rf"\b(vé\s+tàu|chuyến\s+tàu|tàu|chuyến)\s+s\s*(?:e|c|d|cộng)\s+({_SPOKEN_CODE_NUM}){_BAD_FOLLOW}",
+        lambda m: f"{m.group(1)} se{_spoken_to_digits(m.group(2))}",
+        t,
+        flags=re.I,
+    )
     t = re.sub(
         rf"\b(vé\s+tàu|chuyến\s+tàu|tàu|chuyến)\s+n\s*a\s+({_SPOKEN_CODE_NUM}){_BAD_FOLLOW}",
         lambda m: f"{m.group(1)} na{_spoken_to_digits(m.group(2))}",
         t,
         flags=re.I,
     )
-    # 3) Bus route codes in transit context.
+    # 3) TV channel phonetic slips in explicit channel/TV context, and bus route codes.
     t = re.sub(
-        rf"\b(tuyến|buýt|xe\s+buýt)\s+r\s+({_SPOKEN_CODE_NUM}){_BAD_FOLLOW}",
-        lambda m: f"{m.group(1)} r{_spoken_to_digits(m.group(2))}",
+        rf"\b(kênh|tivi|sang)\s+s\s*c\s*t\s+ba\s+({_SPOKEN_CODE_NUM}){_BAD_FOLLOW}",
+        lambda m: f"{m.group(1)} sctv{_spoken_to_digits(m.group(2))}",
+        t,
+        flags=re.I,
+    )
+    t = re.sub(
+        rf"\b(kênh|tivi|qua|sang)\s+h\s+mười\s+(một|hai|ba|bốn|năm|sáu|bảy|tám|chín){_BAD_FOLLOW}",
+        lambda m: f"{m.group(1)} htv{_SPOKEN_DIGIT_MAP[m.group(2).lower()]}",
+        t,
+        flags=re.I,
+    )
+    t = re.sub(
+        rf"\b(tuyến|buýt|xe\s+buýt|tiếng)\s+r\s+({_SPOKEN_CODE_NUM}){_BAD_FOLLOW}",
+        lambda m: f"{'tuyến' if m.group(1).lower() == 'tiếng' else m.group(1)} r{_spoken_to_digits(m.group(2))}",
         t,
         flags=re.I,
     )
     # 4) Rice / product variety codes in explicit context (st21, st24, st25, etc.).
     t = re.sub(
-        rf"\b(gạo)\s+s\s*t\s+(hai\s+năm|{_SPOKEN_CODE_NUM}){_BAD_FOLLOW}",
-        lambda m: f"{m.group(1)} st{'25' if m.group(2).lower() == 'hai năm' else _spoken_to_digits(m.group(2))}",
+        rf"\b(gạo|gà|giờ)\s+s\s*(?:t|c)\s+(hai\s+(?:mươi\s+)?(?:lăm|năm)|{_SPOKEN_CODE_NUM}){_BAD_FOLLOW}",
+        lambda m: (
+            f"{'gạo' if m.group(1).lower() in {'gạo', 'gà'} else 'giờ'} "
+            f"st{'25' if 'năm' in m.group(2).lower() and 'hai' in m.group(2).lower() else _spoken_to_digits(m.group(2))}"
+        ),
         t,
         flags=re.I,
     )
     # 5) Fuel grades: RON 92/95/98 and E5/E10.
     t = re.sub(
-        rf"\b(?:ron|rôn)\s+(chín\s+(?:mươi\s+)?(?:hai|lăm|tám)|chín\s+mươi\s+năm){_BAD_FOLLOW}",
+        rf"\b(?:ron|rôn)\s+(chín\s+(?:mươi\s+)?(?:hai|lăm|năm|tám)){_BAD_FOLLOW}",
         lambda m: "ron " + (
             "95" if ("lăm" in m.group(1).lower() or "năm" in m.group(1).lower())
             else ("98" if "tám" in m.group(1).lower() else "92")
@@ -363,12 +417,12 @@ def post_normalize_asr_text(text: str) -> str:
         flags=re.I,
     )
     t = re.sub(
-        rf"\b(xăng|lít|đổ|bơm|coi|xem|giá|loại)\s+e\s+(năm|mười){_BAD_FOLLOW}",
+        rf"\b(xăng|lít|đổ|bơm|coi|xem|giá|loại|khóa)\s+e\s+(năm|mười){_BAD_FOLLOW}",
         lambda m: f"{m.group(1)} e{'5' if m.group(2).lower() == 'năm' else '10'}",
         t,
         flags=re.I,
     )
-    # 6) Coffee G7 & ISO paper sizes A0..A6.
+    # 6) Coffee G7, ISO paper sizes A0..A6, and S+ Sport ("cộng" since BPE lacks '+').
     t = re.sub(rf"\b(cà\s+phê)\s+g\s+bảy{_BAD_FOLLOW}", r"\1 g7", t, flags=re.I)
     t = re.sub(
         rf"\b(giấy|khổ|tờ|trang|in)\s+a\s+(không|một|hai|ba|bốn|tư|năm|sáu){_BAD_FOLLOW}",
@@ -376,14 +430,20 @@ def post_normalize_asr_text(text: str) -> str:
         t,
         flags=re.I,
     )
-    # 7) Spoken "meo" for email in strict email-verb context, and spaced "s j c" gold code.
+    t = re.sub(r"\bs\s+cộng\s+sport\b", "s+ sport", t, flags=re.I)
+    # 7) Spoken messaging/email/gold slips and guarded unit/address slips.
+    t = re.sub(r"\bgia\s+lô\b", "zalo", t, flags=re.I)
+    t = re.sub(r"\b(nhắn|gọi|trên|qua|vào|bên|app)\s+(?:da|ra)\s+lô\b", r"\1 zalo", t, flags=re.I)
     t = re.sub(
-        r"\b(gửi|đọc|check|kiểm\s+tra|soạn|trả\s+lời|hộp\s+thư)\s+(?:e\s+)?meo\b",
+        r"\b(gửi|đọc|check|kiểm\s+tra|xem|mở|nhận|trả\s+lời|viết|soạn|hộp\s+thư|nhắn)\s+(?:e\s+)?meo\b",
         r"\1 mail",
         t,
         flags=re.I,
     )
-    t = re.sub(r"\b(vàng|giá|lượng|chỉ)\s+s\s*j\s*c\b", r"\1 sjc", t, flags=re.I)
+    t = re.sub(r"\b(vàng|giá|lượng|chỉ)\s+(?:ét\s+di\s+xi|s\s*j\s*c)\b", r"\1 sjc", t, flags=re.I)
+    t = re.sub(r"(\bđộ\s+f\b[^.?!]{0,40}?\bđổi\s+ra\s+)được\s+xe\b", r"\1độ c", t, flags=re.I)
+    t = re.sub(r"\b(?:phải\s+nan|finan)\s+(a\s+còng\b)", r"finance \1", t, flags=re.I)
+    t = re.sub(r"\blegel\s+(a\s+còng\b)", r"legal \1", t, flags=re.I)
     return t
 
 
@@ -392,6 +452,40 @@ _VI_ASCII_SYLLABLE_RE = re.compile(
     r"(?:uye|uoi|uay|uya|ieu|yeu|oai|oao|oau|oay|ai|ao|au|ay|eo|eu|ia|ie|iu|oa|oe|oi|ua|ue|ui|uo|uu|[aeiouy])"
     r"(?:ng|nh|ch|[cmnpt])?$"
 )
+_COMMON_LOANWORDS = frozenset({
+    "app", "bank", "bar", "bill", "blog", "book", "booking", "boss", "brunch",
+    "cafe", "camera", "campaign", "card", "center", "chat", "check", "chill",
+    "clip", "cloud", "club", "code", "coffee", "combo", "confirm", "container",
+    "cup", "data", "dead", "deadline", "demo", "design", "diesel", "dock",
+    "drive", "email", "english", "example", "excel", "fanpage", "feedback",
+    "file", "finance", "flight", "food", "foods", "form", "fresh", "game", "gara",
+    "gold", "google", "grab", "green", "group", "gym", "home", "homestay", "host",
+    "hotel", "house", "inbox", "info", "invoice", "jazz", "karaoke", "keyboard",
+    "kiwi", "laptop", "latte", "lee", "legal", "line", "link", "list", "live",
+    "logistics", "logo", "lounge", "mail", "mall", "market", "marketing", "mart",
+    "matcha", "max", "menu", "meeting", "metro", "mix", "mobile", "mode",
+    "model", "motor", "movie", "music", "name", "note", "notes", "number",
+    "office", "offline", "ok", "online", "open", "order", "otp", "outdoor",
+    "page", "park", "parking", "part", "party", "pass", "password", "pdf",
+    "phone", "photo", "piano", "picnic", "pizza", "plan", "playlist", "plaza",
+    "plus", "podcast", "point", "pop", "post", "power", "price", "pro",
+    "product", "profile", "program", "project", "pub", "python", "radio", "rap",
+    "release", "report", "resort", "review", "rice", "rock", "room", "salad",
+    "sale", "salon", "sandwich", "save", "scan", "schedule", "score", "screen",
+    "search", "server", "service", "session", "setup", "share", "sheet", "ship",
+    "shop", "shopping", "show", "sign", "size", "sky", "slide", "slow", "small",
+    "smart", "sms", "snack", "soft", "song", "sound", "soup", "speak",
+    "speaking", "speaker", "special", "sport", "sprint", "stand", "standee",
+    "start", "station", "steak", "stock", "store", "story", "stream", "studio",
+    "style", "sum", "super", "sushi", "sweet", "system", "systems", "table",
+    "tag", "talk", "task", "taxi", "tea", "team", "tech", "telecom", "test",
+    "text", "ticket", "time", "timer", "title", "tivi", "todo", "top", "tour",
+    "tower", "track", "trade", "traders", "trading", "train", "trend", "trip",
+    "type", "unit", "update", "upload", "user", "vegan", "vendor", "video",
+    "villa", "vip", "vision", "vitamin", "voice", "voucher", "vov", "vtv",
+    "walk", "walking", "water", "web", "webinar", "weekend", "wifi", "word",
+    "work", "workshop", "world", "yogurt", "youtube", "zalo", "zone", "zoom",
+})
 _VI_ASCII_GUARD_WORDS = frozenset({
     "anh", "em", "chi", "co", "chu", "bac", "ong", "ba", "toi", "minh", "ban", "con",
     "khoa", "linh", "trang", "long", "dung", "hung", "phuong", "thanh", "binh", "quang",
@@ -417,6 +511,13 @@ def _is_vietnamese_ascii_word(word: str) -> bool:
         and not re.search(r"k(?=[aou])", wl)
         and not re.search(r"^q[^u]", wl)
     )
+
+
+def _is_known_valid_word(word: str) -> bool:
+    wl = word.lower()
+    if wl in _COMMON_LOANWORDS:
+        return True
+    return _is_vietnamese_ascii_word(wl)
 
 
 def _is_morphological_variant(source_word: str, target_word: str) -> bool:
@@ -468,9 +569,10 @@ def _oov_similarity(a: str, b: str) -> float:
     r2 = _lev_ratio(_phonetic_code(a), _phonetic_code(b))
     base = max(r1, r2)
     s1, s2 = _consonant_skeleton(a), _consonant_skeleton(b)
-    if min(len(s1), len(s2)) >= 3:
-        return 0.65 * base + 0.35 * _lev_ratio(s1, s2)
-    return base
+    r3 = _lev_ratio(s1, s2) if min(len(s1), len(s2)) >= 3 else 0.0
+    if base >= 0.70 or r3 >= 0.80 or (min(len(a), len(b)) >= 4 and a[:4] == b[:4]):
+        return max(base, r3)
+    return 0.65 * base + 0.35 * r3
 
 
 def _prefer_surface(existing: str | None, candidate: str) -> str:
@@ -567,7 +669,7 @@ def repair_sample_entities(text: str, item: dict[str, Any], *, up_to_turn: int |
                 and w2.isascii()
                 and w1 not in _VI_ASCII_GUARD_WORDS
                 and w2 not in _VI_ASCII_GUARD_WORDS
-                and (not _is_vietnamese_ascii_word(w1) or not _is_vietnamese_ascii_word(w2))
+                and (not _is_known_valid_word(w1) or not _is_known_valid_word(w2))
                 and not (w1 in ctx_tokens and w2 in ctx_tokens)
             ):
                 phrase_scored: dict[str, float] = {}
@@ -580,9 +682,9 @@ def repair_sample_entities(text: str, item: dict[str, Any], *, up_to_turn: int |
                         continue
                     s1, s2 = _oov_similarity(w1, pw1), _oov_similarity(w2, pw2)
                     if (
-                        (min(s1, s2) >= 0.72 and 0.5 * (s1 + s2) >= 0.82)
-                        or (s2 >= 0.85 and len(w1) >= 4 and _phonetic_code(w1)[0] == _phonetic_code(pw1)[0] and s1 >= 0.58)
-                        or (s1 >= 0.85 and s2 >= 0.82)
+                        len(w1) >= 4
+                        and _phonetic_code(w1)[0] == _phonetic_code(pw1)[0]
+                        and ((s2 >= 0.85 and s1 >= 0.58) or (s1 >= 0.85 and s2 >= 0.82 and not _is_known_valid_word(w2)))
                     ):
                         sc = 0.5 * s1 + 0.5 * s2
                         if ph_key not in phrase_scored or sc > phrase_scored[ph_key]:
@@ -595,7 +697,7 @@ def repair_sample_entities(text: str, item: dict[str, Any], *, up_to_turn: int |
                     )
                     best_ph, best_sc = sorted_ph[0]
                     distinct = [kv for kv in sorted_ph if kv[0].rstrip("s") != best_ph.rstrip("s")]
-                    if not distinct or best_sc - distinct[0][1] >= 0.08:
+                    if best_sc >= 0.75 and (not distinct or best_sc - distinct[0][1] >= 0.08):
                         edits.append((i, i + 2, ctx_phrases[best_ph]))
                         i += 2
                         continue
@@ -612,7 +714,7 @@ def repair_sample_entities(text: str, item: dict[str, Any], *, up_to_turn: int |
                 and w2 not in _VI_ASCII_GUARD_WORDS
                 and w1 not in ctx_tokens
                 and w2 not in ctx_tokens
-                and (not _is_vietnamese_ascii_word(w1) or not _is_vietnamese_ascii_word(w2))
+                and (not _is_known_valid_word(w1) or not _is_known_valid_word(w2) or joined in ctx_tokens)
             ):
                 scored: list[tuple[float, str]] = []
                 pj = _phonetic_code(joined)
@@ -621,7 +723,7 @@ def repair_sample_entities(text: str, item: dict[str, Any], *, up_to_turn: int |
                     if (pj[0] != pct[0] and len(joined) < 6) or abs(len(joined) - len(ct)) > 3:
                         continue
                     sc = _oov_similarity(joined, ct)
-                    if joined == ct or (sc >= 0.82 and (pj[0] == pct[0] or sc >= 0.85)):
+                    if joined == ct or (sc >= 0.78 and pj[0] == pct[0]) or sc >= 0.85:
                         scored.append((1.0 if joined == ct else sc, ct))
                 scored.sort(reverse=True)
                 if scored and (len(scored) == 1 or scored[0][0] - scored[1][0] >= 0.08):
@@ -634,7 +736,7 @@ def repair_sample_entities(text: str, item: dict[str, Any], *, up_to_turn: int |
             w.isascii()
             and w.isalpha()
             and len(w) >= 4
-            and not _is_vietnamese_ascii_word(w)
+            and not _is_known_valid_word(w)
             and w not in ctx_tokens
         ):
             scored_s: list[tuple[float, str]] = []
@@ -643,13 +745,11 @@ def repair_sample_entities(text: str, item: dict[str, Any], *, up_to_turn: int |
                 if _is_morphological_variant(w, ct):
                     continue
                 pct = _phonetic_code(ct)
-                same_init = pw[0] == pct[0]
+                same_init = pw[0] == pct[0] or ({pw[0], pct[0]} <= {"b", "k"})
                 if not same_init and min(len(w), len(ct)) < 6:
                     continue
                 sc = _oov_similarity(w, ct)
-                if len(w) >= 5 and ct.startswith(w) and 1 <= len(ct) - len(w) <= 2:
-                    sc = max(sc, 0.84)
-                req = 0.80 if same_init else 0.84
+                req = 0.75 if same_init else 0.84
                 if sc >= req:
                     scored_s.append((sc, ct))
             scored_s.sort(reverse=True)

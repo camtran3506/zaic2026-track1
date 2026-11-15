@@ -6,12 +6,15 @@ import math
 from pathlib import Path
 import sys
 
-CODE_DIR = Path(__file__).resolve().parents[1]
+TRAINING_DIR = Path(__file__).resolve().parent
+CODE_DIR = TRAINING_DIR.parent
 REPO_ROOT = CODE_DIR.parent
-if str(CODE_DIR) not in sys.path:
-    sys.path.insert(0, str(CODE_DIR))
+for _path in (CODE_DIR, TRAINING_DIR):
+    if str(_path) not in sys.path:
+        sys.path.insert(0, str(_path))
 
 from main import resolve_data_layout
+from sft_run_step_compat import DEFAULT_SFT_PROFILE, SFT_PROFILES, use_sft_replay_profile
 from lifemate.agent import _train_transcript
 from lifemate.catalog import load_catalog
 from lifemate.reasoning import (DEFAULT_REASONING_STEPWISE_RATIO, DEFAULT_SHORT_REASONING, REASONING_POLICY,
@@ -113,6 +116,8 @@ def main():
                    help="Completed ASR transcript cache JSONL (with manifest) to reuse instead of running live ASR")
     p.add_argument("--filter-damaged-asr", action="store_true",
                    help="Drop contradictory TRAIN ASR copies when spoken exact-match gold arguments are lost in ASR")
+    p.add_argument("--sft-profile", choices=list(SFT_PROFILES), default=DEFAULT_SFT_PROFILE,
+                   help="SFT guard/replay profile: run_sft_step matches Nov-13 79fdce3 weights; current uses HEAD lifemate guards")
     add_arguments(p)
     p.add_argument("--tokenizer", type=Path, help="Local base model/tokenizer, required for augmentation token-budget checks")
     p.add_argument("--max-length", type=int, default=MAX_CONTEXT_TOKENS)
@@ -248,6 +253,7 @@ def main():
         'guard_recovery_ratio': args.guard_recovery_ratio,
         'short_reasoning': args.short_reasoning,
         'reasoning_stepwise_ratio': args.reasoning_stepwise_ratio,
+        'sft_profile': args.sft_profile,
     }
     if args.transcript_cache is not None:
         metadata['sft_format']['transcript_cache'] = str(args.transcript_cache.expanduser().resolve())
@@ -287,7 +293,7 @@ def main():
         retained_ids = []
         skipped = []
         # Partial preparations stay marked .partial and are never consumed by the trainer.
-        with path.with_suffix(".partial").open("w", encoding="utf-8") as f:
+        with use_sft_replay_profile(args.sft_profile), path.with_suffix(".partial").open("w", encoding="utf-8") as f:
             for i, record in enumerate(rows):
                 synthetic = is_synthetic_sample(record)
                 if synthetic:

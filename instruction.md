@@ -19,49 +19,68 @@ Tài liệu này hướng dẫn chi tiết cách thiết lập môi trường, t
 
 ## 1. TỔNG QUAN KIẾN TRÚC & CẤU TRÚC THƯ MỤC
 
-### 1.1. Luồng xử lý tách biệt (Two-Stage Offline Pipeline)
-LifeMate hoạt động theo nguyên lý **2 giai đoạn độc lập tuyệt đối (Stage Separation)** để tối ưu hóa bộ nhớ VRAM:
-1. **Giai đoạn ASR (Âm thanh -> Chữ viết):**
-   - Sử dụng mô hình `Gipformer 1.5` (68M Zipformer-RNNT).
-   - Chạy trên CPU ONNX Runtime đa luồng (hoặc GPU), giải mã batch audio hiện tại và audio history.
-   - Kết quả xuất ra tệp bộ nhớ đệm `transcripts.jsonl` kèm mã băm kiểm tra (SHA-256 manifest). Tiến trình ASR giải phóng hoàn toàn bộ nhớ sau khi hoàn thành.
-2. **Giai đoạn LLM (Chữ viết -> Tool Execution Agent):**
-   - Sử dụng mô hình `Qwen/Qwen3.5-4B` tải ở định dạng `bfloat16` kết hợp LoRA Adapter.
-   - Tự động nạp `user_context` (bao gồm `date_reference` tính sẵn và danh mục app), kết hợp dynamic prefix caching, schema snapshot caching.
-   - Inference mặc định **tắt thinking** (`enable_thinking=False`, `thinking_budget=0`): tối đa **16.000 input / 384 output tokens** mỗi lượt, không cấp riêng 256 token thinking. Dữ liệu SFT mặc định dùng **Step-wise SFT** (`--step-wise-sft`) và tắt Short Checked Reasoning (`--no-short-reasoning`) để đồng bộ prefix `<think>\n\n</think>\n\n` giữa train và inference (có thể bật lại reasoning khi thử nghiệm bằng `--short-reasoning`).
-   - Tương tác nhiều lượt với môi trường công cụ (Tool Environment) cho đến khi ra kết quả cuối cùng hoặc đạt giới hạn số bước.
+### 1.1. Luồng xử lý End-to-End 1 tiến trình (Mặc định chuẩn BTC) & Chế độ Legacy Tách Giai đoạn
+Mặc định (`--stage online` trong `main.py`, `run_server.sh`, `predict.py`, `benchmark_timing.py` và `predict_notebook.ipynb`), LifeMate sử dụng **1 tiến trình duy nhất nạp đồng thời ASR và LLM** ([`lifemate/predictor.py`](file:///mnt/mmlab2024nas/trantran/lifemate/code/lifemate/predictor.py)) để tuân thủ đúng chuẩn nộp bài Docker & đo thời gian của BTC:
+1. **Khởi tạo cố định & nạp model đồng thời (Load Upfront):**
+   - Cố định seed (`seed_everything(42)` + `PYTHONHASHSEED`) trước khi load bất kỳ model nào.
+   - Nạp **`LocalASR`** (`Gipformer 1.5` 68M Zipformer-RNNT, chạy trên CPU ONNX Runtime) và **`LocalLLM`** (`Qwen/Qwen3.5-4B` `bfloat16` + optional LoRA Adapter, chạy trên GPU) cùng tồn tại trong RAM/VRAM.
+   - Tự động phát hiện split trong `/data` (`--split auto`) và import `ToolEnv` trực tiếp từ `/data/<split>/zaic_tools`.
+2. **Suy luận từng sample theo đúng thứ tự gốc (Sample-by-sample E2E):**
+   - Bắt đầu bấm giờ `t1 = time.perf_counter()` **trước khi đọc file audio và khởi tạo `ToolEnv`**.
+   - Tạo đúng 1 thực thể `ToolEnv(split, item["id"], root=env_root)` cho mỗi mẫu.
+   - Chạy live `ASR (câu hiện tại + history) -> LLM -> ToolEnv` nhiều lượt thông qua `LifeMateAgent`.
+   - Inference mặc định **tắt thinking** (`enable_thinking=False`, `thinking_budget=0`): tối đa **16.000 input / 384 output tokens** mỗi lượt. Dữ liệu SFT mặc định dùng **Step-wise SFT** (`--step-wise-sft`) và tắt Short Checked Reasoning (`--no-short-reasoning`) để đồng bộ prefix `<think>\n\n</think>\n\n` giữa train và inference.
+   - Kết thúc mẫu, tính `ms = int((time.perf_counter() - t1) * 1000)` và ghi + `flush()` ngay từng dòng `{"id", "tool_calls", "state_hash", "time"}` ra `submission.jsonl`.
+
+> [!NOTE]
+> **Chế độ tách 2 tiến trình cũ (`--stage full` / `--stage asr` / `--stage llm`):** Vẫn được giữ lại trong `main.py` phục vụ thử nghiệm/ablation nội bộ khi muốn chạy ASR 1 lần ra `transcripts.jsonl` (kèm SHA-256 manifest) rồi thử nhiều adapter/prompt LLM mà không cần nhận dạng lại audio. Không dùng chế độ này cho Docker nộp bài BTC.
 
 ### 1.2. Cấu trúc cây thư mục chuẩn
 ```text
-/mnt/mmlab2024nas/trantran/lifemate/
+lifemate/
 ├── instruction.md                     # Tài liệu hướng dẫn này
-├── train_asr.jsonl                    # Dữ liệu 1,536 sample ASR audio_text đã gán nhãn chuẩn
-├── train+public_test/                 # Thư mục gốc chứa dataset
-│   ├── train/                         # Split train (train.jsonl + audio/)
-│   └── public_test/                   # Split test (public_test.jsonl + audio/)
+├── data/                              # Toàn bộ dataset & dữ liệu huấn luyện (gom chung theo yêu cầu BTC)
+│   ├── train_asr.jsonl                # Dữ liệu 1,536 sample ASR audio_text đã gán nhãn chuẩn
+│   ├── train/                         # Split train (train.jsonl + audio/ + zaic_tools/)
+│   └── public_test/                   # Split public_test (public_test.jsonl + audio/ + zaic_tools/)
 ├── runtime_cache/                     # Thư mục cache tốc độ cao trên NAS
 │   ├── triton/                        # Cache cho Triton JIT kernels
 │   ├── torchinductor/                 # Cache cho PyTorch Inductor compiler
 │   ├── tmp/                           # Thư mục tạm hệ thống (thay thế /tmp)
 │   └── logs/                          # Thư mục chứa log các tiến trình chạy nền
-└── code/                              # Mã nguồn chính của pipeline
-    ├── main.py                        # Điểm khởi động chính cho Inference
-    ├── run_server.sh                  # Shell script chạy nhanh inference chuẩn
-    ├── finetune.py                    # Script 1-lệnh tự động hóa SFT LLM
-    ├── prepare_sft.py                 # Chuẩn bị dữ liệu huấn luyện SFT cho LLM
-    ├── train_lora.py                  # Huấn luyện Unsloth LoRA trên LLM
-    ├── merge_lora.py                  # Trộn LoRA adapter vào base model
-    ├── models/                        # Nơi lưu trữ checkpoint mô hình
+└── code/                              # Mã nguồn chính (tương ứng /code trong Docker theo Mục 5 BTC)
+    ├── predict.py                     # Entrypoint BTC mặc định (/data -> /result/submission.jsonl)
+    ├── predict.sh                     # Script BTC chạy không tham số (bash /code/predict.sh)
+    ├── benchmark_timing.py            # Script 4 bước đo thời gian & kiểm tra parity theo Phụ lục BTC
+    ├── predict_notebook.ipynb         # Jupyter Notebook 4 bước theo Phụ lục Mục 7 BTC
+    ├── start_jupyter.sh               # Khởi chạy JupyterLab cổng 9777 (password/token: zac2026)
+    ├── README.md                      # Mô tả giải pháp theo Mục 6.1 BTC (ASR, LLM, params, context, agent loop, data)
+    ├── Dockerfile                     # Đóng gói container offline chuẩn ZAC 2026 (CUDA <= 13.2)
+    ├── requirements.txt               # Danh sách thư viện runtime + jupyterlab
+    ├── main.py                        # CLI suy luận đa chế độ (mặc định --stage online; hỗ trợ full/asr/llm)
+    ├── run_server.sh                  # Shell script launcher (mặc định STAGE=online, relative ../data & saved_models/)
+    ├── lifemate/
+    │   ├── predictor.py               # Engine suy luận 1-process dùng chung cho predict.py/main.py/notebook
+    │   └── ...                        # agent, asr, models, schema_cache, guards, ...
+    ├── models/llm/                    # Mô hình LLM gốc (Qwen3.5-4B base dùng để train/merge; được .dockerignore bỏ qua)
+    ├── saved_models/                  # Nơi lưu trữ checkpoint mô hình phục vụ inference & Docker
     │   ├── asr/                       # Mô hình ASR gốc (ONNX fp32, int8, model.pt)
     │   ├── asr_ft/                    # Mô hình ASR sau khi fine-tune (ONNX fp32)
-    │   └── llm/                       # Mô hình LLM gốc (Qwen3.5-4B weights)
-    ├── scripts/                       # Các scripts phụ trợ
-    │   ├── download_models.py         # Script tải mô hình từ Hugging Face
+    │   └── llm_ft/                    # LLM đã gộp LoRA run_sft_step (predict.py/run_server.sh/Docker tự nhận diện)
+    ├── training_code/                 # Toàn bộ mã nguồn huấn luyện & README.md theo Mục 5 & 6.2 BTC
+    │   ├── README.md                  # Hướng dẫn reproduce training, seed=42, link HF/data
+    │   ├── finetune.py                # Script 1-lệnh tự động hóa SFT LLM
+    │   ├── prepare_sft.py             # Chuẩn bị dữ liệu huấn luyện SFT cho LLM
+    │   ├── train_lora.py              # Huấn luyện Unsloth LoRA trên LLM
+    │   ├── merge_lora.py              # Trộn LoRA adapter vào base model (-> saved_models/llm_ft)
+    │   ├── audit_initial_tokens.py    # Audit token budget
+    │   ├── score_train.py             # Chấm điểm proxy trên train
+    │   ├── download_models.py         # Script tải mô hình từ Hugging Face vào saved_models/
     │   └── asr_finetune/              # Bộ công cụ fine-tune ASR Gipformer
     │       ├── setup_icefall.sh       # Clone và kiểm tra Icefall dependency
-    │       ├── prepare_gipformer_sft.py # Chuẩn bị tập train ASR
+    │       ├── prepare_gipformer_sft.py # Chuẩn bị tập train ASR từ ../data/train_asr.jsonl
     │       ├── train_gipformer.py     # Huấn luyện PyTorch RNNT Gipformer
-    │       └── export_gipformer.py    # Xuất checkpoint sang ONNX FP32
+    │       └── export_gipformer.py    # Xuất checkpoint sang ONNX FP32 -> saved_models/asr_ft
     └── result/                        # Thư mục lưu kết quả nộp bài và adapter
 ```
 
@@ -108,15 +127,16 @@ export HF_DATASETS_OFFLINE="1"
 
 ## 3. BƯỚC 1: TẢI VÀ CHUẨN BỊ PRETRAINED MODELS
 
-Pipeline LifeMate hoạt động **hoàn toàn offline**. Toàn bộ mô hình phải được tải về sẵn trong thư mục [`code/models`](file:///mnt/mmlab2024nas/trantran/lifemate/code/models) trước khi bắt đầu.
+Pipeline LifeMate hoạt động **hoàn toàn offline**. Toàn bộ mô hình phải được tải về sẵn trong thư mục [`code/saved_models`](file:///mnt/mmlab2024nas/trantran/lifemate/code/saved_models) trước khi bắt đầu.
 
-Tạm thời bỏ cờ `HF_HUB_OFFLINE` để tải mô hình qua script [`download_models.py`](file:///mnt/mmlab2024nas/trantran/lifemate/code/scripts/download_models.py):
+Tạm thời bỏ cờ `HF_HUB_OFFLINE` để tải mô hình qua script [`download_models.py`](file:///mnt/mmlab2024nas/trantran/lifemate/code/training_code/download_models.py):
 
 ```bash
-cd /mnt/mmlab2024nas/trantran/lifemate/code
+cd code
 
 # Tải cả Base LLM (Qwen3.5-4B) và Base ASR (Gipformer 1.5 với đầy đủ ONNX FP32, INT8 và PyTorch weights)
-HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 /usr/bin/python3.12 scripts/download_models.py \
+HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 /usr/bin/python3.12 training_code/download_models.py \
+  --models-dir saved_models \
   --only both \
   --asr-precision all
 ```
@@ -124,80 +144,87 @@ HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 /usr/bin/python3.12 scripts/download_mod
 ### (Tùy chọn) Tải sẵn mô hình ASR Fine-tuned từ Hugging Face
 Nếu bạn không muốn tự fine-tune lại mô hình ASR từ đầu mà muốn dùng ngay checkpoint đã được fine-tune sẵn trên tập dữ liệu cuộc thi:
 ```bash
-HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 /usr/bin/python3.12 scripts/download_models.py \
+HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 /usr/bin/python3.12 training_code/download_models.py \
+  --models-dir saved_models \
   --only asr \
   --asr-ft-repo hugebenevolence/lifemate-final \
   --asr-ft-subdir asr-gipformer
 ```
-Khi đó, các tệp ONNX của mô hình fine-tune sẽ được lưu tại [`code/models/asr_ft`](file:///mnt/mmlab2024nas/trantran/lifemate/code/models/asr_ft).
+Khi đó, các tệp ONNX của mô hình fine-tune sẽ được lưu tại [`code/saved_models/asr_ft`](file:///mnt/mmlab2024nas/trantran/lifemate/code/saved_models/asr_ft).
 
 ---
 
 ## 4. BƯỚC 2: FINE-TUNE MÔ HÌNH ASR GIPFORMER (TÙY CHỌN)
 
-Bước này áp dụng khi bạn muốn tự huấn luyện lại mô hình nhận dạng giọng nói Gipformer bằng tệp [`train_asr.jsonl`](file:///mnt/mmlab2024nas/trantran/lifemate/train_asr.jsonl) (trong đó các câu audio text chính đã được con người chuyển số thành chữ chính xác).
+Bước này áp dụng khi bạn muốn tự huấn luyện lại mô hình nhận dạng giọng nói Gipformer bằng tệp [`data/train_asr.jsonl`](file:///mnt/mmlab2024nas/trantran/lifemate/data/train_asr.jsonl) (trong đó các câu audio text chính đã được con người chuyển số thành chữ chính xác).
 
 ### 4.1. Chuẩn bị thư viện Icefall
 Chạy script cài đặt liên kết mã nguồn Icefall:
 ```bash
-cd /mnt/mmlab2024nas/trantran/lifemate/code
-bash scripts/asr_finetune/setup_icefall.sh
+cd code
+bash training_code/asr_finetune/setup_icefall.sh
 ```
 
 ### 4.2. Chuẩn bị dữ liệu huấn luyện ASR (`prepare_gipformer_sft.py`)
-Script này áp dụng chính sách **Selective Normalization & Anti-Noise**:
-- **Tập `audio_text` chính (1,538 câu):** Con người đã kiểm tra và đảm bảo chuyển toàn bộ số thành chữ chính xác (`năm mươi ngàn`, `bảy rưỡi`...). Do đó, cách đọc số được giữ nguyên vẹn; còn lại **tất cả các phép chuẩn hóa khác** (xử lý ký hiệu `+`, `&`, `%`, `@`, `°`, dấu thời gian `h`, ngày tháng `tháng`, dấu phẩy số thập phân `phẩy`, viết hoa toàn bộ, loại bỏ dấu câu, căn chỉnh dấu thanh BPE `model_style`, kiểm tra bảng ký tự và BPE token) **đều được áp dụng đồng nhất như history audio**. Vì các câu này đã được con người nghe và thẩm định, pipeline không áp dụng bộ lọc WER (`--max-history-wer`) để bảo toàn 100% dữ liệu.
-- **Tập số còn sót (7 câu):** Một số ít câu còn sót chữ số chưa được con người chuyển (`2 triệu`, `tập 12`, `tháng 9`, `101`, `Omega-3`) sẽ được tự động chuyển số thành chữ qua `target_v3` (khớp âm học với hypothesis của Gipformer) giống như history.
-- **Tập hội thoại lịch sử (`history`, 3,491 lượt user):** Chưa qua thẩm định của con người, áp dụng đầy đủ quy trình mở rộng số/ký hiệu qua `target_v3` và tùy chọn lọc bỏ các câu có WER quá cao so với hypothesis âm học (`--max-history-wer`).
+Script này áp dụng chính sách **Selective Normalization & Anti-Noise** và hiện mặc định khớp 100% với bộ dữ liệu đã tạo ra `saved_models/asr_ft` (`result/asr_sft_data`):
+- **Tập `audio_text` chính (1,536 câu):** Con người đã kiểm tra và đảm bảo chuyển toàn bộ số thành chữ chính xác (`năm mươi ngàn`, `bảy rưỡi`...). Do đó, cách đọc số được giữ nguyên vẹn; còn lại **tất cả các phép chuẩn hóa khác** (xử lý ký hiệu `+`, `&`, `%`, `@`, `°`, dấu thời gian `h`, ngày tháng `tháng`, dấu phẩy số thập phân `phẩy`, viết hoa toàn bộ, loại bỏ dấu câu, căn chỉnh dấu thanh BPE `model_style`, kiểm tra bảng ký tự và BPE token) **đều được áp dụng đồng nhất như history audio**. Không bật `--verify-main`, `--max-main-wer`, `--max-history-wer` hay `--final` để bảo toàn 100% dữ liệu gốc.
+- **Tập số còn sót (9 câu):** Một số ít câu còn sót chữ số chưa được con người chuyển (`2 triệu`, `tập 12`, `tháng 9`, `101`, `Omega-3`) sẽ được tự động chuyển số thành chữ qua `target_v3` (khớp âm học với hypothesis của Gipformer) giống như history.
+- **Tập hội thoại lịch sử (`history`, 3,491 lượt user):** Áp dụng đầy đủ quy trình mở rộng số/ký hiệu qua `target_v3` và giữ nguyên toàn bộ (`--max-history-wer` mặc định tắt `None`, `skipped_rows=0`).
 
-Chạy lệnh:
+> [!NOTE]
+> Các tùy chọn thử nghiệm thêm từ commit `d76a2c8` (`--verify-main`, `--max-main-wer`, `--eval-wer`, `--selection-metric wer`) đều ở chế độ **tắt mặc định (opt-in)** nên `prepare_gipformer_sft.py` tạo đúng 4,496 dòng `train.jsonl` + 540 dòng `dev.jsonl` khớp hoàn toàn bản gốc `result/asr_sft_data`.
+
+Chạy lệnh (relative paths từ `code/`):
 ```bash
-cd /mnt/mmlab2024nas/trantran/lifemate/code
+cd code
 
-/usr/bin/python3.12 scripts/asr_finetune/prepare_gipformer_sft.py \
-  --input-jsonl /mnt/mmlab2024nas/trantran/lifemate/train_asr.jsonl \
-  --data-root /mnt/mmlab2024nas/trantran/lifemate/train+public_test \
-  --model-dir /mnt/mmlab2024nas/trantran/lifemate/code/models/asr \
-  --output-dir /mnt/mmlab2024nas/trantran/lifemate/code/result/asr_sft_data \
+/usr/bin/python3.12 training_code/asr_finetune/prepare_gipformer_sft.py \
+  --input-jsonl ../data/train_asr.jsonl \
+  --data-root ../data \
+  --model-dir saved_models/asr \
+  --output-dir result/asr_sft_data \
   --val-fraction 0.1 \
   --seed 42
 ```
-*Kết quả:* Tạo ra `train.jsonl`, `dev.jsonl` và `manifest.json` trong `result/asr_sft_data`.
+*Kết quả:* Tạo ra `train.jsonl` (4,496 mẫu), `dev.jsonl` (540 mẫu) và `manifest.json` trong `result/asr_sft_data` (`skipped_rows: 0`).
 
 ### 4.3. Chạy huấn luyện ASR ngầm bằng `nohup` (`train_gipformer.py`)
-Huấn luyện Gipformer PyTorch RNNT loss trên GPU:
+Huấn luyện Gipformer PyTorch RNNT loss trên GPU theo đúng cấu hình đã tạo `result/asr_sft/best.pt` (step 13,000, `dev_loss=1.1992`, chạy hết 3 epochs = 13,488 steps; nếu thư mục đích đã tồn tại thì đổi `--output-dir` sang tên mới như `result/asr_sft_repro`):
 ```bash
-cd /mnt/mmlab2024nas/trantran/lifemate/code
+cd code
 
-nohup /usr/bin/python3.12 scripts/asr_finetune/train_gipformer.py \
+nohup /usr/bin/python3.12 training_code/asr_finetune/train_gipformer.py \
   --cuda-visible-devices 0 \
-  --data-root /mnt/mmlab2024nas/trantran/lifemate/train+public_test \
-  --data-dir /mnt/mmlab2024nas/trantran/lifemate/code/result/asr_sft_data \
-  --model-dir /mnt/mmlab2024nas/trantran/lifemate/code/models/asr \
-  --output-dir /mnt/mmlab2024nas/trantran/lifemate/code/result/asr_sft \
+  --data-root ../data \
+  --data-dir result/asr_sft_data \
+  --model-dir saved_models/asr \
+  --output-dir result/asr_sft \
   --epochs 3 \
   --learning-rate 3e-5 \
   --accum 4 \
-  --eval-every 250 \
-  --patience 3 \
-  > /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/train_asr.log 2>&1 &
+  --max-dev-audio 300 \
+  --augment-scope all \
+  --selection-metric loss \
+  --eval-every 1000 \
+  --patience 5 \
+  > ../runtime_cache/logs/train_asr.log 2>&1 &
 ```
-*Kiểm tra tiến trình:* Xem log thời gian thực bằng `tail -f /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/train_asr.log`.
+*Kiểm tra tiến trình:* Xem log thời gian thực bằng `tail -f ../runtime_cache/logs/train_asr.log`.
 
 ### 4.4. Xuất mô hình fine-tuned sang ONNX FP32 (`export_gipformer.py`)
-Sau khi huấn luyện xong, chuyển checkpoint tốt nhất `best.pt` thành định dạng ONNX FP32 đặt trong `code/models/asr_ft`:
+Sau khi huấn luyện xong, chuyển checkpoint tốt nhất `best.pt` thành định dạng ONNX FP32 đặt trong `saved_models/asr_ft`:
 ```bash
-cd /mnt/mmlab2024nas/trantran/lifemate/code
+cd code
 
-/usr/bin/python3.12 scripts/asr_finetune/export_gipformer.py \
-  --best /mnt/mmlab2024nas/trantran/lifemate/code/result/asr_sft/best.pt \
-  --original-dir /mnt/mmlab2024nas/trantran/lifemate/code/models/asr \
-  --output-dir /mnt/mmlab2024nas/trantran/lifemate/code/models/asr_ft \
-  --data-root /mnt/mmlab2024nas/trantran/lifemate/train+public_test
+/usr/bin/python3.12 training_code/asr_finetune/export_gipformer.py \
+  --best result/asr_sft/best.pt \
+  --original-dir saved_models/asr \
+  --output-dir saved_models/asr_ft \
+  --data-root ../data
 ```
-*Xác nhận:* Thư mục `code/models/asr_ft` sẽ chứa đầy đủ `encoder.onnx`, `decoder.onnx`, `joiner.onnx`, `tokens.txt`, `bpe.model` và tệp kê khai `lifemate_manifest.json`.
+*Xác nhận:* Thư mục `saved_models/asr_ft` sẽ chứa đầy đủ `encoder.onnx`, `decoder.onnx`, `joiner.onnx`, `tokens.txt`, `bpe.model` và tệp kê khai `lifemate_manifest.json`.
 
-Inference nạp các file ONNX đã xuất trong `models/asr_ft`, không nạp trực tiếp
+Inference nạp các file ONNX đã xuất trong `saved_models/asr_ft`, không nạp trực tiếp
 `result/asr_sft/best.pt`. Sau mỗi lần train ASR tạo checkpoint mới, cần chạy lại
 bước export này để cập nhật ONNX trước khi tạo transcript mới.
 
@@ -218,12 +245,15 @@ Pipeline đã tích hợp toàn bộ các kỹ thuật tối ưu hóa cao nhất
 - **Short Checked Reasoning mặc định tắt (`--no-short-reasoning`):** Giữ đồng bộ 100% với chế độ suy luận `enable_thinking=False`, `thinking_budget=0` (có thể bật lại khi thử nghiệm bằng `--short-reasoning`).
 - **Pre-computed `date_reference`:** Tự động giải quyết thời gian biểu mà không cần sinh các lệnh gọi helper thời gian dư thừa.
 
-### 5.1. Chạy Fine-tune LLM toàn diện bằng `nohup` (Khuyên dùng)
-Chạy kịch bản 1 lệnh [`finetune.py`](code/finetune.py) (mặc định sử dụng Step-wise SFT, 3 epochs, kích hoạt Guard Recovery và tắt Short Checked Reasoning để đồng bộ với inference `thinking_budget=0`):
+### 5.1. Chạy Fine-tune LLM toàn diện bằng `nohup` (Cấu hình `run_sft_step` — Khuyên dùng)
+Chạy kịch bản 1 lệnh [`finetune.py`](file:///mnt/mmlab2024nas/trantran/lifemate/code/training_code/finetune.py) để tái lập đúng cấu hình **`run_sft_step`** (được chuẩn bị từ commit `79fdce3` ngày 13/11, dùng Step-wise SFT 3 epochs, kích hoạt Guard Recovery, tắt Short Checked Reasoning để đồng bộ `thinking_budget=0`, và tạo transcript SFT chỉ bằng `asr_ft` cũ ở `beam=4`, tắt hotwords & post-normalize):
 
-`finetune.py` và `prepare_sft.py` mặc định dùng `code/models/asr_ft` để tạo
+> [!IMPORTANT]
+> Cả `training_code/finetune.py` và `training_code/prepare_sft.py` hiện đã đặt **mặc định theo cấu hình `run_sft_step`** (`--step-wise-sft`, `--asr-beam-size 4`, `--asr-hotwords off`, `--no-asr-post-normalize`, `--asr-threads 4`, `--sft-profile run_sft_step`, và `--filter-damaged-asr` mặc định bật trên `finetune.py`), còn `train_lora.py` giữ nguyên quy trình huấn luyện LoRA (`epochs=3`, `lr=1e-4`, `lora_r=16`, `lora_alpha=32`, `fuzzy_weight=0.3`, `seed=42`). Phần prompt tĩnh chia sẻ với inference (`SYSTEM_PROMPT` trong [agent.py](file:///mnt/mmlab2024nas/trantran/lifemate/code/lifemate/agent.py) và `date_reference` trong [local_time.py](file:///mnt/mmlab2024nas/trantran/lifemate/code/lifemate/local_time.py)) đã được đồng bộ đúng theo `run_sft_step`, còn khác biệt của các module guard/fallback mới dùng cho inference được cô lập qua profile `--sft-profile run_sft_step` trong [`sft_run_step_compat.py`](file:///mnt/mmlab2024nas/trantran/lifemate/code/training_code/sft_run_step_compat.py). Nhờ đó, chạy `prepare_sft.py` / `finetune.py` với cấu hình mặc định tái lập đúng từng byte `result/run_sft_step/sft/train.jsonl` (`10,724` dòng, `sha256: a32459e8a200626f846a519b17fffa33427905838fcd220a076f54b182ab0996`) mà không ảnh hưởng các cải tiến inference. Nếu thư mục `result/run_sft_step` đã tồn tại và không rỗng, đổi `--output-dir` sang tên thư mục mới (ví dụ `result/run_sft_step_repro`) vì script không ghi đè thư mục cũ.
+
+`finetune.py` và `prepare_sft.py` mặc định dùng `saved_models/asr_ft` để tạo
 transcript ở **cả dual và mix**, cùng nguồn ASR fine-tune với inference. Các lệnh
-bên dưới cũng ghi rõ đường dẫn này. Nếu chưa có bộ ONNX fine-tune đầy đủ, chạy
+bên dưới dùng relative path từ `code/`. Nếu chưa có bộ ONNX fine-tune đầy đủ, chạy
 bước export 4.4; chương trình báo lỗi thay vì tự dùng ASR gốc. Có thể chỉ định
 model khác bằng `--asr-model` khi chủ động làm ablation.
 
@@ -241,24 +271,36 @@ của bản dual giữ cùng nhãn. Chế độ mix, các ablation tỷ lệ 0/1
 partition chẩn đoán và prompt inference không thêm nhãn này.
 
 ```bash
-cd /mnt/mmlab2024nas/trantran/lifemate/code
+cd code
 
-nohup /usr/bin/python3.12 finetune.py \
+nohup /usr/bin/python3.12 training_code/finetune.py \
   --cuda-visible-devices 0 \
-  --data-root /mnt/mmlab2024nas/trantran/lifemate/train+public_test \
-  --base-model /mnt/mmlab2024nas/trantran/lifemate/code/models/llm \
-  --output-dir /mnt/mmlab2024nas/trantran/lifemate/code/result/run_sft_final \
-  --asr-model /mnt/mmlab2024nas/trantran/lifemate/code/models/asr_ft \
+  --data-root ../data \
+  --base-model models/llm \
+  --output-dir result/run_sft_step \
+  --asr-model saved_models/asr_ft \
   --transcript-mode dual \
   --asr-transcript-ratio 0.5 \
-  --asr-precision auto \
+  --asr-precision fp32 \
   --asr-decoding-method modified_beam_search \
   --asr-beam-size 4 \
+  --asr-hotwords off \
+  --no-asr-post-normalize \
+  --asr-threads 4 \
+  --asr-batch-size 16 \
   --filter-damaged-asr \
-  --fuzzy-weight 0.3 \
   --guard-recovery-ratio 0.18 \
   --step-wise-sft \
   --no-short-reasoning \
+  --validation-fraction 0.0 \
+  --missing-tool-policy error \
+  --guard-conflict-policy skip \
+  --max-length 16384 \
+  --seed 42 \
+  --backend unsloth \
+  --quantization none \
+  --fuzzy-weight 0.3 \
+  --reasoning-weight 0.25 \
   --epochs 3 \
   --batch-size 1 \
   --gradient-accumulation 8 \
@@ -267,62 +309,67 @@ nohup /usr/bin/python3.12 finetune.py \
   --lora-alpha 32 \
   --lora-dropout 0.0 \
   --save-strategy epoch \
-  > /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/train_llm_final.log 2>&1 &
+  > ../runtime_cache/logs/train_llm_step.log 2>&1 &
 ```
 
 *Kiểm tra tiến trình:*
 ```bash
-tail -f /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/train_llm_stepwise.log
+tail -f ../runtime_cache/logs/train_llm_step.log
 ```
 *Kết quả đầu ra:* Adapter hoàn chỉnh sẽ được lưu tại:
-`/mnt/mmlab2024nas/trantran/lifemate/code/result/run_sft_stepwise/training/adapter`
+`result/run_sft_step/training/adapter`
 
 ### 5.2. Chạy tách riêng từng bước (Dành cho Debug hoặc tùy biến)
 Nếu bạn muốn chia nhỏ để kiểm tra tập dữ liệu trước khi train:
 
 #### Bước 3a: Chuẩn bị dữ liệu SFT
-Lệnh sau tạo hai bộ riêng `sft_dual_asr_ft` và `sft_mix_asr_ft`, dùng cùng ASR
-fine-tune, tỷ lệ 0.5 và toàn bộ tập train. Nếu các thư mục đã có dữ liệu, chọn tên
-output mới; prepare không ghi đè SFT cũ.
+Lệnh sau chuẩn bị bộ SFT Step-wise chuẩn của `run_sft_step` (`dual`, tỷ lệ ASR `0.5`, toàn bộ tập train, `asr_ft` thuần `beam=4`, `--asr-hotwords off`, `--no-asr-post-normalize`). Nếu thư mục đích đã có dữ liệu, chọn tên output mới; `prepare_sft.py` không ghi đè SFT cũ (có thể thay `--transcript-mode mix` nếu muốn chạy ablation `mix`).
 
 ```bash
-cd /mnt/mmlab2024nas/trantran/lifemate/code
+cd code
 
-for SFT_TRANSCRIPT_MODE in dual mix; do
-  /usr/bin/python3.12 prepare_sft.py \
-    --data-root /mnt/mmlab2024nas/trantran/lifemate/train+public_test \
-    --tokenizer /mnt/mmlab2024nas/trantran/lifemate/code/models/llm \
-    --output-dir "/mnt/mmlab2024nas/trantran/lifemate/code/result/sft_${SFT_TRANSCRIPT_MODE}_asr_ft" \
-    --asr-model /mnt/mmlab2024nas/trantran/lifemate/code/models/asr_ft \
-    --asr-precision fp32 \
-    --asr-decoding-method modified_beam_search \
-    --asr-beam-size 4 \
-    --transcript-mode "$SFT_TRANSCRIPT_MODE" \
-    --asr-transcript-ratio 0.5 \
-    --filter-damaged-asr \
-    --guard-recovery-ratio 0.18 \
-    --step-wise-sft \
-    --no-short-reasoning \
-    --validation-fraction 0.0 || break
-done
+/usr/bin/python3.12 training_code/prepare_sft.py \
+  --data-root ../data \
+  --tokenizer models/llm \
+  --output-dir result/sft_step_dual \
+  --asr-model saved_models/asr_ft \
+  --asr-precision fp32 \
+  --asr-decoding-method modified_beam_search \
+  --asr-beam-size 4 \
+  --asr-hotwords off \
+  --no-asr-post-normalize \
+  --asr-threads 4 \
+  --asr-batch-size 16 \
+  --transcript-mode dual \
+  --asr-transcript-ratio 0.5 \
+  --filter-damaged-asr \
+  --guard-recovery-ratio 0.18 \
+  --step-wise-sft \
+  --no-short-reasoning \
+  --validation-fraction 0.0 \
+  --missing-tool-policy error \
+  --guard-conflict-policy skip \
+  --max-length 16384 \
+  --seed 42
 ```
 
-Kiểm tra `asr.model_path` trong `manifest.json` của mỗi bộ: phải trỏ vào
-`code/models/asr_ft`. Nhãn nguồn trong prompt vẫn chỉ bật cho dual; mix giữ định
-dạng prompt hiện có. Mẫu synthetic luôn dùng một bản `audio_text`, không qua ASR.
+Kiểm tra `asr` trong `result/sft_step_dual/manifest.json`: `model_path` trỏ vào
+`saved_models/asr_ft`, `precision` là `fp32`, `max_active_paths` là `4`, và không bật `hotwords_mode`/`post_normalize`. Nhãn nguồn trong prompt chỉ bật cho `dual`; `mix` giữ định dạng prompt hiện có. Mẫu synthetic luôn dùng một bản `audio_text`, không qua ASR.
 
 #### Bước 3b: Huấn luyện LoRA với Unsloth
 ```bash
-cd /mnt/mmlab2024nas/trantran/lifemate/code
+cd code
 
-nohup /usr/bin/python3.12 train_lora.py \
+nohup /usr/bin/python3.12 training_code/train_lora.py \
   --cuda-visible-devices 0 \
-  --base-model /mnt/mmlab2024nas/trantran/lifemate/code/models/llm \
-  --sft-dir /mnt/mmlab2024nas/trantran/lifemate/code/result/sft_dual_asr_ft \
-  --output-dir /mnt/mmlab2024nas/trantran/lifemate/code/result/training_lora \
+  --base-model models/llm \
+  --sft-dir result/sft_step_dual \
+  --output-dir result/training_lora_step \
   --backend unsloth \
   --quantization none \
+  --max-length 16384 \
   --fuzzy-weight 0.3 \
+  --reasoning-weight 0.25 \
   --epochs 3 \
   --batch-size 1 \
   --gradient-accumulation 8 \
@@ -331,21 +378,19 @@ nohup /usr/bin/python3.12 train_lora.py \
   --lora-alpha 32 \
   --lora-dropout 0.0 \
   --save-strategy epoch \
-  > /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/train_lora_only.log 2>&1 &
+  --seed 42 \
+  > ../runtime_cache/logs/train_lora_only.log 2>&1 &
 ```
 
-Để train bộ mix, thay `--sft-dir` bằng `.../result/sft_mix_asr_ft` và chọn
-`--output-dir` huấn luyện riêng.
-
-### 5.3. (Tùy chọn) Gộp LoRA Adapter vào Base Model (`merge_lora.py`)
-Nếu muốn xuất ra một thư mục checkpoint mô hình đầy đủ không cần nạp PEFT adapter lúc suy luận:
+### 5.3. Gộp LoRA Adapter vào Base Model (`merge_lora.py`)
+Model đã merge sẵn vào `code/saved_models/llm_ft/` từ adapter `run_sft_step`. Nếu muốn xuất lại từ adapter khác vào thư mục mới:
 ```bash
-cd /mnt/mmlab2024nas/trantran/lifemate/code
+cd code
 
-/usr/bin/python3.12 merge_lora.py \
-  --base-model /mnt/mmlab2024nas/trantran/lifemate/code/models/llm \
-  --adapter /mnt/mmlab2024nas/trantran/lifemate/code/result/run_sft_dual/training/adapter \
-  --output-dir /mnt/mmlab2024nas/trantran/lifemate/code/models/llm_merged \
+/usr/bin/python3.12 training_code/merge_lora.py \
+  --base-model models/llm \
+  --adapter result/run_sft_step/training/adapter \
+  --output-dir saved_models/llm_ft \
   --dtype bfloat16
 ```
 
@@ -419,7 +464,7 @@ Cơ chế Search Fallback 2B chạy tự động trong tầng điều phối Pyt
 
 ## 6. BƯỚC 4: CHẠY SUY LUẬN (INFERENCE PIPELINE)
 
-Giai đoạn suy luận đọc tập kiểm thử (`public_test` hoặc `private_test`), phiên âm giọng nói qua ASR, gửi văn bản và schema công cụ cho LLM, thực thi môi trường mô phỏng và xuất tệp nộp bài `submission.jsonl`.
+Giai đoạn suy luận đọc tập kiểm thử (`public_test` hoặc `private_test`, hoặc `--split auto`), phiên âm giọng nói qua ASR, gửi văn bản và schema công cụ cho LLM, thực thi môi trường `ToolEnv` (import trực tiếp từ thư mục split của BTC) và xuất tệp nộp bài `submission.jsonl` (mỗi dòng gồm `id`, `tool_calls`, `state_hash` và thêm `time` bằng mili-giây ở chế độ online/BTC).
 
 Với `--thinking-budget 0` (mặc định), inference dùng **guard chọn token** để đầu ra
 bắt đầu trực tiếp bằng `<tool_call>` ở native function calling hoặc `{` cho JSON.
@@ -433,104 +478,192 @@ lớn hơn 0 và còn đủ context/thời gian, cơ chế thinking có giới h
 nếu ngân sách hiệu lực về 0 thì guard tự bật. SFT/Short Checked Reasoning giữ cấu
 hình riêng. Khởi động lại tiến trình inference để áp dụng code mới với adapter hiện có.
 
-Cách chọn ASR phụ thuộc lệnh chạy:
+Cách chọn ASR & model phụ thuộc entrypoint chạy:
 
-- `run_server.sh`: tự chọn `models/asr_ft` khi `models/asr_ft/tokens.txt` tồn tại
-  và không rỗng; nếu chưa có thì chọn `models/asr`. Đây là điều kiện chọn thư mục;
-  bộ ONNX trong thư mục được chọn vẫn phải đầy đủ.
-- `main.py --stage full` hoặc `--stage asr`: dùng chính xác thư mục truyền qua
-  `--asr-model`, không tự chọn checkpoint mới nhất hoặc tự export `best.pt`.
+- [`predict.py`](file:///mnt/mmlab2024nas/trantran/lifemate/code/predict.py) / [`predict.sh`](file:///mnt/mmlab2024nas/trantran/lifemate/code/predict.sh) / [`benchmark_timing.py`](file:///mnt/mmlab2024nas/trantran/lifemate/code/benchmark_timing.py) / [`predict_notebook.ipynb`](file:///mnt/mmlab2024nas/trantran/lifemate/code/predict_notebook.ipynb): tự chọn `saved_models/asr_ft` nếu `saved_models/asr_ft/tokens.txt` tồn tại và không rỗng (ngược lại dùng `saved_models/asr`); tự chọn `saved_models/llm_ft` nếu có `config.json` (ngược lại dùng `saved_models/llm`, và nạp thêm `saved_models/llm_adapter` nếu có `adapter_config.json`), hỗ trợ ghi đè qua `LIFEMATE_ASR_MODEL`, `LIFEMATE_LLM_MODEL`, `LIFEMATE_LLM_ADAPTER`. Toàn bộ tham số suy luận sản xuất (`seed=42`, `asr_beam_size=8`, `asr_hotwords=auto`, `asr_hotwords_score=1.5`, `asr_post_normalize=True`, `asr_threads=8`) được cố định đồng nhất giữa `predict.py`, `benchmark_timing.py` và `predict_notebook.ipynb`, nên **tự động kích hoạt Hybrid ASR** mới nhất trong [`lifemate/asr_biasing.py`](file:///mnt/mmlab2024nas/trantran/lifemate/code/lifemate/asr_biasing.py) mà không cần export lại ONNX.
+- [`run_server.sh`](file:///mnt/mmlab2024nas/trantran/lifemate/code/run_server.sh): tự chọn `saved_models/asr_ft` theo điều kiện `tokens.txt` ở trên; nếu chưa có thì chọn `saved_models/asr`, và chọn `saved_models/llm_ft` (nếu có `config.json`) hoặc `saved_models/llm`. Mặc định `--data-root` là relative `../data`, `STAGE=online`, và tự bật Hybrid ASR (`ASR_BEAM_SIZE=8`, `ASR_HOTWORDS=auto`, `ASR_HOTWORDS_SCORE=1.5`, `ASR_POST_NORMALIZE=1`).
+- `main.py` (`--stage online` mặc định, hoặc `--stage full` / `--stage asr`): dùng chính xác thư mục truyền qua `--asr-model`, không tự chọn checkpoint mới nhất hoặc tự export `best.pt`. Lưu ý bản thân `main.py` giữ mặc định bảo thủ (`--asr-beam-size 4`, `--asr-hotwords off`, `--no-asr-post-normalize`), nên khi gọi trực tiếp `main.py` cần truyền đủ `--asr-beam-size 8 --asr-hotwords auto --asr-hotwords-score 1.5 --asr-post-normalize --asr-threads 8` (như các lệnh ở Mục 6.4/6.5) để kích hoạt Hybrid ASR.
 - `main.py --stage llm`: chỉ đọc transcript cache; không nạp hay chuyển model ASR.
 
-Các lệnh bên dưới dùng cache riêng `transcripts_asr_ft.jsonl` cho ASR fine-tune.
-Nếu đổi checkpoint, model hoặc cấu hình giải mã mà vẫn dùng cùng đường dẫn cache,
-hãy chạy lại bước ASR với `--refresh-transcripts` hoặc chọn một đường dẫn cache mới.
-Bước `full/asr` báo lỗi khi cache không khớp model/settings, không tự thay cache cũ.
-Chỉ chạy `--stage llm` sẽ tiếp tục dùng nguồn ASR ghi trong manifest của cache đó.
+> [!NOTE]
+> - Hybrid ASR nằm hoàn toàn trong logic Python tại [`lifemate/asr_biasing.py`](file:///mnt/mmlab2024nas/trantran/lifemate/code/lifemate/asr_biasing.py) (áp dụng khi `hotwords=auto` và `asr_post_normalize=True`), nên các entrypoint `--stage online` (`predict.sh`, `predict.py`, `run_server.sh`, `benchmark_timing.py`, `predict_notebook.ipynb`) **tự động dùng Hybrid ASR ngay lập tức**.
+> - Các cải tiến suy luận sau `79fdce3` gồm Hybrid ASR (`asr_biasing.py`, `asr.py`, `transcripts.py`) và các lớp guard / loop recovery / fallback (`tool_execution.py`, `execution_policy.py`, `missing_info_guard.py`, `predictor.py`, `runtime.py`) đều được giữ nguyên ở inference; riêng prompt tĩnh (`SYSTEM_PROMPT` trong [`lifemate/agent.py`](file:///mnt/mmlab2024nas/trantran/lifemate/code/lifemate/agent.py) và `date_reference()` trong [`lifemate/local_time.py`](file:///mnt/mmlab2024nas/trantran/lifemate/code/lifemate/local_time.py)) đã được đồng bộ khớp hoàn toàn với weights `saved_models/llm_ft` (`run_sft_step`).
+> - Chỉ khi dùng chế độ legacy `--stage full` / `--stage asr` / `--stage llm` mới cần chú ý: `asr_identity` trong manifest chỉ hash file ONNX và cờ CLI (không hash mã Python `asr_biasing.py`). Vì vậy, nếu trong `result/` đã có cache cũ (ví dụ `result/transcripts.jsonl`), **bắt buộc truyền `--refresh-transcripts` hoặc đổi sang file `--transcript-cache` mới** (như `result/transcripts_asr_hybrid.jsonl`) để tránh tái sử dụng transcript trước khi cập nhật Hybrid ASR.
 
-Sau khi bước ASR hoàn tất, kiểm tra nguồn model và cấu hình giải mã của cache:
+---
 
+### 6.1. Kịch bản 1: Chạy chuẩn nộp bài BTC (`predict.sh` / `predict.py`) & Docker
+
+Phục vụ chạy chuẩn theo tài liệu BTC (`bash /code/predict.sh`, `/data` mount read-only, tự nhận diện split, xuất `/result/submission.jsonl` và in thời gian load model + thống kê latency):
+
+#### Chạy trực tiếp trên máy cục bộ (tự dùng `saved_models/asr_ft` + `saved_models/llm_ft` đã merge)
 ```bash
-rg -n '"model_path"|"precision"|"decoding_method"|"max_active_paths"|"hotwords_mode"|"hotwords_score"|"post_normalize"' \
-  /mnt/mmlab2024nas/trantran/lifemate/code/result/transcripts_asr_ft.manifest.json
+cd code
+
+# Chạy predict.sh trỏ tới ../data để kiểm thử local (không cần truyền --llm-adapter vì saved_models/llm_ft đã merge run_sft_step)
+PYTHON_BIN="/usr/bin/python3.12" \
+DATA_ROOT="../data" \
+SPLIT="public_test" \
+OUTPUT="result/submission.jsonl" \
+bash predict.sh
 ```
 
-`model_path` phải trỏ tới `code/models/asr_ft` khi muốn dùng ASR đã fine-tune.
+#### Đóng gói và kiểm thử bằng Docker offline theo BTC (`Dockerfile`)
+> [!IMPORTANT]
+> - `code/saved_models/llm_ft/` đã được gộp sẵn từ adapter `run_sft_step` thành **thư mục thật**, và symlink `code/saved_models/llm` cũ đã được xóa để `docker build` (`COPY saved_models/ /code/saved_models/`) không chép nhầm symlink hỏng (`code/models/llm/` đã được `.dockerignore` loại khỏi context).
+> - Theo cấu hình mặc định chuẩn BTC, `predict.sh` / `predict.py` / `predict_notebook.ipynb` trong Docker tự dùng `saved_models/llm_ft` + `saved_models/asr_ft` với mặc định **Hybrid ASR** (`lifemate/asr_biasing.py` + `--asr-beam-size 8`, `--asr-hotwords auto`, `--asr-hotwords-score 1.5`, `--asr-post-normalize`, `--asr-threads 8`). Sau mỗi lần sửa `lifemate/asr_biasing.py`, cần `docker build` lại để cập nhật mã Python vào image.
 
-### 6.1. Kịch bản 1: Chạy chuẩn qua launcher `run_server.sh` (Khuyên dùng)
-Script [`code/run_server.sh`](code/run_server.sh) đã cấu hình sẵn tự động:
-
-- Ưu tiên chọn `models/asr_ft` theo điều kiện `tokens.txt` ở trên; nếu chưa có sẽ dùng `models/asr`.
-- Tự động bật cấu hình tối ưu hóa ASR (`1A + 1B + 2A`): `ASR_BEAM_SIZE=8`, `ASR_HOTWORDS=auto`, `ASR_HOTWORDS_SCORE=1.5`, `--asr-post-normalize` (`ASR_POST_NORMALIZE=1`, đặt `0` để tắt) và các cờ runtime tốt nhất.
-- Chạy tách bạch 2 tiến trình ASR và LLM.
-
-Launcher cố định đường dẫn model trong script và truyền chúng sau các tham số CLI.
-Biến môi trường `ASR_MODEL`/`LLM_MODEL` hoặc cờ `--asr-model`/`--llm-model` truyền
-vào launcher không ghi đè lựa chọn này; các cờ tối ưu ASR (`--asr-beam-size`,
-`--asr-hotwords`, `--asr-hotwords-score`, `--[no-]asr-post-normalize`) được truyền
-trước `"$@"` nên vẫn có thể ghi đè qua CLI hoặc biến môi trường tương ứng. Dùng `main.py`
-ở mục 6.2 nếu cần chỉ định thư mục model khác. Log khởi động ghi `[run_server] ASR_MODEL=...` để kiểm tra.
-
-Chạy ngầm với `nohup`:
 ```bash
-cd /mnt/mmlab2024nas/trantran/lifemate/code
+cd code
 
-# Chọn adapter vừa huấn luyện qua --llm-adapter
-# Launcher đã bật sẵn --asr-beam-size 8, --asr-hotwords auto, --asr-hotwords-score 1.5, --asr-post-normalize
-nohup env \
-  PYTHON_BIN="/usr/bin/python3.12" \
-  DATA_ROOT="/mnt/mmlab2024nas/trantran/lifemate/train+public_test" \
-  SPLIT="public_test" \
-  OUTPUT="/mnt/mmlab2024nas/trantran/lifemate/code/result/submission_traj.jsonl" \
-  TRANSCRIPT_CACHE="/mnt/mmlab2024nas/trantran/lifemate/code/result/transcripts.jsonl" \
-  DEVICE="cuda" \
-  bash run_server.sh \
-  --llm-adapter /mnt/mmlab2024nas/trantran/lifemate/code/result/run_sft_traj/training/adapter \
-  --asr-precision fp32 \
-  --asr-decoding-method modified_beam_search \
-  --asr-beam-size 8 \
-  --asr-batch-size 16 \
-  --thinking-budget 0 \
-  --prefix-cache auto \
-  --schema-cache auto \
-  --sample-schedule schema \
-  > /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/inference_traj.log 2>&1 &
-```
+# 1. Build image BTC sạch (chứa saved_models/asr_ft + saved_models/llm_ft đã merge run_sft_step + Hybrid ASR mới nhất)
+docker build -t lifemate-zac2026:latest .
 
-*Theo dõi tiến độ:*
-```bash
-tail -f /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/inference_server1.log
+# 2a. Chạy chuẩn môi trường chấm bài BTC (--network none, /data read-only; tự dùng llm_ft + Hybrid ASR beam=8/auto/post_normalize)
+docker run --rm --gpus '"device=0"' --network none \
+  -v "$(cd ../data/public_test && pwd)":/data/public_test:ro \
+  -v "$(pwd)/result":/result \
+  lifemate-zac2026:latest bash /code/predict.sh
+
+# 2b. (Tuỳ chọn) Test nhanh một adapter chưa merge trên Docker KHÔNG cần merge_lora / docker build lại
+# (Mount base models/llm + adapter từ host và truyền LIFEMATE_LLM_MODEL + LIFEMATE_LLM_ADAPTER)
+docker run --rm --gpus '"device=0"' --network none \
+  -e LIFEMATE_LLM_MODEL=/llm \
+  -e LIFEMATE_LLM_ADAPTER=/adapter \
+  -v "$(cd models/llm && pwd)":/llm:ro \
+  -v "$(cd result/run_sft_step/training/adapter && pwd)":/adapter:ro \
+  -v "$(cd ../data/public_test && pwd)":/data/public_test:ro \
+  -v "$(pwd)/result":/result \
+  lifemate-zac2026:latest bash /code/predict.sh \
+    --asr-beam-size 8 \
+    --asr-hotwords auto \
+    --asr-hotwords-score 1.5 \
+    --asr-post-normalize \
+    --asr-threads 8
+
+# 3a. Khởi động JupyterLab trên image sạch đã merge (BTC chạy predict_notebook.ipynb tại cổng 9777, token/pass: zac2026)
+docker run --rm --gpus '"device=0"' --network none -p 9777:9777 \
+  -v "$(cd ../data/public_test && pwd)":/data/public_test:ro \
+  -v "$(pwd)/result":/result \
+  lifemate-zac2026:latest bash /code/start_jupyter.sh
+
+# 3b. (Tuỳ chọn) Khởi động JupyterLab để test nhanh một adapter chưa merge
+docker run --rm --gpus '"device=0"' --network none -p 9777:9777 \
+  -e LIFEMATE_LLM_MODEL=/llm \
+  -e LIFEMATE_LLM_ADAPTER=/adapter \
+  -v "$(cd models/llm && pwd)":/llm:ro \
+  -v "$(cd result/run_sft_step/training/adapter && pwd)":/adapter:ro \
+  -v "$(cd ../data/public_test && pwd)":/data/public_test:ro \
+  -v "$(pwd)/result":/result \
+  lifemate-zac2026:latest bash /code/start_jupyter.sh
 ```
 
 ---
 
-### 6.2. Kịch bản 2: Chạy trực tiếp bằng `main.py`
-Nếu muốn kiểm soát tuyệt đối từng tham số hoặc chạy trên split khác:
-```bash
-cd /mnt/mmlab2024nas/trantran/lifemate/code
+### 6.2. Kịch bản 2: Đo lường thời gian & kiểm tra Parity (`benchmark_timing.py` & `predict_notebook.ipynb`)
 
+Thực hiện chính xác 4 bước theo Phụ lục Mục 7 của BTC (Set Seed -> Load ASR + LLM -> Đọc dataset & import `ToolEnv` từ thư mục split -> Loop từng sample bấm giờ từ trước khi đọc audio, ghi & flush ra `/result/jupyter_submission.jsonl`) và kiểm tra đối chiếu tuyệt đối `id`, `tool_calls`, `state_hash` với `submission.jsonl`:
+
+```bash
+cd code
+
+/usr/bin/python3.12 benchmark_timing.py \
+  --cuda-visible-devices 0 \
+  --data-root ../data \
+  --split public_test \
+  --output result/jupyter_submission.jsonl \
+  --compare result/submission.jsonl \
+  --strict-compare \
+  --report-json result/timing_report.json
+```
+*Ghi chú:* `benchmark_timing.py` tự nạp `saved_models/llm_ft` đã merge từ `run_sft_step` (không cần `--llm-adapter`). Nếu muốn test một adapter chưa merge khác, truyền thêm `--llm-model models/llm --llm-adapter <adapter_dir>`. Trong Docker của BTC, mở [`predict_notebook.ipynb`](file:///mnt/mmlab2024nas/trantran/lifemate/code/predict_notebook.ipynb) trên JupyterLab (`http://<host>:9777`, mật khẩu/token `zac2026`) và chạy tuần tự 4 cell code để sinh `/result/jupyter_submission.jsonl` có kết quả giống hệt `submission.jsonl`.
+
+---
+
+### 6.3. Kịch bản 3: Chạy nhanh qua launcher `run_server.sh` (Mặc định `--stage online`)
+Script [`code/run_server.sh`](file:///mnt/mmlab2024nas/trantran/lifemate/code/run_server.sh) mặc định:
+
+- Dùng `DATA_ROOT=../data` (relative), ưu tiên chọn `saved_models/asr_ft` theo điều kiện `tokens.txt` ở trên; nếu chưa có sẽ dùng `saved_models/asr`.
+- Tự ưu tiên chọn `saved_models/llm_ft` khi `saved_models/llm_ft/config.json` tồn tại (do đó **không** truyền thêm `--llm-adapter` khi `llm_ft` đã merge, tránh lệch fingerprint/chồng adapter).
+- Tự động bật cấu hình tối ưu hóa **Hybrid ASR** (`1A + 1B + Hybrid 2A` trong [`lifemate/asr_biasing.py`](file:///mnt/mmlab2024nas/trantran/lifemate/code/lifemate/asr_biasing.py)): `ASR_BEAM_SIZE=8`, `ASR_HOTWORDS=auto`, `ASR_HOTWORDS_SCORE=1.5`, `--asr-post-normalize` (`ASR_POST_NORMALIZE=1`, đặt `0` để tắt).
+- Chạy chế độ mặc định `STAGE=online` (nạp đồng thời ASR + LLM trong 1 tiến trình, nhận dạng live từng sample theo Hybrid ASR và ghi thêm `"time"` ms). Nếu chuyển sang `STAGE=full`, cần kèm `--refresh-transcripts` hoặc đặt `TRANSCRIPT_CACHE="result/transcripts_hybrid.jsonl"` để không dùng nhầm `result/transcripts.jsonl` cũ.
+
+Chạy ngầm với `nohup` (dùng đúng weights `saved_models/llm_ft` đã merge từ `run_sft_step` + Hybrid ASR mặc định của `run_server.sh`):
+```bash
+cd code
+
+nohup env \
+  PYTHON_BIN="/usr/bin/python3.12" \
+  DATA_ROOT="../data" \
+  SPLIT="public_test" \
+  OUTPUT="result/submission_step_hybrid.jsonl" \
+  DEVICE="cuda" \
+  bash run_server.sh \
+  --asr-precision fp32 \
+  --asr-decoding-method modified_beam_search \
+  --asr-beam-size 8 \
+  --asr-threads 8 \
+  --thinking-budget 0 \
+  --prefix-cache auto \
+  --schema-cache auto \
+  > ../runtime_cache/logs/inference_step.log 2>&1 &
+```
+
+*(Tuỳ chọn)* Nếu muốn chạy qua `run_server.sh` với **adapter chưa merge** (`result/run_sft_step/training/adapter`) + Hybrid ASR:
+```bash
+cd code
+
+nohup env \
+  PYTHON_BIN="/usr/bin/python3.12" \
+  DATA_ROOT="../data" \
+  SPLIT="public_test" \
+  LLM_MODEL="models/llm" \
+  OUTPUT="result/submission_adapter_hybrid.jsonl" \
+  DEVICE="cuda" \
+  bash run_server.sh \
+  --llm-adapter result/run_sft_step/training/adapter \
+  --asr-precision fp32 \
+  --asr-decoding-method modified_beam_search \
+  --asr-beam-size 8 \
+  --asr-threads 8 \
+  --thinking-budget 0 \
+  --prefix-cache auto \
+  --schema-cache auto \
+  > ../runtime_cache/logs/inference_step_adapter.log 2>&1 &
+```
+
+*Theo dõi tiến độ:*
+```bash
+tail -f ../runtime_cache/logs/inference_step.log
+```
+
+---
+
+### 6.4. Kịch bản 4: Chạy trực tiếp bằng `main.py` (`--stage online`, tự kích hoạt Hybrid ASR)
+Nếu muốn kiểm soát tuyệt đối từng tham số trên model đã merge (`saved_models/llm_ft`) hoặc adapter chưa merge (`models/llm` + `--llm-adapter`):
+```bash
+cd code
+
+# 4a. Chạy trực tiếp với model đã merge (saved_models/llm_ft) + Hybrid ASR
 nohup /usr/bin/python3.12 main.py \
   --cuda-visible-devices 0 \
-  --data-root /mnt/mmlab2024nas/trantran/lifemate/train+public_test \
+  --stage online \
+  --data-root ../data \
   --split public_test \
-  --stage full \
-  --output /mnt/mmlab2024nas/trantran/lifemate/code/result/submission.jsonl \
-  --transcript-cache /mnt/mmlab2024nas/trantran/lifemate/code/result/transcripts_asr_ft.jsonl \
-  --asr-model /mnt/mmlab2024nas/trantran/lifemate/code/models/asr_ft \
+  --output result/submission.jsonl \
+  --asr-model saved_models/asr_ft \
   --asr-precision fp32 \
   --asr-decoding-method modified_beam_search \
   --asr-beam-size 8 \
   --asr-hotwords auto \
   --asr-hotwords-score 1.5 \
   --asr-post-normalize \
-  --asr-batch-size 16 \
-  --asr-threads 4 \
-  --llm-model /mnt/mmlab2024nas/trantran/lifemate/code/models/llm \
-  --llm-adapter /mnt/mmlab2024nas/trantran/lifemate/code/result/run_sft_dual/training/adapter \
+  --asr-threads 8 \
+  --llm-model saved_models/llm_ft \
   --llm-dtype bfloat16 \
   --prefix-cache auto \
   --schema-cache auto \
-  --sample-schedule schema \
+  --sample-schedule original \
   --max-input-tokens 16000 \
   --max-new-tokens 384 \
   --thinking-budget 0 \
@@ -538,81 +671,117 @@ nohup /usr/bin/python3.12 main.py \
   --max-invalid 3 \
   --sample-seconds inf \
   --seed 42 \
-  > /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/inference_main.log 2>&1 &
-```
+  > ../runtime_cache/logs/inference_main.log 2>&1 &
 
----
-
-### 6.3. Kịch bản 3: Tách rời công đoạn ASR và LLM
-Rất hữu ích khi bạn muốn chạy ASR một lần duy nhất, sau đó có thể thử nghiệm nhiều adapter hoặc prompt của LLM mà không phải tốn thời gian chạy lại nhận dạng giọng nói:
-
-#### Công đoạn 1: Chỉ chạy ASR
-```bash
-cd /mnt/mmlab2024nas/trantran/lifemate/code
-
+# 4b. (Tuỳ chọn) Chạy với base model + LoRA adapter chưa merge (result/run_sft_step/training/adapter) + Hybrid ASR
 nohup /usr/bin/python3.12 main.py \
-  --stage asr \
-  --data-root /mnt/mmlab2024nas/trantran/lifemate/train+public_test \
+  --cuda-visible-devices 0 \
+  --stage online \
+  --data-root ../data \
   --split public_test \
-  --transcript-cache /mnt/mmlab2024nas/trantran/lifemate/code/result/transcripts_asr_ft.jsonl \
-  --asr-model /mnt/mmlab2024nas/trantran/lifemate/code/models/asr_ft \
+  --output result/submission_step_hybrid.jsonl \
+  --asr-model saved_models/asr_ft \
   --asr-precision fp32 \
   --asr-decoding-method modified_beam_search \
   --asr-beam-size 8 \
   --asr-hotwords auto \
   --asr-hotwords-score 1.5 \
   --asr-post-normalize \
-  --asr-batch-size 16 \
-  > /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/stage_asr.log 2>&1 &
+  --asr-threads 8 \
+  --llm-model models/llm \
+  --llm-adapter result/run_sft_step/training/adapter \
+  --llm-dtype bfloat16 \
+  --prefix-cache auto \
+  --schema-cache auto \
+  --sample-schedule original \
+  --max-input-tokens 16000 \
+  --max-new-tokens 384 \
+  --thinking-budget 0 \
+  --max-calls 8 \
+  --max-invalid 3 \
+  --sample-seconds inf \
+  --seed 42 \
+  > ../runtime_cache/logs/inference_main_adapter.log 2>&1 &
 ```
 
-#### Công đoạn 2: Chỉ chạy LLM (sử dụng lại transcript cache ở trên)
+---
+
+### 6.5. Kịch bản 5: Tách rời công đoạn ASR và LLM (`--stage asr` / `--stage llm`, Legacy Ablation)
+Chỉ dùng cho thử nghiệm nội bộ khi muốn chạy Hybrid ASR một lần ra `transcripts_asr_hybrid.jsonl` rồi đánh giá nhiều adapter hoặc prompt khác nhau (không dùng cho Docker BTC). Truyền `--refresh-transcripts` để đảm bảo tạo mới theo [`lifemate/asr_biasing.py`](file:///mnt/mmlab2024nas/trantran/lifemate/code/lifemate/asr_biasing.py) hiện tại thay vì dùng lại cache cũ:
+
+#### Công đoạn 1: Chỉ chạy ASR (Hybrid ASR)
 ```bash
-cd /mnt/mmlab2024nas/trantran/lifemate/code
+cd code
+
+nohup /usr/bin/python3.12 main.py \
+  --stage asr \
+  --data-root ../data \
+  --split public_test \
+  --transcript-cache result/transcripts_asr_hybrid.jsonl \
+  --refresh-transcripts \
+  --asr-model saved_models/asr_ft \
+  --asr-precision fp32 \
+  --asr-decoding-method modified_beam_search \
+  --asr-beam-size 8 \
+  --asr-hotwords auto \
+  --asr-hotwords-score 1.5 \
+  --asr-post-normalize \
+  --asr-threads 8 \
+  --asr-batch-size 16 \
+  > ../runtime_cache/logs/stage_asr.log 2>&1 &
+```
+
+Kiểm tra nguồn model và cấu hình giải mã đã ghi vào manifest của cache:
+```bash
+rg -n '"model_path"|"precision"|"decoding_method"|"max_active_paths"|"hotwords_mode"|"hotwords_score"|"post_normalize"' \
+  result/transcripts_asr_hybrid.manifest.json
+```
+
+#### Công đoạn 2: Chỉ chạy LLM (sử dụng lại transcript cache Hybrid ASR ở trên)
+*(Dùng `--llm-model saved_models/llm_ft`, hoặc thay bằng `--llm-model models/llm --llm-adapter result/run_sft_step/training/adapter` nếu chạy trực tiếp trên adapter chưa merge.)*
+```bash
+cd code
 
 nohup /usr/bin/python3.12 main.py \
   --cuda-visible-devices 0 \
   --stage llm \
-  --data-root /mnt/mmlab2024nas/trantran/lifemate/train+public_test \
+  --data-root ../data \
   --split public_test \
-  --transcript-cache /mnt/mmlab2024nas/trantran/lifemate/code/result/transcripts_asr_ft.jsonl \
-  --llm-model /mnt/mmlab2024nas/trantran/lifemate/code/models/llm \
-  --llm-adapter /mnt/mmlab2024nas/trantran/lifemate/code/result/run_sft_dual/training/adapter \
-  --output /mnt/mmlab2024nas/trantran/lifemate/code/result/submission.jsonl \
+  --transcript-cache result/transcripts_asr_hybrid.jsonl \
+  --llm-model saved_models/llm_ft \
+  --output result/submission.jsonl \
   --prefix-cache auto \
   --schema-cache auto \
   --sample-schedule schema \
   --max-input-tokens 16000 \
   --max-new-tokens 384 \
   --thinking-budget 0 \
-  > /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/stage_llm.log 2>&1 &
+  > ../runtime_cache/logs/stage_llm.log 2>&1 &
 ```
 
 ---
 
-### 6.4. Kịch bản 4: Chạy Zero-Shot Inference (Không có Adapter)
-Để đánh giá khả năng gốc của mô hình `Qwen3.5-4B` khi chưa qua fine-tune, dùng cùng
-ASR fine-tune và cấu hình giải mã như các lệnh có adapter ở trên để đối chiếu LLM:
-Bỏ tham số `--llm-adapter`:
+### 6.6. Kịch bản 6: Chạy Zero-Shot Inference (Không có Adapter)
+Để đánh giá khả năng gốc của mô hình `Qwen3.5-4B` khi chưa qua fine-tune, bỏ tham số `--llm-adapter`:
 ```bash
-cd /mnt/mmlab2024nas/trantran/lifemate/code
+cd code
 
 nohup /usr/bin/python3.12 main.py \
   --cuda-visible-devices 0 \
-  --data-root /mnt/mmlab2024nas/trantran/lifemate/train+public_test \
+  --stage online \
+  --data-root ../data \
   --split public_test \
-  --stage full \
-  --asr-model /mnt/mmlab2024nas/trantran/lifemate/code/models/asr_ft \
+  --asr-model saved_models/asr_ft \
   --asr-precision fp32 \
   --asr-decoding-method modified_beam_search \
   --asr-beam-size 8 \
   --asr-hotwords auto \
   --asr-hotwords-score 1.5 \
   --asr-post-normalize \
-  --llm-model /mnt/mmlab2024nas/trantran/lifemate/code/models/llm \
-  --output /mnt/mmlab2024nas/trantran/lifemate/code/result/submission_zeroshot.jsonl \
-  --transcript-cache /mnt/mmlab2024nas/trantran/lifemate/code/result/transcripts_asr_ft_zeroshot.jsonl \
-  > /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/inference_zeroshot.log 2>&1 &
+  --asr-threads 8 \
+  --llm-model models/llm \
+  --output result/submission_zeroshot.jsonl \
+  > ../runtime_cache/logs/inference_zeroshot.log 2>&1 &
 ```
 
 ---
@@ -622,16 +791,16 @@ nohup /usr/bin/python3.12 main.py \
 ### 7.1. Tham số ASR (Nhận dạng âm thanh)
 | Tham số | Giá trị khuyên dùng | Các giá trị khả dĩ | Ý nghĩa & Mô tả |
 | :--- | :--- | :--- | :--- |
-| `--asr-model` | `models/asr_ft` | Đường dẫn thư mục | Mặc định của `finetune.py`/`prepare_sft.py` cho dual và mix, không tự dùng ASR gốc khi thiếu weights. `main.py` cần truyền đường dẫn; launcher ưu tiên `asr_ft` rồi mới dùng `asr`. |
+| `--asr-model` | `saved_models/asr_ft` | Đường dẫn thư mục | Mặc định của `training_code/finetune.py` & `prepare_sft.py` cho dual và mix, không tự dùng ASR gốc khi thiếu weights. `main.py`/`predict.py` & launcher ưu tiên `saved_models/asr_ft` rồi mới dùng `saved_models/asr`. |
 | `--asr-precision` | `fp32` | `auto`, `fp32`, `int8` | Độ chính xác ONNX. `fp32` cho WER tiếng Việt tốt nhất (~4.1% so với 4.8% của int8). |
 | `--asr-decoding-method` | `modified_beam_search` | `modified_beam_search`, `greedy_search` | Thuật toán giải mã RNNT. Modified beam search vượt trội trên các từ hiếm. |
-| `--asr-beam-size` | `8` (inference) / `4` (CLI mặc định) | Số nguyên >= 1 | Độ rộng chùm beam search (`max_active_paths`). Mức `8` được bật sẵn trong `run_server.sh` (hỗ trợ cả contextual hotwords tốt hơn); mức `4` là mặc định trong CLI (`main.py`/`prepare_sft.py`/`finetune.py`). |
-| `--asr-hotwords` | `auto` (`off` mặc định CLI) | `off`, `auto` | Chế độ **1A** contextual BPE hotwords theo từng sample/turn (trích từ `user_profile`, assistant turns/tool results quá khứ không rò rỉ tương lai, và domain lexicon đã kiểm chứng). Tự tổng hợp `bpe.vocab` tạm từ `tokens.txt` khi thư mục model chưa có. |
+| `--asr-beam-size` | `8` (inference) / `4` (train `run_sft_step`) | Số nguyên >= 1 | Độ rộng chùm beam search (`max_active_paths`). Inference (`predict.py`, `run_server.sh`, `benchmark_timing.py`, `predict_notebook.ipynb`) mặc định `8`; toàn bộ training (`finetune.py`, `prepare_sft.py`) và `main.py` mặc định `4`. |
+| `--asr-hotwords` | `auto` (inference) / `off` (train `run_sft_step`) | `off`, `auto` | Chế độ **1A** contextual BPE hotwords theo từng sample/turn (phiên bản **Hybrid ASR** trong `lifemate/asr_biasing.py`, mở rộng ngữ cảnh và kiểm soát thực thi cho tên app/loanword). Mặc định bật `auto` ở `predict.py`/`run_server.sh`/`predict_notebook.ipynb` và `off` ở `finetune.py`/`prepare_sft.py`/`main.py`. |
 | `--asr-hotwords-score` | `1.5` | Số thực | Trọng số boost hotwords BPE khi `--asr-hotwords auto` (tránh >= `2.0` vì dễ ép nhầm hoặc cắt ngắn câu dài). |
-| `--asr-post-normalize` | Bật (`--no-asr-post-normalize` mặc định CLI) | Bật / Tắt | Chế độ **2A** chuẩn hóa hậu ASR có điều kiện ngữ cảnh cho mã/tên riêng quen thuộc (`SE3`, `RON 95`, `VOV1`/`VOV2`/`VOV5`, `Compact K2`, v.v.) trước `normalize_transcript`. Được bật sẵn trong `run_server.sh`. |
+| `--asr-post-normalize` | Bật (inference) / Tắt (train `run_sft_step`) | Bật / Tắt | Chế độ **Hybrid 2A** chuẩn hóa hậu ASR trong `lifemate/asr_biasing.py` (kết hợp quy tắc mã/tên riêng quen thuộc như `SE3`, `RON 95`, `VOV1`/`VOV2`/`VOV5`, `Compact K2` với sửa OOV loanword/biến thể hình thái tổng quát) trước `normalize_transcript`. Mặc định bật ở `predict.py`/`run_server.sh`/`predict_notebook.ipynb` và tắt (`False`, bật/tắt bằng `--no-asr-post-normalize`) ở `finetune.py`/`prepare_sft.py`/`main.py`. |
 | `--asr-batch-size` | `16` | Số nguyên >= 1 | Kích thước batch gộp file âm thanh để decode song song offline. |
-| `--asr-threads` | `4` | Số nguyên >= 1 | Số luồng CPU sử dụng cho ONNX Runtime của Gipformer. |
-| `--max-history-wer` | `0.5` | `None` hoặc float `0..1` | Ngưỡng WER tối đa để lọc bỏ câu history nhiễu trong `prepare_gipformer_sft.py`. |
+| `--asr-threads` | `8` (inference) / `4` (train `run_sft_step`) | Số nguyên >= 1 | Số luồng CPU sử dụng cho ONNX Runtime của Gipformer (`predict.py` mặc định `8`; `main.py`/`prepare_sft.py`/`finetune.py` mặc định `4`). |
+| `--max-history-wer` | `None` (tái lập `asr_ft`) | `None` hoặc float `0..1` | Ngưỡng WER tối đa để lọc bỏ câu history nhiễu trong `prepare_gipformer_sft.py` / `train_gipformer.py` (`None` giữ toàn bộ 3,491 câu history như bản `asr_ft` gốc). |
 
 ### 7.2. Tham số Huấn luyện LLM SFT & LoRA
 | Tham số | Giá trị khuyên dùng | Các giá trị khả dĩ | Ý nghĩa & Mô tả |
@@ -644,7 +813,8 @@ nohup /usr/bin/python3.12 main.py \
 | `--no-inject-guard-recovery` | Tắt (cờ) | Bật / Tắt | Cờ tắt hoàn toàn việc chèn các mẫu Guard Recovery trong `prepare_sft.py`. |
 | `--step-wise-sft` | Đã bật mặc định | Bật / Tắt | Xuất mỗi lượt quyết định thành một dòng SFT riêng (Step-wise SFT), giữ đồng bộ `<think>\n\n</think>\n\n` ở mọi bước trung gian; dùng `--no-step-wise-sft` để chuyển về full-trajectory packing. |
 | `--short-reasoning` | Đã tắt mặc định | Bật / Tắt | Mặc định tắt (`--no-short-reasoning`) để đồng bộ `thinking_budget=0`; truyền `--short-reasoning` để sinh reasoning trong `prepare_sft.py` và `finetune.py`. |
-| `--filter-damaged-asr` | Đã bật (cờ) | Bật / Tắt | Loại bỏ bản sao ASR khỏi SFT nếu ASR làm hỏng các đối số chuẩn của tool call. |
+| `--filter-damaged-asr` | Đã bật mặc định trên `finetune.py` | Bật / Tắt | Loại bỏ bản sao ASR khỏi SFT nếu ASR làm hỏng các đối số chuẩn của tool call. `finetune.py` mặc định bật (`--no-filter-damaged-asr` để tắt); `prepare_sft.py` bật bằng cờ `--filter-damaged-asr`. |
+| `--sft-profile` | `run_sft_step` | `run_sft_step`, `current` | Chọn profile replay cho `prepare_sft.py` và `finetune.py`. `run_sft_step` (mặc định) kích hoạt hook tương thích trong `sft_run_step_compat.py` chỉ trong phạm vi replay để tái lập đúng từng byte `result/run_sft_step/sft/train.jsonl`; `current` dùng logic guard mới nhất ở `lifemate/`. |
 | `--epochs` | `3` | Số thực > 0 | Số epoch huấn luyện LoRA (mặc định `3` cho Step-wise SFT). |
 | `--batch-size` | `1` | Số nguyên | Batch size cục bộ trên mỗi GPU. |
 | `--gradient-accumulation` | `8` | Số nguyên | Tích lũy gradient (tương đương effective batch size = 8). |
@@ -653,12 +823,14 @@ nohup /usr/bin/python3.12 main.py \
 | `--lora-alpha` | `32` | `16`, `32`, `64` | Hệ số tỷ lệ LoRA Alpha (thường đặt bằng `2 * r`). |
 | `--lora-dropout` | `0.0` | `0.0` | Bắt buộc `0.0` để kích hoạt tối ưu hóa Unsloth Fast LoRA kernels. |
 
-### 7.3. Tham số Suy luận LLM (Inference)
+### 7.3. Tham số Suy luận LLM & Benchmarking (Inference)
 | Tham số | Giá trị khuyên dùng | Các giá trị khả dĩ | Ý nghĩa & Mô tả |
 | :--- | :--- | :--- | :--- |
+| `--stage` | `online` (mặc định `main.py`) | `online`, `full`, `asr`, `llm` | `online` nạp đồng thời ASR + LLM trong 1 tiến trình theo chuẩn BTC; `full`/`asr`/`llm` chạy luồng tách cache cũ. |
+| `--split` | `auto` (`predict.py`) / `public_test` (`main.py`) | `auto`, `train`, `public_test`, `private_test` | `auto` tự phát hiện thư mục split duy nhất trong `--data-root` (ví dụ `/data/private_test`). |
 | `--prefix-cache` | `auto` | `auto`, `off` | Kích hoạt bộ nhớ đệm KV đa lượt tự động (tăng tốc độ suy luận gấp ~2.5 lần). |
 | `--schema-cache` | `auto` | `auto`, `shared`, `off` | Tái sử dụng KV-cache các system prompt và định nghĩa JSON schema của các app. |
-| `--sample-schedule` | `schema` | `schema`, `original` | Sắp xếp các mẫu có cùng tập installed apps chạy liền kề nhau để tối đa hóa tỷ lệ trúng schema cache. |
+| `--sample-schedule` | `original` | `original`, `schema` | `online`/`predict.py` luôn giữ nguyên `original` theo thứ tự file gốc đúng chuẩn BTC; `schema` chỉ áp dụng khi chạy `--stage llm`. |
 | `--max-input-tokens` | `16000` | Số nguyên | Giới hạn token đầu vào cho prompt; tổng input + output tối đa 16.384 tokens. |
 | `--max-new-tokens` | `384` | Số nguyên | Toàn bộ ngân sách token đầu ra cho quyết định hoặc tool call mỗi lượt. |
 | `--thinking-budget` | `0` | Số nguyên >= 0 | 0 tắt thinking và chặn prefix reasoning bằng logits guard, yêu cầu mở đầu JSON/tool call. Giá trị lớn hơn 0 cho phép thinking khi còn đủ ngân sách. |
@@ -666,6 +838,8 @@ nohup /usr/bin/python3.12 main.py \
 | `--max-calls` | `8` | Số nguyên | Giới hạn tối đa số bước gọi công cụ trên mỗi mẫu để tránh vòng lặp vô hạn. |
 | `--max-invalid` | `3` | Số nguyên | Số lần tối đa môi trường cho phép gọi sai cú pháp trước khi hủy lượt. |
 | `--sample-seconds` | `inf` | `inf` hoặc số giây | Giới hạn thời gian tối đa cho mỗi mẫu (mặc định `inf` = không giới hạn). |
+| `--compare` / `--strict-compare` | *(chỉ `benchmark_timing.py`)* | Đường dẫn JSONL / Cờ | Đối chiếu `id`, `tool_calls`, `state_hash` với `submission.jsonl`; `--strict-compare` thoát mã lỗi khác 0 nếu lệch. |
+| `--report-json` | *(chỉ `benchmark_timing.py`)* | Đường dẫn JSON | Lưu thống kê tổng (`mean`, `median`, `p95`, `max`, `asr_mean_ms`, `llm_agent_mean_ms`) và chi tiết từng sample. |
 
 ---
 
@@ -679,11 +853,11 @@ Mỗi lệnh chạy nền đã được điều hướng ghi log vào thư mục
 # Xem log huấn luyện ASR
 tail -n 50 -f /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/train_asr.log
 
-# Xem log huấn luyện LLM LoRA
-tail -n 50 -f /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/train_llm.log
+# Xem log huấn luyện LLM LoRA (run_sft_step)
+tail -n 50 -f /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/train_llm_step.log
 
 # Xem log suy luận
-tail -n 50 -f /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/inference_server1.log
+tail -n 50 -f /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/inference_step.log
 ```
 
 ### 8.2. Kiểm tra trạng thái GPU và tiến trình
@@ -692,7 +866,7 @@ tail -n 50 -f /mnt/mmlab2024nas/trantran/lifemate/runtime_cache/logs/inference_s
 watch -n 1 nvidia-smi
 
 # Tìm PID của các tiến trình Python đang chạy liên quan đến lifemate
-ps aux | grep -E "main.py|finetune.py|train_lora.py|train_gipformer.py" | grep -v grep
+ps aux | grep -E "predict.py|benchmark_timing.py|main.py|finetune.py|train_lora.py|train_gipformer.py" | grep -v grep
 ```
 
 ### 8.3. Dừng hoặc hủy tiến trình an toàn
@@ -731,8 +905,8 @@ pkill -f "main.py"
   3. Đảm bảo `--lora-dropout 0.0` để kích hoạt Unsloth GPU memory patch.
 
 ### 9.4. Lỗi `Missing fine-tuned GIPformer ONNX artifacts`
-- **Nguyên nhân:** Chạy `main.py` với đường dẫn `--asr-model models/asr_ft` nhưng thư mục này chưa được xuất file bằng `export_gipformer.py`.
-- **Cách khắc phục:** Export lại theo mục 4.4 và kiểm tra đủ `encoder.onnx`, `decoder.onnx`, `joiner.onnx`, `tokens.txt`. Nếu chưa có ASR fine-tune, chạy `main.py` với `--asr-model models/asr`. Launcher chỉ kiểm tra `models/asr_ft/tokens.txt` tồn tại và không rỗng để chọn thư mục; nếu ONNX còn thiếu trong thư mục được chọn thì bước ASR báo lỗi, không tự chuyển sang model gốc. Khi đổi nguồn ASR, dùng cache mới hoặc `--refresh-transcripts` ở bước `asr/full`.
+- **Nguyên nhân:** Chạy `main.py` với đường dẫn `--asr-model saved_models/asr_ft` nhưng thư mục này chưa được xuất file bằng `export_gipformer.py`.
+- **Cách khắc phục:** Export lại theo mục 4.4 và kiểm tra đủ `encoder.onnx`, `decoder.onnx`, `joiner.onnx`, `tokens.txt`. Nếu chưa có ASR fine-tune, chạy `main.py` với `--asr-model saved_models/asr`. Launcher chỉ kiểm tra `saved_models/asr_ft/tokens.txt` tồn tại và không rỗng để chọn thư mục; nếu ONNX còn thiếu trong thư mục được chọn thì bước ASR báo lỗi, không tự chuyển sang model gốc. Khi đổi nguồn ASR, dùng cache mới hoặc `--refresh-transcripts` ở bước `asr/full`.
 
 ---
 *Tài liệu được cập nhật tự động và đồng bộ với kiến trúc LifeMate Baseline mới nhất.*

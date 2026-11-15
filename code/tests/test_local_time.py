@@ -89,28 +89,25 @@ def test_registry_does_not_mutate_official_tools_and_returns_independent_schemas
         with_local_tools({"local_time.calendar_reference": {}})
 
 
-def test_date_reference_labels_weeks_directly_across_boundaries():
-    # Monday: k=-1 falls in tuần trước, k=0..6 in tuần này, k=7..13 in tuần sau
+def test_date_reference_matches_sft_relative_day_labels():
     mon_ref = date_reference("2026-10-12T09:00:00+07:00", "Asia/Ho_Chi_Minh")
-    assert mon_ref["days"][0] == "2026-10-11 Chủ Nhật (hôm qua, tuần trước)"
-    assert mon_ref["days"][1] == "2026-10-12 Thứ Hai (hôm nay, tuần này)"
-    assert mon_ref["days"][2] == "2026-10-13 Thứ Ba (mai, tuần này)"
-    assert mon_ref["days"][3] == "2026-10-14 Thứ Tư (ngày kia, tuần này)"
-    assert mon_ref["days"][7] == "2026-10-18 Chủ Nhật (tuần này)"
-    assert mon_ref["days"][8] == "2026-10-19 Thứ Hai (tuần sau)"
-    assert mon_ref["days"][14] == "2026-10-25 Chủ Nhật (tuần sau)"
+    assert mon_ref["days"][0] == "2026-10-11 Chủ Nhật (hôm qua)"
+    assert mon_ref["days"][1] == "2026-10-12 Thứ Hai (hôm nay)"
+    assert mon_ref["days"][2] == "2026-10-13 Thứ Ba (mai)"
+    assert mon_ref["days"][3] == "2026-10-14 Thứ Tư (ngày kia)"
+    assert mon_ref["days"][4] == "2026-10-15 Thứ Năm"
+    assert mon_ref["days"][8] == "2026-10-19 Thứ Hai"
+    assert mon_ref["this_week"] == "2026-10-12 .. 2026-10-18"
+    assert mon_ref["next_week"] == "2026-10-19 .. 2026-10-25"
 
-    # Sunday: k=1..2 fall in tuần sau, and overflow past next_week has no duplicate tuần sau tag
     sun_ref = date_reference("2026-10-18T09:00:00+07:00", "Asia/Ho_Chi_Minh")
-    assert sun_ref["days"][0] == "2026-10-17 Thứ Bảy (hôm qua, tuần này)"
-    assert sun_ref["days"][1] == "2026-10-18 Chủ Nhật (hôm nay, tuần này)"
-    assert sun_ref["days"][2] == "2026-10-19 Thứ Hai (mai, tuần sau)"
-    assert sun_ref["days"][3] == "2026-10-20 Thứ Ba (ngày kia, tuần sau)"
-    assert sun_ref["days"][8] == "2026-10-25 Chủ Nhật (tuần sau)"
+    assert sun_ref["days"][0] == "2026-10-17 Thứ Bảy (hôm qua)"
+    assert sun_ref["days"][1] == "2026-10-18 Chủ Nhật (hôm nay)"
+    assert sun_ref["days"][2] == "2026-10-19 Thứ Hai (mai)"
+    assert sun_ref["days"][3] == "2026-10-20 Thứ Ba (ngày kia)"
     assert sun_ref["days"][9] == "2026-10-26 Thứ Hai"
-    assert sum("Thứ Bảy (tuần sau)" in d for d in sun_ref["days"]) == 1
 
     # Reasoning provenance index handles labeled entries cleanly
     from lifemate.reasoning import _index_scalar_sources
     sources = _index_scalar_sources({"user_context": {"date_reference": sun_ref}})
-    assert "tuần sau" in sources["2026-10-19"]
+    assert sources["2026-10-18"] == "date_reference 'Chủ Nhật (hôm nay)'"

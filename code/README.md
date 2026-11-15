@@ -8,8 +8,8 @@ Offline end-to-end voice agent for Zalo AI Challenge 2026 (LifeMate track). All 
 
 ### 1.1 ASR Model
 - **Model**: `g-group-ai-lab/gipformer1.5-68M-rnnt` (**~68M parameters**), Zipformer-RNNT architecture, exported to **FP32 ONNX** (`saved_models/asr_ft/`) for offline CPU decoding via `sherpa-onnx`.
-- **Domain Adaptation**: Fine-tuned on 1,536 verified Vietnamese utterances + cleaned user history utterances (`../data/train_asr.jsonl`) using a selective normalization and anti-noise policy (`training_code/asr_finetune/`).
-- **Inference Decoding**: 16 kHz mono audio, CPU `8` threads, `modified_beam_search` (`max_active_paths=8`), dynamic per-sample contextual BPE hotwords extracted from installed apps/contacts/entities/tool schemas (`hotwords_score=1.5`), plus deterministic post-ASR normalization (`--asr-post-normalize`).
+- **Domain Adaptation**: Fine-tuned on 1,536 human-verified Vietnamese main utterances + 9 leftover digit utterances + 3,491 user history turns from `../data/train_asr.jsonl` (`4,496` train / `540` dev rows) using selective normalization (`training_code/asr_finetune/`, `epochs=3`, `lr=3e-5`, `accum=4`, `eval_every=1000`, `best.pt` at step 13,000).
+- **Inference Decoding (Hybrid ASR)**: 16 kHz mono audio, CPU `8` threads, `modified_beam_search` (`max_active_paths=8`), dynamic per-sample Hybrid contextual BPE hotwords extracted from installed apps/contacts/entities/tool schemas (`hotwords_score=1.5`), plus deterministic Hybrid post-ASR normalization (`--asr-post-normalize` in [lifemate/asr_biasing.py](lifemate/asr_biasing.py)).
 
 ### 1.2 LLM Model
 - **Model**: `Qwen/Qwen3.5-4B` (**~4.0B parameters**, **BF16**, loaded via `AutoModelForImageTextToText` in text-only mode with native Qwen3.5 function calling, fine-tuned with **LoRA** `r=16, alpha=32` targeting language attention, GatedDeltaNet `linear_attn`, and MLP projections — vision layers frozen/unmodified).

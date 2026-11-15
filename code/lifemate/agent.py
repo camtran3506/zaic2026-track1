@@ -38,7 +38,7 @@ QUY TẮC BẮT BUỘC:
 - Với x-ref, dùng ID từ kết quả read tool thành công trong history hoặc lượt hiện tại;
   nếu chưa có thì gọi read tool tương ứng để tìm ID thực; KHÔNG bịa ID.
 - Dùng `user_context.date_reference` đổi ngày tương đối ra YYYY-MM-DD (không cần gọi calendar_reference) và `user_context.apps` để đối chiếu tên tiếng Việt của app.
-- Tìm kiếm rỗng: rút gọn từ khóa (bỏ danh xưng, giữ tên chính), thử tìm theo mốc tiếng Việt đi kèm (quán, đường, đối diện/gần...), bỏ trống query (hoặc query="*") hay gọi tool danh sách; không nối thêm ngày giờ/near vào từ khóa đã rỗng, không lặp call cũ; vẫn rỗng mới gọi sys.ask_missing_info.
+- Tìm kiếm rỗng: rút gọn từ khóa (bỏ danh xưng, giữ tên chính), bỏ trống query hoặc gọi tool danh sách; không đưa ngày giờ vào từ khóa, không lặp call cũ; vẫn rỗng mới gọi sys.ask_missing_info.
 - Nếu cần kết hợp nhiều hành động, hoàn tất từng hành động theo thứ tự phụ thuộc.
 - Dùng user context (current_time/timezone/location/profile) và lịch sử để giải quyết tham chiếu.
 - local_time.* (departure_time, duration_between) là hàm nội bộ đọc toán hạng đã có; không đổi trạng thái app hay cấp ID x-ref.

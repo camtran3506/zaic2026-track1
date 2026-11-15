@@ -17,8 +17,8 @@ from lifemate.gpu import add_cuda_device_argument, configure_cuda_device, model_
 from lifemate.context import MAX_CONTEXT_TOKENS, validate_training_length
 from lifemate.llm import is_qwen35, model_loader, lora_targets, configure_tokenizer
 from lifemate.reasoning import DEFAULT_REASONING_WEIGHT
-from lifemate.runtime import (make_runtime_manifest, runtime_save_callback,
-                              save_runtime_manifest, training_dtype)
+from lifemate.runtime import (make_runtime_manifest, resolve_default_base_llm,
+                              runtime_save_callback, save_runtime_manifest, training_dtype)
 from lifemate.numerics import NUMERICS_POLICY, guarded_trainer_class
 
 
@@ -125,8 +125,8 @@ def make_weighted_trainer_class(base_trainer, backend):
 def main():
     p = argparse.ArgumentParser(description=__doc__)
     add_cuda_device_argument(p)
-    p.add_argument("--base-model", type=Path, default=CODE_DIR / "saved_models" / "llm",
-                   help="Local model directory (stage HF weights first; default: saved_models/llm)")
+    p.add_argument("--base-model", type=Path, default=resolve_default_base_llm(CODE_DIR),
+                   help="Local model directory (stage HF weights first; default: saved_models/llm or models/llm)")
     p.add_argument("--sft-dir", type=Path, default=CODE_DIR / "result" / "finetune_run" / "sft")
     p.add_argument("--output-dir", type=Path, default=CODE_DIR / "result" / "finetune_run" / "training")
     p.add_argument("--backend", choices=["unsloth", "transformers"], default="unsloth")
