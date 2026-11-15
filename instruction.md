@@ -64,13 +64,15 @@ lifemate/
     │   └── ...                        # agent, asr, models, schema_cache, guards, ...
     ├── models/llm/                    # Mô hình LLM gốc (Qwen3.5-4B base dùng để train/merge; được .dockerignore bỏ qua)
     ├── saved_models/                  # Nơi lưu trữ checkpoint mô hình phục vụ inference & Docker
-    │   ├── asr/                       # Mô hình ASR gốc (ONNX fp32, int8, model.pt)
+    │   ├── asr/                       # Mô hình ASR gốc (chỉ dùng để train; đã được .dockerignore bỏ qua khi build Docker)
     │   ├── asr_ft/                    # Mô hình ASR sau khi fine-tune (ONNX fp32)
     │   └── llm_ft/                    # LLM đã gộp LoRA run_sft_step (predict.py/run_server.sh/Docker tự nhận diện)
     ├── training_code/                 # Toàn bộ mã nguồn huấn luyện & README.md theo Mục 5 & 6.2 BTC
     │   ├── README.md                  # Hướng dẫn reproduce training, seed=42, link HF/data
+    │   ├── requirements-train.txt     # Danh sách gói train ghim phiên bản (Unsloth, TRL, Datasets, Lhotse + k2/kaldifeat)
     │   ├── finetune.py                # Script 1-lệnh tự động hóa SFT LLM
     │   ├── prepare_sft.py             # Chuẩn bị dữ liệu huấn luyện SFT cho LLM
+    │   ├── sft_run_step_compat.py     # Hook tương thích replay (--sft-profile run_sft_step) khớp SHA256 train.jsonl gốc
     │   ├── train_lora.py              # Huấn luyện Unsloth LoRA trên LLM
     │   ├── merge_lora.py              # Trộn LoRA adapter vào base model (-> saved_models/llm_ft)
     │   ├── audit_initial_tokens.py    # Audit token budget
@@ -134,20 +136,27 @@ Tạm thời bỏ cờ `HF_HUB_OFFLINE` để tải mô hình qua script [`downl
 ```bash
 cd code
 
-# Tải cả Base LLM (Qwen3.5-4B) và Base ASR (Gipformer 1.5 với đầy đủ ONNX FP32, INT8 và PyTorch weights)
+# (Nếu cài môi trường train sạch trên máy mới) Cài các gói train đã ghim phiên bản:
+# pip install -r training_code/requirements-train.txt
+
+# Tải cả Base LLM (Qwen3.5-4B, commit 851bf6e8...) và Base ASR (Gipformer 1.5, commit dd9227dc...) với đầy đủ ONNX FP32, INT8 và PyTorch weights
 HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 /usr/bin/python3.12 training_code/download_models.py \
   --models-dir saved_models \
   --only both \
   --asr-precision all
 ```
 
-### (Tùy chọn) Tải sẵn mô hình ASR Fine-tuned từ Hugging Face
+### (Tùy chọn) Tải sẵn mô hình ASR Fine-tuned & dữ liệu từ Hugging Face
+Kho lưu trữ Hugging Face chính thức của đội:
+- **Models** (`asr-gipformer/`, `llm-adapter/`, `llm-merged/`): https://huggingface.co/camtran3506/zaic2026-lifemate-models
+- **Training Data** (`train/`, `train_asr.jsonl`): https://huggingface.co/datasets/camtran3506/zaic2026-lifemate-data
+
 Nếu bạn không muốn tự fine-tune lại mô hình ASR từ đầu mà muốn dùng ngay checkpoint đã được fine-tune sẵn trên tập dữ liệu cuộc thi:
 ```bash
 HF_HUB_OFFLINE=0 TRANSFORMERS_OFFLINE=0 /usr/bin/python3.12 training_code/download_models.py \
   --models-dir saved_models \
   --only asr \
-  --asr-ft-repo hugebenevolence/lifemate-final \
+  --asr-ft-repo camtran3506/zaic2026-lifemate-models \
   --asr-ft-subdir asr-gipformer
 ```
 Khi đó, các tệp ONNX của mô hình fine-tune sẽ được lưu tại [`code/saved_models/asr_ft`](file:///mnt/mmlab2024nas/trantran/lifemate/code/saved_models/asr_ft).
@@ -207,6 +216,7 @@ nohup /usr/bin/python3.12 training_code/asr_finetune/train_gipformer.py \
   --selection-metric loss \
   --eval-every 1000 \
   --patience 5 \
+  --seed 42 \
   > ../runtime_cache/logs/train_asr.log 2>&1 &
 ```
 *Kiểm tra tiến trình:* Xem log thời gian thực bằng `tail -f ../runtime_cache/logs/train_asr.log`.
@@ -541,7 +551,7 @@ docker run --rm --gpus '"device=0"' --network none \
     --asr-post-normalize \
     --asr-threads 8
 
-# 3a. Khởi động JupyterLab trên image sạch đã merge (BTC chạy predict_notebook.ipynb tại cổng 9777, token/pass: zac2026)
+# 3a. Khởi động JupyterLab trên image sạch đã merge (BTC chạy predict_notebook.ipynb tại cổng 9777, `--IdentityProvider.token=zac2026`, đổi qua `JUPYTER_TOKEN`)
 docker run --rm --gpus '"device=0"' --network none -p 9777:9777 \
   -v "$(cd ../data/public_test && pwd)":/data/public_test:ro \
   -v "$(pwd)/result":/result \

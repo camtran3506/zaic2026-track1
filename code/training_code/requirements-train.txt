@@ -1,0 +1,17 @@
+# Additional dependencies required for full ASR & LLM training reproduction (code/training_code/).
+# Keep code/requirements.txt minimal for the offline inference Docker image.
+-r ../requirements.txt
+
+# LLM LoRA SFT (--backend unsloth default in training_code/finetune.py & train_lora.py)
+unsloth==2026.10.11
+unsloth-zoo==2026.10.11
+trl==0.24.0
+datasets==4.3.0
+
+# ASR fine-tuning (training_code/asr_finetune/)
+lhotse==1.33.0
+# NOTE: k2 and kaldifeat depend on exact CUDA + PyTorch ABI; install matching CUDA 12.8 / torch 2.11 wheels:
+#   pip install k2==1.24.4.dev20260625+cuda12.8.torch2.11.0 -f https://k2-fsa.github.io/k2/cuda.html
+#   pip install kaldifeat==1.24 -f https://csukuangfj.github.io/kaldifeat/cuda.html
+# Then clone icefall architecture helpers:
+#   bash training_code/asr_finetune/setup_icefall.sh

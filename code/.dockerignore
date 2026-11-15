@@ -9,8 +9,11 @@ result/
 *.wav
 **/*_environment/
 models/
+saved_models/asr/
 saved_models/.research/
 saved_models/*/.cache/
+unsloth_compiled_cache/
+*.tar.gz
 train/
 public_test/
 private_test/

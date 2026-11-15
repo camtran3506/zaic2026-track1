@@ -9,6 +9,7 @@ from __future__ import annotations
 import argparse
 import json
 import math
+import os
 from pathlib import Path
 import random
 import sys
@@ -136,6 +137,8 @@ def main() -> None:
                         help="Keep last checkpoint as best.pt cleanly even when training on all audio")
     parser.add_argument("--smoke-only", action="store_true",
                         help="Run one forward/backward pass and check finite gradients without saving")
+    parser.add_argument("--seed", type=int, default=42,
+                        help="Random seed for reproducibility (default: 42)")
     args = parser.parse_args()
 
     if any(x < 1 for x in (args.epochs, args.accum, args.max_train_audio, args.max_dev_audio, args.eval_every, args.patience)):
@@ -145,6 +148,8 @@ def main() -> None:
 
     configure_cuda_device(args)
 
+    os.environ["PYTHONHASHSEED"] = str(args.seed)
+    import numpy as np
     import torch
     import torchaudio
     import sentencepiece as spm
@@ -162,8 +167,14 @@ def main() -> None:
 
         model, params = strict_model(args.model_dir, args.icefall_root)
         source_sha = sha256(args.model_dir / "model.pt")
-        torch.manual_seed(42)
-        random.seed(42)
+        random.seed(args.seed)
+        np.random.seed(args.seed)
+        torch.manual_seed(args.seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(args.seed)
+        if hasattr(torch.backends, "cudnn"):
+            torch.backends.cudnn.deterministic = True
+            torch.backends.cudnn.benchmark = False
         model = model.to(device)
 
         train_all = not args.encoder_only

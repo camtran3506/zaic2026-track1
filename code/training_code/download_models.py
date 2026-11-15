@@ -8,6 +8,8 @@ MODELS = {
     "llm": "Qwen/Qwen3.5-4B",
     "asr": "g-group-ai-lab/gipformer1.5-68M-rnnt",
 }
+DEFAULT_LLM_REVISION = "851bf6e806efd8d0a36b00ddf55e13ccb7b8cd0a"
+DEFAULT_ASR_REVISION = "dd9227dcd8705c13f33bdbe59728d546ab94480f"
 
 
 def main():
@@ -16,8 +18,10 @@ def main():
                    default=Path(__file__).resolve().parents[1] / "saved_models",
                    help="Download root (default: code/saved_models, independent of working directory)")
     p.add_argument("--only", choices=["llm", "asr", "both"], default="both")
-    p.add_argument("--llm-revision", default=None, help="Pin a git commit before final submission")
-    p.add_argument("--asr-revision", default=None, help="Pin a git commit before final submission")
+    p.add_argument("--llm-revision", default=DEFAULT_LLM_REVISION,
+                   help="Pinned HF commit SHA for Qwen/Qwen3.5-4B")
+    p.add_argument("--asr-revision", default=DEFAULT_ASR_REVISION,
+                   help="Pinned HF commit SHA for g-group-ai-lab/gipformer1.5-68M-rnnt")
     p.add_argument("--asr-precision", choices=["int8", "fp32", "both", "all"], default="all",
                    help="GIPformer assets to stage into saved_models/asr (all includes fp32/int8 ONNX + bpe.model + model.pt)")
     p.add_argument("--asr-ft-repo", default=None,

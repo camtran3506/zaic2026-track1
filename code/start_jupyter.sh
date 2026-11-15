@@ -13,11 +13,12 @@ export CUBLAS_WORKSPACE_CONFIG=:4096:8
 
 mkdir -p /result
 
+JUPYTER_TOKEN="${JUPYTER_TOKEN:-zac2026}"
+
 exec jupyter lab \
   --port "${JUPYTER_PORT:-9777}" \
   --ip 0.0.0.0 \
-  --NotebookApp.password='zac2026' \
-  --NotebookApp.token='zac2026' \
+  --IdentityProvider.token="${JUPYTER_TOKEN}" \
   --allow-root \
   --no-browser \
   --notebook-dir="${SCRIPT_DIR}"
